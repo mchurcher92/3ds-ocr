@@ -1,0 +1,22 @@
+Author: ""
+
+Version: # Plugin version
+    Major: 1
+    Minor: 0
+    Revision: 0
+
+Targets: # Low TitleId of games which are compatibles with this plugin (0 for all)
+
+Title: Japanese OCR & Translation (Slim)
+
+Summary: Lightweight Headless Japanese OCR Plugin for All Consoles
+
+Description: |
+  Headless Japanese OCR & AI translation client for Nintendo 3DS.
+  Pure background listener without CTRPF menu or cheat engines.
+
+Compatibility: Any
+
+MemorySize: 2MiB
+
+UsePrivateMemory: false

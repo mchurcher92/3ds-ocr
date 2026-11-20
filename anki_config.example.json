@@ -1,0 +1,9 @@
+{
+  "anki_mode": "ankiconnect",
+  "use_ankiconnect": true,
+  "ankiconnect_url": "http://127.0.0.1:8765",
+  "deck_prefix": "",
+  "screenshot_mode": "both",
+  "player_name": "",
+  "player_english_name": ""
+}

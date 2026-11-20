@@ -1,0 +1,63 @@
+# Credentials, secrets, and private configs
+anki_credentials.json
+gemini_credentials.json
+ocr_psk.txt
+anki_config.json
+*.env
+
+# Local Anki database and sync storage
+anki_sync/
+
+# Logs and local screenshots/dumps
+*.log
+*.dmp
+dumps/
+tmp_dumps/
+
+# Python execution and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# PyInstaller / Build artifacts
+build/
+dist/
+*.exe
+
+# 3DS compiled binaries and build files
+*.3gx
+*.elf
+3gx_plugin/Build/
+3gx_plugin/disasm.txt
+3gx_plugin_hb/Build/
+3gx_plugin_hb/disasm.txt
+3gx_plugin_slim/Build/
+3gx_plugin_slim/disasm.txt
+full/
+slim/
+homebrew/
+CTRPluginFramework/Library/debug/
+CTRPluginFramework/Library/lib/
+CTRPluginFramework/Library/release/
+CTRPluginFramework_Hb/Library/debug/
+CTRPluginFramework_Hb/Library/lib/
+CTRPluginFramework_Hb/Library/release/
+CTRPluginFramework_Slim/Library/debug/
+CTRPluginFramework_Slim/Library/lib/
+CTRPluginFramework_Slim/Library/release/
+
+# Large OCR models (downloaded separately)
+ocr_models/*.onnx
+ocr_models/*.safetensors
+
+# Large dictionary databases and zip archives
+dictionaries/*.db
+dictionaries/*.zip
+dictionaries/.cache/
+
+# OS / Editor temporary files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

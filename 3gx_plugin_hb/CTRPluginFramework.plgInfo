@@ -1,0 +1,26 @@
+Author: ""
+
+Version: # Plugin version
+    Major: 1
+    Minor: 0
+    Revision: 0
+
+Targets: # Low TitleId of games which are compatibles with this plugin (0 for all)
+
+Title: Japanese OCR & Translation (HB)
+
+Summary: Standalone Japanese OCR & Translation 3GX Plugin (Homebrew Build)
+
+Description: |
+  Real-time screen capture, OCR, and AI translation client for Nintendo 3DS homebrew.
+  Features:
+    - Direct hotkey activation (R + Start + Select)
+    - In-game pause & inspection
+    - Single word lookup & 2-point box selection
+    - Encrypted communication with PC OCR server
+
+Compatibility: Any
+
+MemorySize: 5MiB
+
+UsePrivateMemory: false
