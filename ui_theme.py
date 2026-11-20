@@ -413,6 +413,13 @@ class ThemedButton(tk.Frame):
 
     config = configure
 
+    def cget(self, key: str):
+        if key in ("text", "command", "state", "width", "padx", "pady"):
+            return self._btn.cget(key)
+        return super().cget(key)
+
+    __getitem__ = cget
+
 
 def make_secondary_button(
     parent: tk.Widget,

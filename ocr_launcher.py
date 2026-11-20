@@ -40,13 +40,17 @@ from anki_dialog import (
 from ui_theme import (
     ACCENT,
     BG_CANVAS,
+    BG_ELEVATED,
     BG_ROOT,
     BG_SURFACE,
     BORDER,
+    BORDER_BTN,
+    CYAN,
     DANGER,
     DANGER_BG,
     FG_MUTED,
     FG_PRIMARY,
+    FG_SECONDARY,
     MONO_FONT,
     ModernTabBar,
     SUCCESS,
@@ -569,6 +573,9 @@ class OcrServerLauncherGui:
         self.log_queue: queue.Queue = queue.Queue()
         self.reader_thread: Optional[threading.Thread] = None
         self.qr_image_tk = None
+        self.qr_placeholder_tk = None
+        self.qr_revealed = False
+        self.psk_revealed = False
         self.popout_window: Optional[tk.Toplevel] = None
         self.log_line_count = 0
 
@@ -816,17 +823,27 @@ class OcrServerLauncherGui:
             style="SurfaceMuted.TLabel",
             wraplength=290,
             justify="center",
-        ).pack(pady=(0, 12))
+        ).pack(pady=(0, 10))
 
-        # High-contrast white quiet-zone card for reliable 3DS camera scanning
+        # QR code frame with toggleable reveal
         qr_outer = tk.Frame(pair_body, bg=BORDER, bd=0, highlightthickness=0)
-        qr_outer.pack(pady=(0, 14))
-        qr_pad = tk.Frame(qr_outer, bg="#FFFFFF", padx=10, pady=10)
-        qr_pad.pack(padx=1, pady=1)
-        self.qr_canvas = tk.Label(qr_pad, bg="#FFFFFF", bd=0)
+        qr_outer.pack(pady=(0, 8))
+        self.qr_pad = tk.Frame(qr_outer, bg=BG_SURFACE, padx=10, pady=10)
+        self.qr_pad.pack(padx=1, pady=1)
+        self.qr_canvas = tk.Label(self.qr_pad, bg=BG_SURFACE, bd=0, cursor="hand2")
         self.qr_canvas.pack()
+        self.qr_canvas.bind("<Button-1>", lambda _e: self._toggle_qr_visibility())
 
-        tk.Frame(pair_body, bg=BORDER, height=1).pack(fill="x", pady=(2, 12))
+        self.toggle_qr_btn = make_secondary_button(
+            pair_body,
+            text="Show QR Code",
+            command=self._toggle_qr_visibility,
+            padx=14,
+            pady=4,
+        )
+        self.toggle_qr_btn.pack(pady=(0, 10))
+
+        tk.Frame(pair_body, bg=BORDER, height=1).pack(fill="x", pady=(0, 10))
 
         ttk.Label(pair_body, text="Pre-Shared Key (256-bit PSK)", style="SurfaceBold.TLabel").pack(
             anchor="w", pady=(0, 6)
@@ -841,11 +858,17 @@ class OcrServerLauncherGui:
             textvariable=self.psk_var,
             font=(MONO_FONT, 9),
             state="readonly",
+            show="•",
         )
-        self.psk_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.psk_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        self.toggle_psk_btn = make_secondary_button(
+            psk_box, text="Show", width=5, command=self._toggle_psk_visibility, padx=6, pady=4
+        )
+        self.toggle_psk_btn.pack(side="left", padx=(0, 4))
 
         self.copy_psk_btn = make_secondary_button(
-            psk_box, text="Copy", width=7, command=self._copy_psk, padx=8, pady=4
+            psk_box, text="Copy", width=5, command=self._copy_psk, padx=6, pady=4
         )
         self.copy_psk_btn.pack(side="left")
 
@@ -1165,6 +1188,57 @@ class OcrServerLauncherGui:
         self.copy_psk_btn.configure(text="Copied!")
         self.root.after(1500, lambda: self.copy_psk_btn.configure(text="Copy"))
 
+    def _toggle_psk_visibility(self) -> None:
+        """Toggle PSK text entry masking (hidden by default)."""
+        self.psk_revealed = not self.psk_revealed
+        if self.psk_revealed:
+            self.psk_entry.configure(show="")
+            self.toggle_psk_btn.configure(text="Hide")
+        else:
+            self.psk_entry.configure(show="•")
+            self.toggle_psk_btn.configure(text="Show")
+
+    def _toggle_qr_visibility(self) -> None:
+        """Toggle QR code visibility (hidden by default to protect key from shoulder-surfing)."""
+        self.qr_revealed = not self.qr_revealed
+        self._update_qr_display()
+
+    def _make_qr_placeholder(self, width: int = 180, height: int = 180) -> Image.Image:
+        """Generate a sleek theme-consistent placeholder card when the QR code is hidden."""
+        img = Image.new("RGB", (width, height), color=BG_SURFACE)
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([(0, 0), (width - 1, height - 1)], outline=BORDER, width=1)
+
+        cx = width // 2
+        # Padlock shackle
+        draw.arc([(cx - 18, 38), (cx + 18, 76)], start=180, end=0, fill=FG_SECONDARY, width=4)
+        # Padlock body
+        draw.rounded_rectangle([(cx - 24, 60), (cx + 24, 96)], radius=6, fill=BG_ELEVATED, outline=BORDER_BTN, width=2)
+        # Keyhole
+        draw.ellipse([(cx - 3, 72), (cx + 3, 78)], fill=FG_SECONDARY)
+        draw.polygon([(cx - 2, 77), (cx + 2, 77), (cx + 4, 85), (cx - 4, 85)], fill=FG_SECONDARY)
+
+        draw.text((cx, 120), "Pairing QR Hidden", fill=FG_PRIMARY, anchor="mm")
+        draw.text((cx, 142), "Click to Reveal", fill=CYAN, anchor="mm")
+        return img
+
+    def _update_qr_display(self) -> None:
+        """Update QR canvas and button state based on reveal toggle."""
+        if not hasattr(self, "qr_canvas"):
+            return
+        if self.qr_revealed:
+            if self.qr_image_tk is not None:
+                self.qr_pad.configure(bg="#FFFFFF")
+                self.qr_canvas.configure(image=self.qr_image_tk, bg="#FFFFFF")
+            if hasattr(self, "toggle_qr_btn"):
+                self.toggle_qr_btn.configure(text="Hide QR Code")
+        else:
+            if self.qr_placeholder_tk is not None:
+                self.qr_pad.configure(bg=BG_SURFACE)
+                self.qr_canvas.configure(image=self.qr_placeholder_tk, bg=BG_SURFACE)
+            if hasattr(self, "toggle_qr_btn"):
+                self.toggle_qr_btn.configure(text="Show QR Code")
+
     def _generate_new_psk(self) -> None:
         new_psk = secrets.token_urlsafe(32)
         self.current_psk = new_psk
@@ -1175,7 +1249,7 @@ class OcrServerLauncherGui:
         messagebox.showinfo(
             "New Key Generated",
             "A fresh 256-bit PSK has been generated!\n\n"
-            "Point your 3DS camera at the updated QR code (press [Start] in OCR mode) to pair.",
+            "Click 'Show QR Code' (or the placeholder) to view the updated QR code and pair with your 3DS.",
         )
 
     def _detect_wan_async(self) -> None:
@@ -1207,7 +1281,13 @@ class OcrServerLauncherGui:
 
         img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
         self.qr_image_tk = ImageTk.PhotoImage(img)
-        self.qr_canvas.config(image=self.qr_image_tk)
+
+        # Generate matching-sized placeholder for hidden state
+        qr_w, qr_h = img.size
+        placeholder_img = self._make_qr_placeholder(qr_w, qr_h)
+        self.qr_placeholder_tk = ImageTk.PhotoImage(placeholder_img)
+
+        self._update_qr_display()
 
 
 def main() -> None:
