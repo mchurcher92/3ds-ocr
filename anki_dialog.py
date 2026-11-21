@@ -11,7 +11,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Optional, Tuple, Dict
+from typing import Tuple
 import tkinter as tk
 from tkinter import ttk, messagebox
 

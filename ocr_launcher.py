@@ -73,11 +73,8 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DICTIONARIES_DIR = os.path.join(APP_DIR, "dictionaries")
-OCR_MODELS_DIR = os.path.join(APP_DIR, "ocr_models")
 OCR_SERVER_SCRIPT = os.path.join(APP_DIR, "ocr_server.py")
 OCR_PSK_PATH = os.path.join(APP_DIR, "ocr_psk.txt")
-ANKI_CONFIG_PATH = os.path.join(APP_DIR, "anki_config.json")
-ANKI_CREDENTIALS_PATH = os.path.join(APP_DIR, "anki_credentials.json")
 DUMPS_DIR = os.path.join(APP_DIR, "dumps")
 DEFAULT_PORT = 8888
 MAX_LOG_LINES = 5000

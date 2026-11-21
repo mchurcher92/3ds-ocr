@@ -10,7 +10,7 @@ Real-time dual-screen Japanese OCR, dictionary lookup, AI/neural translation, an
 - `3gx_plugin/` — Full CTRPluginFramework `.3gx` plugin source (`build_plugin.ps1` / `build_plugin.bat`).
 - `3gx_plugin_slim/` — Headless slim `.3gx` plugin for Old 3DS / extended memory games (`build_slim_plugin.ps1`).
 - `3gx_plugin_hb/` & `CTRPluginFramework_Hb/` — Homebrew-compatible `.3gx` plugin build (`build_hb_plugin.ps1`).
-- `custom_dict.json` & `dictionaries/` — Custom proper-noun glossary and JMdict lookup support.
+- `dictionaries/` — Custom proper-noun glossary (`custom_dict.json`), kanji stroke order font, JLPT metadata, and JMdict lookup support.
 - `ocr_models/` — Model charsets/configs (`NDLmoji.yaml`, `japan_dict.txt`, `yomitoku_charset.txt`).
 
 ---

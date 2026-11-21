@@ -314,7 +314,6 @@ namespace CTRPluginFramework
     static SessionBuffer s_topBuffer;
     static SessionBuffer s_botBuffer;
     static SessionBuffer s_popupBuffer;
-    static SessionBuffer s_kanjiBuffer;     // legacy 230,400-byte slot (kept for compat)
     static SessionBuffer s_kanjiTallBuffer; // 384,000-byte tall canvas for local-scroll kanji
     static int s_kanjiScrollY;              // current scroll offset within tall buffer
     static int s_kanjiMaxScrollY;           // actual max scroll = max(0, content_height - POPUP_HEIGHT)
@@ -322,7 +321,6 @@ namespace CTRPluginFramework
     #define s_top_rgb    (s_topBuffer.ptr)
     #define s_bot_rgb    (s_botBuffer.ptr)
     #define s_popup_rgb  (s_popupBuffer.ptr)
-    #define s_kanji_rgb  (s_kanjiBuffer.ptr)
     #define s_kanji_tall (s_kanjiTallBuffer.ptr)
 
     static void OCR_FreePopupBuffer(void)
@@ -332,7 +330,6 @@ namespace CTRPluginFramework
 
     static void OCR_FreeKanjiBuffer(void)
     {
-        s_kanjiBuffer.Free();
         s_kanjiTallBuffer.Free();
         s_kanjiScrollY = 0;
         s_kanjiMaxScrollY = 0;
@@ -343,7 +340,6 @@ namespace CTRPluginFramework
         s_topBuffer.Free();
         s_botBuffer.Free();
         s_popupBuffer.Free();
-        s_kanjiBuffer.Free();
         s_kanjiTallBuffer.Free();
     }
 

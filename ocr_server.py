@@ -270,7 +270,6 @@ BPP = 3
 TOP_FB_BYTES = TOP_DIM[0] * TOP_DIM[1] * BPP        # 288,000 bytes
 BOT_FB_BYTES = BOT_DIM[0] * BOT_DIM[1] * BPP        # 230,400 bytes
 POPUP_FB_BYTES = POPUP_DIM[0] * POPUP_DIM[1] * BPP  # 230,400 bytes
-KANJI_FB_BYTES = KANJI_TALL_DIM[0] * KANJI_TALL_DIM[1] * BPP + 2  # 384,002 bytes (384,000 RGB + 2-byte content_height)
 
 OCR_UPSCALE_FACTOR = 3
 MAX_CLICK_DISTANCE_PX = 26.0  # Max cursor distance from a character box to count as a hit
@@ -436,7 +435,6 @@ class OcrVariant:
     ocr_text: str
     engines: List[str]
     results: List[DictionaryResult]
-    all_engine_readings: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -886,7 +884,6 @@ class _YomiPARSeqSmallEngine:
     """
 
     def __init__(self, weights_path: str, charset_path: str) -> None:
-        import torch
         import torch.nn as nn
         from torch.nn.modules import transformer
         from safetensors.torch import load_file
@@ -1343,6 +1340,22 @@ class YomitanDictionaryManager:
                 except OSError:
                     pass
 
+    def _try_open_cached_db(self, db_path: str, terms_path: str, src_mtime: float) -> bool:
+        """Open cached SQLite database if it is up-to-date with the source dictionary."""
+        if not (os.path.isfile(db_path) and os.path.getmtime(db_path) >= src_mtime):
+            return False
+        try:
+            test_conn = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=ro", uri=True)
+            cur = test_conn.cursor()
+            cur.execute("SELECT dict_title, COUNT(*) FROM entries LIMIT 1")
+            row = cur.fetchone()
+            test_conn.close()
+            if row and row[0]:
+                return self._open_cached_db(db_path, terms_path, row[0], row[1])
+        except Exception:
+            pass
+        return False
+
     def _load_zip(self, zip_path: str) -> None:
         try:
             base_name = os.path.splitext(os.path.basename(zip_path))[0]
@@ -1350,18 +1363,8 @@ class YomitanDictionaryManager:
             terms_path = os.path.join(self.cache_dir, f"{base_name}.terms.pkl")
             zip_mtime = os.path.getmtime(zip_path)
 
-            if os.path.isfile(db_path) and os.path.getmtime(db_path) >= zip_mtime:
-                try:
-                    test_conn = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=ro", uri=True)
-                    cur = test_conn.cursor()
-                    cur.execute("SELECT dict_title, COUNT(*) FROM entries LIMIT 1")
-                    row = cur.fetchone()
-                    test_conn.close()
-                    if row and row[0]:
-                        if self._open_cached_db(db_path, terms_path, row[0], row[1]):
-                            return
-                except Exception:
-                    pass
+            if self._try_open_cached_db(db_path, terms_path, zip_mtime):
+                return
 
             with zipfile.ZipFile(zip_path, "r") as z:
                 names = set(z.namelist())
@@ -1399,18 +1402,8 @@ class YomitanDictionaryManager:
             terms_path = os.path.join(self.cache_dir, f"{base_name}.terms.pkl")
             dir_mtime = os.path.getmtime(idx_path)
 
-            if os.path.isfile(db_path) and os.path.getmtime(db_path) >= dir_mtime:
-                try:
-                    test_conn = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=ro", uri=True)
-                    cur = test_conn.cursor()
-                    cur.execute("SELECT dict_title, COUNT(*) FROM entries LIMIT 1")
-                    row = cur.fetchone()
-                    test_conn.close()
-                    if row and row[0]:
-                        if self._open_cached_db(db_path, terms_path, row[0], row[1]):
-                            return
-                except Exception:
-                    pass
+            if self._try_open_cached_db(db_path, terms_path, dir_mtime):
+                return
 
             with open(idx_path, "r", encoding="utf-8") as f:
                 idx_data = json.load(f)
@@ -1586,48 +1579,64 @@ class WordMetaManager:
                 self._cache[cache_key] = res
         return res
 
-    def get_kanji_details(self, kanji_char: str, jam: Any = None) -> DictionaryResult:
-        """Lookup kanji in Kanjidic2 and return a DictionaryResult with stroke count, readings, and meanings."""
-        stroke_count = None
-        grade = None
-        freq = None
-        jlpt = self._jlpt_kanji.get(kanji_char)
-        rad_num = None
-        rad_char = ""
-        on_readings: List[str] = []
-        kun_readings: List[str] = []
-        nanori: List[str] = []
-        meanings: List[str] = []
-
+    def lookup_kanji_info(self, kanji_char: str, jam: Any = None) -> dict:
+        """Query Kanjidic2 and local JLPT data for a single kanji character."""
+        info: dict = {
+            "stroke_count": None,
+            "grade": None,
+            "freq": None,
+            "jlpt": self._jlpt_kanji.get(kanji_char),
+            "rad_num": None,
+            "rad_char": "",
+            "on_readings": [],
+            "kun_readings": [],
+            "nanori": [],
+            "meanings": [],
+        }
         if jam is not None:
             try:
                 kd_res = jam.lookup(kanji_char)
                 if kd_res and kd_res.chars:
                     c = kd_res.chars[0]
-                    stroke_count = c.stroke_count
-                    grade = c.grade
-                    freq = c.freq
-                    if jlpt is None and c.jlpt is not None:
-                        jlpt = c.jlpt
+                    info["stroke_count"] = c.stroke_count
+                    info["grade"] = c.grade
+                    info["freq"] = c.freq
+                    if info["jlpt"] is None and c.jlpt is not None:
+                        info["jlpt"] = c.jlpt
                     if c.radicals:
                         try:
                             rad_num = int(c.radicals[0].value)
+                            info["rad_num"] = rad_num
                             if 1 <= rad_num <= 214:
-                                rad_char = chr(0x2F00 + rad_num - 1)
+                                info["rad_char"] = chr(0x2F00 + rad_num - 1)
                         except (ValueError, TypeError):
                             pass
                     if c.rm_groups:
                         rm0 = c.rm_groups[0]
-                        on_readings = [str(r) for r in getattr(rm0, "on_readings", []) or []]
-                        kun_readings = [str(r) for r in getattr(rm0, "kun_readings", []) or []]
-                        meanings = [
+                        info["on_readings"] = [str(r) for r in getattr(rm0, "on_readings", []) or []]
+                        info["kun_readings"] = [str(r) for r in getattr(rm0, "kun_readings", []) or []]
+                        info["meanings"] = [
                             getattr(m, "value", str(m))
                             for m in getattr(rm0, "meanings", []) or []
                             if getattr(m, "m_lang", "") in ("", "en")
                         ]
-                    nanori = [getattr(n, "value", str(n)) for n in getattr(c, "nanori", []) or []]
+                    info["nanori"] = [getattr(n, "value", str(n)) for n in getattr(c, "nanori", []) or []]
             except Exception as ex:
                 logger.debug("Kanjidic lookup error for %s: %s", kanji_char, ex)
+        return info
+
+    def get_kanji_details(self, kanji_char: str, jam: Any = None) -> DictionaryResult:
+        """Lookup kanji in Kanjidic2 and return a DictionaryResult with stroke count, readings, and meanings."""
+        info = self.lookup_kanji_info(kanji_char, jam)
+        stroke_count = info["stroke_count"]
+        grade = info["grade"]
+        freq = info["freq"]
+        jlpt = info["jlpt"]
+        rad_num = info["rad_num"]
+        rad_char = info["rad_char"]
+        on_readings = info["on_readings"]
+        kun_readings = info["kun_readings"]
+        meanings = info["meanings"]
 
         readings_parts = []
         if on_readings:
@@ -1793,7 +1802,6 @@ class JapaneseOCRDictionaryPipeline:
             self._jamdict = Jamdict(db_file=db_path, reuse_ctx=True)
             if db_path and os.path.isfile(db_path):
                 try:
-                    import sqlite3
                     with sqlite3.connect(db_path) as conn:
                         cur = conn.cursor()
                         cur.execute("SELECT text FROM Kanji UNION ALL SELECT text FROM Kana")
@@ -1868,30 +1876,14 @@ class JapaneseOCRDictionaryPipeline:
                                     self._custom_dict.setdefault(k, []).extend(v)
                                 elif isinstance(v, dict):
                                     self._custom_dict.setdefault(k, []).append(v)
-                            for k in self._custom_dict:
-                                if len(k) >= 3 and all("\u30a1" <= c <= "\u30fc" for c in k):
-                                    v_key = self._katakana_voicing_key(k)
-                                    self._custom_voicing_index.setdefault(v_key, []).append(k)
                     logger.info("Loaded custom/Pokémon dictionary terms from %s (total: %d terms).", c_path, len(self._custom_dict))
                 except Exception as exc:
                     logger.warning("Failed to load custom dictionary %s: %s", c_path, exc)
 
-    def reload_dictionaries(self) -> None:
-        """Dynamically reload custom and Yomitan dictionaries from the dictionaries/ folder at runtime."""
-        with self._lock:
-            self._load_custom_dictionaries()
-            for k, entries in self._BUILTIN_COLLOQUIAL_DICT.items():
-                existing = self._custom_dict.setdefault(k, [])
-                for ent in entries:
-                    if ent not in existing:
-                        existing.append(ent)
-            if self._yomitan_mgr is None:
-                self._yomitan_mgr = YomitanDictionaryManager(dict_dir=DICTIONARIES_DIR)
-            else:
-                self._yomitan_mgr.load_all()
-            if self._yomitan_mgr.known_terms:
-                self._jmd_known_terms.update(self._yomitan_mgr.known_terms)
-            logger.info("Successfully reloaded all dictionaries from %s.", DICTIONARIES_DIR)
+        for k in self._custom_dict:
+            if len(k) >= 3 and all("\u30a1" <= c <= "\u30fc" for c in k):
+                v_key = self._katakana_voicing_key(k)
+                self._custom_voicing_index.setdefault(v_key, []).append(k)
 
     _BUILTIN_COLLOQUIAL_DICT: Dict[str, List[dict]] = {
         "どうだろ": [{
@@ -2552,10 +2544,6 @@ class JapaneseOCRDictionaryPipeline:
         crop_autocontrast = ImageOps.autocontrast(crop, cutoff=1)
         crop_padded_rgb = ImageOps.expand(crop_autocontrast, border=6, fill=255).convert("RGB")
         tight_for_ndl = crop_autocontrast.convert("RGB") if is_light_on_dark else rgb_crop
-
-        punct_chars = r"\.…‥・。、．，！？!?\-―～~「」『』（）()\[\]【】［］｛｝｜|¦＜＞<>,;"
-
-        counters = r"[\d番号円年月日時分秒つ個人匹本体台頭羽ばんごうえんにん]"
 
         _clean_pair = self._clean_ocr_text_pair
 
@@ -6967,7 +6955,6 @@ def render_dictionary_popup(
     font_reading = load_cjk_ttf_font(13)
     font_body = load_cjk_ttf_font(13)
 
-    screen_label = "TOP" if screen_id == SCREEN_ID_TOP else "BOT"
     if result.headword == "Selection Translation":
         surf_info = f"Selection: {result.matched_surface}"
     else:
@@ -7156,8 +7143,6 @@ def render_kanji_popup(
     # Theme colors
     bg_body = (20, 24, 34)
     bg_header = (34, 42, 64)
-    bg_footer = (28, 34, 50)
-    border_col = (88, 166, 255)
 
     # 1. Body fill (no border drawn here — C++ overlays it at fixed screen coords every frame)
     draw.rectangle([0, 0, KANJI_TALL_DIM[0] - 1, KANJI_TALL_DIM[1] - 1], fill=bg_body)
@@ -7174,47 +7159,20 @@ def render_kanji_popup(
     draw.text((250, 9), "[B: Close]", fill=(150, 175, 210), font=font_small)
 
     # Get kanji details
-    stroke_count = None
-    grade = None
-    freq = None
-    jlpt = None
-    rad_num = None
-    rad_char = ""
-    on_readings: List[str] = []
-    kun_readings: List[str] = []
-    nanori: List[str] = []
-    meanings: List[str] = []
-
     if word_meta_mgr is not None and jamdict is not None:
-        try:
-            kd_res = jamdict.lookup(kanji_char)
-            if kd_res and kd_res.chars:
-                c = kd_res.chars[0]
-                stroke_count = c.stroke_count
-                grade = c.grade
-                freq = c.freq
-                jlpt = word_meta_mgr._jlpt_kanji.get(kanji_char)
-                if jlpt is None and c.jlpt is not None:
-                    jlpt = c.jlpt
-                if c.radicals:
-                    try:
-                        rad_num = int(c.radicals[0].value)
-                        if 1 <= rad_num <= 214:
-                            rad_char = chr(0x2F00 + rad_num - 1)
-                    except (ValueError, TypeError):
-                        pass
-                if c.rm_groups:
-                    rm0 = c.rm_groups[0]
-                    on_readings = [str(r) for r in getattr(rm0, "on_readings", []) or []]
-                    kun_readings = [str(r) for r in getattr(rm0, "kun_readings", []) or []]
-                    meanings = [
-                        getattr(m, "value", str(m))
-                        for m in getattr(rm0, "meanings", []) or []
-                        if getattr(m, "m_lang", "") in ("", "en")
-                    ]
-                nanori = [getattr(n, "value", str(n)) for n in getattr(c, "nanori", []) or []]
-        except Exception as exc:
-            logger.warning("Error fetching Kanjidic info for %s: %s", kanji_char, exc)
+        info = word_meta_mgr.lookup_kanji_info(kanji_char, jamdict)
+    else:
+        info = {}
+    stroke_count = info.get("stroke_count")
+    grade = info.get("grade")
+    freq = info.get("freq")
+    jlpt = info.get("jlpt")
+    rad_num = info.get("rad_num")
+    rad_char = info.get("rad_char", "")
+    on_readings: List[str] = info.get("on_readings", [])
+    kun_readings: List[str] = info.get("kun_readings", [])
+    nanori: List[str] = info.get("nanori", [])
+    meanings: List[str] = info.get("meanings", [])
 
     # Helper: pixel-width line wrapper (wraps a list of items joined by sep)
     def _wrap_items(items: List[str], sep: str, font: ImageFont.ImageFont, max_w: int) -> List[str]:
@@ -7774,68 +7732,6 @@ def _load_gemini_api_keys() -> List[str]:
     return keys
 
 
-def _load_gemini_api_key() -> str:
-    """Retrieve primary Gemini API key from environment or gitignored credentials files."""
-    keys = _load_gemini_api_keys()
-    return keys[0] if keys else ""
-
-
-ALLOWED_CONFIG_KEYS = {
-    "anki_mode",
-    "use_ankiconnect",
-    "ankiconnect_url",
-    "deck_prefix",
-    "screenshot_mode",
-    "player_name",
-    "player_english_name",
-    "title_names",
-    "gemini_model",
-    "gemini_fallback_model",
-    "gemini_use_vision",
-    "ocr_mode",
-    "ollama_model",
-}
-
-
-def save_anki_config(cfg_updates: dict) -> None:
-    """Save anki_config.json cleanly while preserving custom title_names."""
-    current = _load_anki_config()
-    for k, v in cfg_updates.items():
-        if k in ALLOWED_CONFIG_KEYS:
-            current[k] = v
-    tmp_path = ANKI_CONFIG_PATH + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(current, f, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, ANKI_CONFIG_PATH)
-
-
-def save_anki_credentials(username: str, password: str) -> None:
-    """Save anki_credentials.json with restricted NTFS permissions."""
-    u_clean = username.strip()[:256]
-    p_clean = password.strip()[:256]
-    data = {"ankiweb_username": u_clean, "ankiweb_password": p_clean}
-    tmp_path = ANKI_CREDENTIALS_PATH + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    if sys.platform == "win32":
-        try:
-            uname = os.environ.get("USERNAME", "")
-            if uname and re.match(r"^[\w\-. ]+$", uname):
-                subprocess.run(
-                    ["icacls", tmp_path, "/inheritance:r", "/grant:r", f"{uname}:(R,W)"],
-                    capture_output=True,
-                    check=False,
-                )
-        except Exception:
-            pass
-    else:
-        try:
-            os.chmod(tmp_path, 0o600)
-        except Exception:
-            pass
-    os.replace(tmp_path, ANKI_CREDENTIALS_PATH)
-
-
 def validate_ankiconnect_url(url: str) -> Tuple[bool, str]:
     """Validate AnkiConnect URL to prevent SSRF and protocol smuggling."""
     try:
@@ -7849,64 +7745,6 @@ def validate_ankiconnect_url(url: str) -> Tuple[bool, str]:
         return True, ""
     except Exception as exc:
         return False, f"Malformed URL: {exc}"
-
-
-def test_ankiconnect_connection(url: str = "http://127.0.0.1:8765") -> Tuple[bool, str]:
-    """Test connection to local Anki Desktop via AnkiConnect."""
-    valid, err_msg = validate_ankiconnect_url(url)
-    if not valid:
-        return False, err_msg
-    try:
-        payload = json.dumps({"action": "version", "version": 6}).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=1.8) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if data.get("error"):
-                return False, f"AnkiConnect error: {data['error']}"
-            ver = data.get("result", "?")
-
-        deck_count = 0
-        try:
-            p_deck = json.dumps({"action": "deckNames", "version": 6}).encode("utf-8")
-            r_deck = urllib.request.Request(url, data=p_deck, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(r_deck, timeout=1.8) as resp:
-                d_data = json.loads(resp.read().decode("utf-8"))
-                decks = d_data.get("result", [])
-                if isinstance(decks, list):
-                    deck_count = len(decks)
-        except Exception:
-            pass
-
-        return True, f"Connected to Anki Desktop! (API v{ver}, {deck_count} decks found)"
-    except urllib.error.URLError:
-        return False, "Could not reach Anki Desktop on 127.0.0.1:8765.\n\nMake sure:\n1. Anki Desktop is running.\n2. AnkiConnect add-on is installed (Code: 2055492159)."
-    except Exception as exc:
-        return False, f"Connection failed: {exc}"
-
-
-def test_ankiweb_login(username: str, password: str) -> Tuple[bool, str]:
-    """Test direct AnkiWeb authentication using the official anki library."""
-    if not username or not password:
-        return False, "Username and password cannot be empty."
-    import tempfile
-    try:
-        from anki.collection import Collection
-        with tempfile.TemporaryDirectory() as td:
-            col_path = os.path.join(td, "test_auth.anki2")
-            col = Collection(col_path)
-            try:
-                auth = col.sync_login(username, password, None)
-                col.close()
-                if auth and getattr(auth, "hkey", None):
-                    return True, f"AnkiWeb login successful for '{username}'!"
-                return False, "Authentication succeeded but received empty sync key."
-            except Exception as auth_exc:
-                col.close()
-                return False, f"AnkiWeb authentication failed: {auth_exc}"
-    except ImportError:
-        return False, "Python 'anki' package is not installed."
-    except Exception as exc:
-        return False, f"Error validating AnkiWeb login: {exc}"
 
 
 def resolve_3ds_game_name(title_id: Union[int, str]) -> str:
@@ -9504,6 +9342,17 @@ def handle_3ds_session(
                     prog_hdr = struct.pack(POPUP_HEADER_FMT, t_scr, len(prog_rgb))
                     _safe_send_pair(prog_hdr, prog_rgb)
 
+            def _build_anki_screenshot() -> Optional[Image.Image]:
+                ss_mode = str(_load_anki_config().get("screenshot_mode", "clicked") or "clicked").strip().lower()
+                if ss_mode == "none":
+                    return None
+                if ss_mode == "both":
+                    combined = Image.new("RGB", (400, 484), color=(18, 20, 26))
+                    combined.paste(top_img, (0, 0))
+                    combined.paste(bot_img, (40, 244))
+                    return combined
+                return top_img if last_screen_id == SCREEN_ID_TOP else bot_img
+
             while True:
                 conn.settimeout(IDLE_SESSION_TIMEOUT_SEC)
                 click_data = rx_stream.recv_frame(conn, CLICK_PACKET_SIZE)
@@ -9887,15 +9736,7 @@ def handle_3ds_session(
                             entry_idx = y
                         result = active_results[entry_idx]
 
-                    ss_mode = str(_load_anki_config().get("screenshot_mode", "clicked") or "clicked").strip().lower()
-                    if ss_mode == "none":
-                        ss_img: Optional[Image.Image] = None
-                    elif ss_mode == "both":
-                        ss_img = Image.new("RGB", (400, 484), color=(18, 20, 26))
-                        ss_img.paste(top_img, (0, 0))
-                        ss_img.paste(bot_img, (40, 244))
-                    else:
-                        ss_img = top_img if last_screen_id == SCREEN_ID_TOP else bot_img
+                    ss_img = _build_anki_screenshot()
 
                     if not client_supports_bundle:
                         # Legacy non-bundle client expects a full rendered popup image response
@@ -10002,15 +9843,7 @@ def handle_3ds_session(
                         continue
                     kanji_res = pipeline.word_meta_mgr.get_kanji_details(last_kanji_char, pipeline.jamdict)
                     target_scr_snap = last_target_screen_id
-                    ss_mode = str(_load_anki_config().get("screenshot_mode", "clicked") or "clicked").strip().lower()
-                    if ss_mode == "none":
-                        ss_img: Optional[Image.Image] = None
-                    elif ss_mode == "both":
-                        ss_img = Image.new("RGB", (400, 484), color=(18, 20, 26))
-                        ss_img.paste(top_img, (0, 0))
-                        ss_img.paste(bot_img, (40, 244))
-                    else:
-                        ss_img = top_img if last_screen_id == SCREEN_ID_TOP else bot_img
+                    ss_img = _build_anki_screenshot()
 
                     with anki_state_lock:
                         anki_req_seq += 1
