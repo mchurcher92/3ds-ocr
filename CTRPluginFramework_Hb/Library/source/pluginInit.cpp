@@ -91,8 +91,22 @@ static Hook         g_onSharedMemMapHook;
 static Hook         g_onSharedMemUnmapHook;
 static LightLock    g_onLoadCroLock;
 
+#ifndef CTRPF_HB_DEBUG_LOG
+#define CTRPF_HB_DEBUG_LOG 0
+#endif
+
+static bool g_hbDebugLogEnabled = (CTRPF_HB_DEBUG_LOG != 0);
+
+extern "C" bool HbBootLogIsEnabled(void)
+{
+    return g_hbDebugLogEnabled;
+}
+
 extern "C" void HbBootLog(const char *msg)
 {
+    if (!g_hbDebugLogEnabled)
+        return;
+
     static LightLock logLock;
     static bool lockInit = false;
     static char logPath[128] = {0};
@@ -272,6 +286,12 @@ namespace CTRPluginFramework
     {
         // Init sdmcArchive
         OpenSdmcArchive();
+
+#if CTRPF_HB_DEBUG_LOG
+        g_hbDebugLogEnabled = true;
+#else
+        g_hbDebugLogEnabled = (File::Exists("/luma/hb_debug.flag") == 1);
+#endif
 
         // Set current working directory
         if (FwkSettings::Header->isDefaultPlugin)
@@ -778,7 +798,8 @@ namespace CTRPluginFramework
                 {
                     const bool isSleepEntry = (event == PLG_SLEEP_ENTRY);
                     if (!isSleepEntry) {
-                        HbLogDisplayState("home_enter");
+                        if (g_hbDebugLogEnabled)
+                            HbLogDisplayState("home_enter");
                         HbLog("[plg] before UserCb");
                     }
                     ProcessImpl::UserProcessEventCallback(isSleepEntry ? Process::Event::SLEEP_ENTER : Process::Event::HOME_ENTER);
@@ -802,7 +823,8 @@ namespace CTRPluginFramework
                         HbLog(Utils::Format("[plg] sleep_replied irrst=%d", restoreIrrstOnWake ? 1 : 0).c_str());
                     } else {
                         HbLog("[plg] after PLGLDR__Reply");
-                        homeElapsedTicks = 1;
+                        if (g_hbDebugLogEnabled)
+                            homeElapsedTicks = 1;
                     }
                 }
                 else if (event == PLG_SLEEP_EXIT || event == PLG_HOME_EXIT)
@@ -863,7 +885,7 @@ namespace CTRPluginFramework
                     ProcessImpl::UserProcessEventCallback(Process::Event::SWAP_EXIT);
                 }
 
-                if (homeElapsedTicks > 0)
+                if (g_hbDebugLogEnabled && homeElapsedTicks > 0)
                 {
                     if (homeElapsedTicks == 5 || homeElapsedTicks == 10 || homeElapsedTicks == 20 ||
                         homeElapsedTicks == 40 || homeElapsedTicks == 80 || homeElapsedTicks == 160 ||

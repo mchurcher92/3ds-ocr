@@ -2,6 +2,8 @@
 #include <CTRPluginFramework.hpp>
 #include "ocr_client.hpp"
 
+extern "C" bool HbBootLogIsEnabled(void);
+
 namespace CTRPluginFramework
 {
     void PatchProcess(FwkSettings &settings)
@@ -295,7 +297,7 @@ namespace CTRPluginFramework
 
         InitMenu(*menu);
 
-        {
+        if (HbBootLogIsEnabled()) {
             File logFile;
             if (File::Open(logFile, "/luma/hb_boot.log", File::WRITE | File::CREATE | File::APPEND | File::SYNC) == 0) {
                 logFile.Write("[main] calling menu->Run()\n", 27);
