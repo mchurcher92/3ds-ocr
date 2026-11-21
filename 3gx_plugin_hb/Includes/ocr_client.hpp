@@ -22,10 +22,13 @@ namespace CTRPluginFramework
     #define BOT_HEIGHT              240
     #define POPUP_WIDTH             320
     #define POPUP_HEIGHT            240
+    #define KANJI_TALL_HEIGHT       400
     #define BPP_RGB24               3
     #define TOP_FB_RGB_SIZE         (TOP_WIDTH * TOP_HEIGHT * BPP_RGB24)
     #define BOT_FB_RGB_SIZE         (BOT_WIDTH * BOT_HEIGHT * BPP_RGB24)
     #define POPUP_RGB_SIZE          (POPUP_WIDTH * POPUP_HEIGHT * BPP_RGB24)
+    #define KANJI_TALL_RGB_SIZE     (POPUP_WIDTH * KANJI_TALL_HEIGHT * BPP_RGB24)
+    #define KANJI_TALL_PAYLOAD_SIZE (KANJI_TALL_RGB_SIZE + 2)  // +2 bytes: big-endian uint16 content_height
 
     // Protocol Navigation Commands
     #define CMD_PREV_ENTRY          0x10
@@ -44,11 +47,14 @@ namespace CTRPluginFramework
     #define CMD_ADD_ANKI_BOT        0x1D
     #define CMD_TRANSLATE_TOP       0x20
     #define CMD_TRANSLATE_BOT       0x21
+    #define CMD_LOOKUP_KANJI        0x22
+    #define CMD_ADD_ANKI_KANJI      0x23
 
     // Server Response Flags (OR'd onto target_screen_id in 5-byte popup header)
     #define POPUP_BUNDLE_FLAG        0x80
     #define POPUP_STATUS_FLAG        0x40
     #define POPUP_SCREEN_BUNDLE_FLAG 0x20
+    #define POPUP_KANJI_FLAG         0x10
 
     // Keybindings Structure
     struct OcrKeyBindings {

@@ -41,23 +41,39 @@ namespace CTRPluginFramework
         u32 size = 0;
         bool isSvc = false;
 
-        bool Alloc(u32 vaddr, u32 reqSize) {
+        bool Alloc(u32 vaddr, u32 reqSize, u32 fallbackVaddr = 0) {
             if (ptr) return true;
             u32 aligned = (reqSize + 0xFFF) & ~0xFFF;
             u32 out = 0;
 
             // Strategy 1: Dedicated memory in APP region at fixed vaddr (bypasses newlib heap limit)
-            Result r = svcControlMemoryUnsafe(&out, vaddr, aligned,
-                (MemOp)(MEMOP_REGION_APP | MEMOP_ALLOC), (MemPerm)(MEMPERM_READ | MEMPERM_WRITE));
-            if (R_SUCCEEDED(r) && out != 0) {
-                ptr = (u8 *)out;
-                size = aligned;
-                isSvc = true;
-                return true;
+            if (vaddr != 0) {
+                Result r = svcControlMemoryUnsafe(&out, vaddr, aligned,
+                    (MemOp)(MEMOP_REGION_APP | MEMOP_ALLOC), (MemPerm)(MEMPERM_READ | MEMPERM_WRITE));
+                if (R_SUCCEEDED(r) && out != 0) {
+                    ptr = (u8 *)out;
+                    size = aligned;
+                    isSvc = true;
+                    return true;
+                }
             }
 
-            // Strategy 2: SYSTEM region at vaddr
-            r = svcControlMemoryUnsafe(&out, vaddr, aligned,
+            // Strategy 2: Fallback APP region address (e.g. 0x072E0000 or 0x07320000)
+            if (fallbackVaddr != 0 && fallbackVaddr != vaddr) {
+                out = 0;
+                Result r = svcControlMemoryUnsafe(&out, fallbackVaddr, aligned,
+                    (MemOp)(MEMOP_REGION_APP | MEMOP_ALLOC), (MemPerm)(MEMPERM_READ | MEMPERM_WRITE));
+                if (R_SUCCEEDED(r) && out != 0) {
+                    ptr = (u8 *)out;
+                    size = aligned;
+                    isSvc = true;
+                    return true;
+                }
+            }
+
+            // Strategy 3: SYSTEM region at 0x074C0000 (New 3DS extended memory)
+            out = 0;
+            Result r = svcControlMemoryUnsafe(&out, 0x074C0000, aligned,
                 (MemOp)(MEMOP_REGION_SYSTEM | MEMOP_ALLOC), (MemPerm)(MEMPERM_READ | MEMPERM_WRITE));
             if (R_SUCCEEDED(r) && out != 0) {
                 ptr = (u8 *)out;
@@ -66,7 +82,7 @@ namespace CTRPluginFramework
                 return true;
             }
 
-            // Strategy 3: fallback to newlib malloc
+            // Strategy 4: fallback to newlib malloc
             void *m = malloc(reqSize);
             if (m) {
                 ptr = (u8 *)m;
@@ -95,13 +111,26 @@ namespace CTRPluginFramework
     static SessionBuffer s_botBuffer;
     static SessionBuffer s_popupBuffer;
 
+    static SessionBuffer s_kanjiTallBuffer;
+    static int s_kanjiScrollY;
+    static int s_kanjiMaxScrollY;           // actual max scroll = max(0, content_height - viewport)
+
     #define s_top_rgb   (s_topBuffer.ptr)
     #define s_bot_rgb   (s_botBuffer.ptr)
     #define s_popup_rgb (s_popupBuffer.ptr)
 
+    #define s_kanji_tall (s_kanjiTallBuffer.ptr)
+
     static void OCR_FreePopupBuffer(void)
     {
         s_popupBuffer.Free();
+    }
+
+    static void OCR_FreeKanjiBuffer(void)
+    {
+        s_kanjiTallBuffer.Free();
+        s_kanjiScrollY = 0;
+        s_kanjiMaxScrollY = 0;
     }
 
     static void OCR_FreeSessionBuffers(void)
@@ -109,6 +138,7 @@ namespace CTRPluginFramework
         s_topBuffer.Free();
         s_botBuffer.Free();
         s_popupBuffer.Free();
+        s_kanjiTallBuffer.Free();
     }
 
     // Parse host and port from "ip:port" or "ip" string
@@ -374,7 +404,7 @@ namespace CTRPluginFramework
         txt += "In Game:\n";
         txt += "Press [" + OCR_KeyToString(g_ocrKeys.activation) + "] anytime during gameplay to capture text.\n\n";
         txt += "Controls in OCR Mode:\n";
-        txt += "- Circle Pad: Move cursor\n";
+        txt += "- Circle Pad / C-Stick: Move cursor\n";
         txt += "- Touch Screen: Jump cursor to touched position\n";
         txt += "- [" + OCR_KeyToString(g_ocrKeys.lookup) + "]: Single word lookup / Region point\n";
         txt += "- [" + OCR_KeyToString(g_ocrKeys.modeToggle) + "]: Toggle Mode (Single Word / Region Box)\n";
@@ -410,6 +440,50 @@ namespace CTRPluginFramework
         if (R_SUCCEEDED(acInit())) {
             s_acInitialized = true;
         }
+    }
+
+    static bool s_pluginOwnIrrst = false;
+
+    static void OCR_InitCStick(void)
+    {
+        if (System::IsNew3DS()) {
+            if (irrstSharedMem == nullptr && !s_pluginOwnIrrst) {
+                Result res = irrstInit();
+                if (R_SUCCEEDED(res)) {
+                    s_pluginOwnIrrst = true;
+                }
+            }
+        }
+    }
+
+    static void OCR_ExitCStick(void)
+    {
+        if (s_pluginOwnIrrst) {
+            s_pluginOwnIrrst = false;
+            irrstExit();
+        }
+    }
+
+    static shortVector GetCStickPosition(void)
+    {
+        circlePosition cPos = {0, 0};
+        irrstCstickRead(&cPos);
+        if (cPos.dx == 0 && cPos.dy == 0 && irrstSharedMem != nullptr) {
+            vu32 *imem = irrstSharedMem;
+            u32 idx = imem[4];
+            if (idx > 7) idx = 7;
+            if (idx == 0) {
+                u64 tickOld = reinterpret_cast<vu64*>(imem)[1];
+                u64 tickNew = reinterpret_cast<vu64*>(imem)[0];
+                if (tickNew == tickOld || static_cast<s64>(tickNew) < 0) {
+                    return shortVector(0, 0);
+                }
+            }
+            u32 raw = imem[9 + idx * 4];
+            cPos.dx = (s16)(raw & 0xFFFF);
+            cPos.dy = (s16)(raw >> 16);
+        }
+        return shortVector(cPos.dx, cPos.dy);
     }
 
     void OCR_Initialize(void)
@@ -450,6 +524,7 @@ namespace CTRPluginFramework
         }
         s_networkLocked = false;
         OCR_FreeSessionBuffers();
+        OCR_ExitCStick();
     }
 
     static size_t OCR_LoadPskFromSd(char *out_psk, size_t max_len)
@@ -1048,10 +1123,27 @@ namespace CTRPluginFramework
         }
     }
 
-    static Color GetCleanPixelColor(int screenId, int x, int y, bool hasPopup, int popupTargetScreen)
+    static Color GetCleanPixelColor(int screenId, int x, int y, bool hasPopup, int popupTargetScreen, bool hasKanji = false, int kanjiTargetScreen = 0)
     {
         int screenW = (screenId == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
         if (x < 0 || x >= screenW || y < 0 || y >= 240) return Color::Black;
+
+        if (hasKanji && kanjiTargetScreen == screenId && s_kanji_tall) {
+            int xOffset = (screenId == SCREEN_ID_TOP) ? ((TOP_WIDTH - POPUP_WIDTH) / 2) : 0;
+            if (x >= xOffset && x < xOffset + POPUP_WIDTH && y >= 0 && y < POPUP_HEIGHT) {
+                int px = x - xOffset;
+                int py;
+                if (y < 32) {
+                    py = y;
+                } else if (y >= 216) {
+                    py = (KANJI_TALL_HEIGHT - 24) + (y - 216);
+                } else {
+                    py = y + std::max(0, std::min(s_kanjiScrollY, s_kanjiMaxScrollY));
+                }
+                size_t idx = (py * POPUP_WIDTH + px) * 3;
+                return Color(s_kanji_tall[idx], s_kanji_tall[idx + 1], s_kanji_tall[idx + 2]);
+            }
+        }
 
         if (hasPopup && popupTargetScreen == screenId && s_popup_rgb) {
             int xOffset = (screenId == SCREEN_ID_TOP) ? ((TOP_WIDTH - POPUP_WIDTH) / 2) : 0;
@@ -1069,23 +1161,23 @@ namespace CTRPluginFramework
         return Color(bg[idx], bg[idx + 1], bg[idx + 2]);
     }
 
-    static void RestorePixelUnder(int screenId, int x, int y, bool hasPopup, int popupTargetScreen)
+    static void RestorePixelUnder(int screenId, int x, int y, bool hasPopup, int popupTargetScreen, bool hasKanji = false, int kanjiTargetScreen = 0)
     {
         int screenW = (screenId == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
         if (x < 0 || x >= screenW || y < 0 || y >= 240) return;
         const Screen &screen = (screenId == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
-        screen.DrawPixel(x, y, GetCleanPixelColor(screenId, x, y, hasPopup, popupTargetScreen));
+        screen.DrawPixel(x, y, GetCleanPixelColor(screenId, x, y, hasPopup, popupTargetScreen, hasKanji, kanjiTargetScreen));
     }
 
     // Cursor Drawing & Restoration
-    static void RestoreCursorArea(int screenId, int x, int y, bool hasPopup, int popupTargetScreen)
+    static void RestoreCursorArea(int screenId, int x, int y, bool hasPopup, int popupTargetScreen, bool hasKanji = false, int kanjiTargetScreen = 0)
     {
         for (int dy = -CURSOR_HALF; dy <= CURSOR_HALF; ++dy) {
             int py = y + dy;
             if (py < 0 || py >= 240) continue;
             for (int dx = -CURSOR_HALF; dx <= CURSOR_HALF; ++dx) {
                 int px = x + dx;
-                RestorePixelUnder(screenId, px, py, hasPopup, popupTargetScreen);
+                RestorePixelUnder(screenId, px, py, hasPopup, popupTargetScreen, hasKanji, kanjiTargetScreen);
             }
         }
     }
@@ -1123,7 +1215,7 @@ namespace CTRPluginFramework
         bool is_drawn{false};
     };
 
-    static void RestoreSelBoxArea(const SelBoxState &sb, bool hasPopup, int popupTargetScreen)
+    static void RestoreSelBoxArea(const SelBoxState &sb, bool hasPopup, int popupTargetScreen, bool hasKanji = false, int kanjiTargetScreen = 0)
     {
         if (!sb.is_drawn) return;
         int rx1 = sb.drawn_rx1;
@@ -1136,7 +1228,7 @@ namespace CTRPluginFramework
                 bool isOuter = (x == rx1 || x == rx2 || y == ry1 || y == ry2);
                 bool isInner = (x == rx1 + 1 || x == rx2 - 1 || y == ry1 + 1 || y == ry2 - 1);
                 if (isOuter || isInner) {
-                    RestorePixelUnder(sb.screenId, x, y, hasPopup, popupTargetScreen);
+                    RestorePixelUnder(sb.screenId, x, y, hasPopup, popupTargetScreen, hasKanji, kanjiTargetScreen);
                 }
             }
         }
@@ -1191,6 +1283,76 @@ namespace CTRPluginFramework
             }
         }
     }
+    // Draw a 240px-high crop of the tall kanji buffer starting at scrollY
+    // Draw a 240px-high kanji window:
+    //   - Screen y=0..31:   pinned header (from tall canvas y=0..31)
+    //   - Screen y=32..215: scrollable content (from tall canvas y = y + scrollY)
+    //   - Screen y=216..239: pinned footer (from tall canvas y=376..399)
+    //   - Outer border (2px light-blue) + header/footer divider lines overlaid
+    static void DrawKanjiCrop(int targetScreenId, const u8 *tallRgb, int scrollY)
+    {
+        static const int HEADER_HEIGHT   = 32;                     // pinned header rows
+        static const int FOOTER_SCREEN_Y = 216;                    // screen y where footer starts
+        static const int FOOTER_TALL_Y   = KANJI_TALL_HEIGHT - 24; // 376 — server-rendered footer
+
+        scrollY = std::max(0, std::min(scrollY, s_kanjiMaxScrollY));
+        const Screen &screen = (targetScreenId == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
+        int xOffset = (targetScreenId == SCREEN_ID_TOP) ? ((TOP_WIDTH - POPUP_WIDTH) / 2) : 0;
+
+        // 1. Pinned header (screen y = 0..31, source: tall y = 0..31)
+        for (int y = 0; y < HEADER_HEIGHT; ++y) {
+            for (int x = 0; x < POPUP_WIDTH; ++x) {
+                size_t idx = (y * POPUP_WIDTH + x) * 3;
+                screen.DrawPixel(x + xOffset, y, Color(tallRgb[idx], tallRgb[idx+1], tallRgb[idx+2]));
+            }
+        }
+
+        // 2. Scrollable content (screen y = 32..215, source: tall y = y + scrollY)
+        for (int y = HEADER_HEIGHT; y < FOOTER_SCREEN_Y; ++y) {
+            int tallY = y + scrollY;
+            for (int x = 0; x < POPUP_WIDTH; ++x) {
+                size_t idx = (tallY * POPUP_WIDTH + x) * 3;
+                screen.DrawPixel(x + xOffset, y, Color(tallRgb[idx], tallRgb[idx+1], tallRgb[idx+2]));
+            }
+        }
+
+        // 3. Pinned footer (screen y = 216..239, source: tall y = 376..399)
+        for (int y = FOOTER_SCREEN_Y; y < POPUP_HEIGHT; ++y) {
+            int tallY = FOOTER_TALL_Y + (y - FOOTER_SCREEN_Y);
+            for (int x = 0; x < POPUP_WIDTH; ++x) {
+                size_t idx = (tallY * POPUP_WIDTH + x) * 3;
+                screen.DrawPixel(x + xOffset, y, Color(tallRgb[idx], tallRgb[idx+1], tallRgb[idx+2]));
+            }
+        }
+
+        // 4. Fixed border overlay (2px light-blue)
+        Color borderCol(88, 166, 255);
+        // Top edge
+        for (int x = 0; x < POPUP_WIDTH; ++x) {
+            screen.DrawPixel(x + xOffset, 0, borderCol);
+            screen.DrawPixel(x + xOffset, 1, borderCol);
+        }
+        // Bottom edge
+        for (int x = 0; x < POPUP_WIDTH; ++x) {
+            screen.DrawPixel(x + xOffset, POPUP_HEIGHT - 2, borderCol);
+            screen.DrawPixel(x + xOffset, POPUP_HEIGHT - 1, borderCol);
+        }
+        // Left and right edges
+        for (int y = 0; y < POPUP_HEIGHT; ++y) {
+            screen.DrawPixel(0 + xOffset, y, borderCol);
+            screen.DrawPixel(1 + xOffset, y, borderCol);
+            screen.DrawPixel(POPUP_WIDTH - 2 + xOffset, y, borderCol);
+            screen.DrawPixel(POPUP_WIDTH - 1 + xOffset, y, borderCol);
+        }
+        // Header separator line (screen y=31)
+        for (int x = 2; x < POPUP_WIDTH - 2; ++x) {
+            screen.DrawPixel(x + xOffset, HEADER_HEIGHT - 1, borderCol);
+        }
+        // Footer separator line (screen y=216)
+        for (int x = 2; x < POPUP_WIDTH - 2; ++x) {
+            screen.DrawPixel(x + xOffset, FOOTER_SCREEN_Y, borderCol);
+        }
+    }
 
     // =========================================================================
     // Client-Side Popup Bundle Parsing & 4-bpp Glyph Rendering
@@ -1217,6 +1379,7 @@ namespace CTRPluginFramework
         bool found{false};
         bool ocrDisagreement{false};
         std::string ocrBadge;
+        std::string rankJlpt;
         std::vector<std::string> wrappedLines;
         std::vector<uint32_t> posCodepoints;
     };
@@ -1438,6 +1601,7 @@ namespace CTRPluginFramework
             !ReadU8(buf, len, off, fFlag) ||
             !ReadU8(buf, len, off, dFlag) ||
             !ReadStrU8(buf, len, off, e.ocrBadge) ||
+            !ReadStrU8(buf, len, off, e.rankJlpt) ||
             !ReadU16(buf, len, off, numLines)) {
             return false;
         }
@@ -1775,7 +1939,6 @@ namespace CTRPluginFramework
         }
 
         // Header label
-        std::string scrLabel = (sourceScreenId == SCREEN_ID_TOP) ? "TOP" : "BOT";
         std::string surfInfo;
         if (res.headword == "Selection Translation") {
             surfInfo = "Selection: " + res.matchedSurface;
@@ -1784,8 +1947,14 @@ namespace CTRPluginFramework
         } else {
             surfInfo = "Text: " + res.contextText;
         }
+        std::string tagStr;
+        if (res.headword == "Selection Translation") {
+            tagStr = "[Translate] ";
+        } else if (!res.rankJlpt.empty()) {
+            tagStr = "[" + res.rankJlpt + "] ";
+        }
         int maxHdrW = std::max(125, 312 - badgeW - ocrBadgeW - 14);
-        std::string hdrText = "[" + scrLabel + " " + std::to_string(clickX) + "," + std::to_string(clickY) + "] " + surfInfo;
+        std::string hdrText = tagStr + surfInfo;
         hdrText = TruncateGlyphText(glyphs, 0, hdrText, maxHdrW);
         DrawGlyphText(screen, xOff, glyphs, 0, hdrText, 8, 7, Color(185, 215, 255), bgHeader, badgeX - ocrBadgeW - 4);
 
@@ -1895,6 +2064,97 @@ namespace CTRPluginFramework
                           popupBundle.variants.size(), eIdx, (int)var.entries.size(), var.entries[eIdx],
                           popupBundle.glossScrollY, popupBundle.posScrollX);
         }
+    }
+
+    static inline bool IsKanjiCodepoint(uint32_t cp)
+    {
+        return (cp >= 0x4E00 && cp <= 0x9FFF) ||
+               (cp >= 0x3400 && cp <= 0x4DBF) ||
+               (cp >= 0xF900 && cp <= 0xFAFF) ||
+               (cp == 0x3005);
+    }
+
+    static bool TryGetKanjiInText(const GlyphMap &glyphs, uint8_t fontId, const std::string &text,
+                                  int startX, int startY, int fontHeight, int popX, int popY,
+                                  uint32_t &outCp, int maxRightX = 315)
+    {
+        if (popY < startY - 2 || popY >= startY + fontHeight + 2) return false;
+        int penX = startX;
+        for (uint32_t cp : Utf8ToCodepoints(text)) {
+            auto it = glyphs.find(GlyphKey(fontId, cp));
+            int adv = (it != glyphs.end()) ? (int)it->second.advanceX : ((cp > 0x7E) ? ((fontId == 2) ? 18 : 12) : ((fontId == 2) ? 10 : 7));
+            if (popX >= penX - 1 && popX < penX + adv + 1) {
+                if (IsKanjiCodepoint(cp)) {
+                    outCp = cp;
+                    return true;
+                }
+                return false;
+            }
+            penX += adv;
+            if (penX >= maxRightX) break;
+        }
+        return false;
+    }
+
+    static bool TryGetKanjiAtPopupCoord(int popX, int popY, const GlyphMap &glyphs,
+                                        const PopupEntry &res, int glossScrollY, int posScrollX,
+                                        uint32_t &outKanji)
+    {
+        // 1. Title (headword + reading) at y=36, fontId=2
+        std::string titleStr = (!res.reading.empty() && res.reading != res.headword)
+                             ? (res.headword + " 【" + res.reading + "】")
+                             : res.headword;
+        titleStr = TruncateGlyphText(glyphs, 2, titleStr, 295);
+        if (TryGetKanjiInText(glyphs, 2, titleStr, 12, 30, 28, popX, popY, outKanji, 312)) {
+            return true;
+        }
+
+        // 2. Header label at y=7, fontId=0
+        std::string surfInfo;
+        if (res.headword == "Selection Translation") {
+            surfInfo = "Selection: " + res.matchedSurface;
+        } else if (!res.matchedSurface.empty() && res.matchedSurface != res.headword) {
+            surfInfo = "Match: " + res.matchedSurface + " -> " + res.headword;
+        } else {
+            surfInfo = "Text: " + res.contextText;
+        }
+        std::string tagStr;
+        if (res.headword == "Selection Translation") {
+            tagStr = "[Translate] ";
+        } else if (!res.rankJlpt.empty()) {
+            tagStr = "[" + res.rankJlpt + "] ";
+        }
+        std::string hdrText = tagStr + surfInfo;
+        hdrText = TruncateGlyphText(glyphs, 0, hdrText, 300);
+        if (TryGetKanjiInText(glyphs, 0, hdrText, 8, 4, 24, popX, popY, outKanji, 310)) {
+            return true;
+        }
+
+        // 3. POS line at y=64, fontId=1
+        int maxPosX = std::max(0, (int)res.posCodepoints.size() - POS_WINDOW_CHARS);
+        int posOff = std::max(0, std::min(posScrollX, maxPosX));
+        std::string posSlice = CodepointsToUtf8(res.posCodepoints, (size_t)posOff, POS_WINDOW_CHARS);
+        int posStartX = (posOff > 0) ? 14 : 12;
+        int posMaxRight = (posOff < maxPosX) ? 300 : 312;
+        if (TryGetKanjiInText(glyphs, 1, posSlice, posStartX, 60, 24, popX, popY, outKanji, posMaxRight)) {
+            return true;
+        }
+
+        // 4. Vertically scrollable gloss lines starting at y=90, fontId=1
+        int totalLines = (int)res.wrappedLines.size();
+        int maxGlossY = std::max(0, totalLines - GLOSS_VISIBLE_LINES);
+        int gOff = std::max(0, std::min(glossScrollY, maxGlossY));
+        int visCount = std::min(GLOSS_VISIBLE_LINES, totalLines - gOff);
+        int yCur = 90;
+        for (int i = 0; i < visCount; ++i) {
+            const std::string &ln = res.wrappedLines[(size_t)(gOff + i)];
+            if (TryGetKanjiInText(glyphs, 1, ln, 12, yCur - 2, 19, popX, popY, outKanji, 309)) {
+                return true;
+            }
+            yCur += 17;
+        }
+
+        return false;
     }
 
     struct BufferState {
@@ -2429,11 +2689,19 @@ namespace CTRPluginFramework
         }
 
         // 5. Initialize Interactive Session State & Double-Buffering
+        OCR_InitCStick();
         int curScreen = SCREEN_ID_TOP;
         int curX = 200, curY = 120;
+        float cstickAccX = 0.0f, cstickAccY = 0.0f;
         bool translateMode = false;
         bool hasPopup = false;
         int popupTargetScreen = SCREEN_ID_BOTTOM;
+        bool hasKanjiWindow = false;
+        int kanjiTargetScreen = SCREEN_ID_TOP;
+        s_kanjiScrollY = 0;
+        s_kanjiMaxScrollY = 0;
+        int kanjiScrollY = 0;
+        uint32_t lastKanjiCp = 0;
         PopupBundle popupBundle;
         ScreenBundle screenBundles[2];
         CachedPopupState cachedPopup;
@@ -2461,11 +2729,13 @@ namespace CTRPluginFramework
                 RestoreCursorArea(bufStates[activeBuf].curScreen,
                                   bufStates[activeBuf].curX,
                                   bufStates[activeBuf].curY,
-                                  hasPopup, popupTargetScreen);
+                                  hasPopup, popupTargetScreen,
+                                  hasKanjiWindow, kanjiTargetScreen);
                 bufStates[activeBuf].hasCursor = false;
             }
             if (bufStates[activeBuf].hasSelBox) {
-                RestoreSelBoxArea(bufStates[activeBuf].selbox, hasPopup, popupTargetScreen);
+                RestoreSelBoxArea(bufStates[activeBuf].selbox, hasPopup, popupTargetScreen,
+                                  hasKanjiWindow, kanjiTargetScreen);
                 bufStates[activeBuf].hasSelBox = false;
             }
             if (hasPopup && bundleActive && (popupDirty[activeBuf] || cursorWasOnBundle || selWasOnBundle)) {
@@ -2505,6 +2775,85 @@ namespace CTRPluginFramework
             SyncBothBuffers();
         };
 
+        auto DismissKanjiWindow = [&](void) {
+            if (hasKanjiWindow) {
+                hasKanjiWindow = false;
+                OCR_FreeKanjiBuffer();
+                for (int b = 0; b < 2; ++b) {
+                    const Screen &scr = (kanjiTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
+                    int scrW = (kanjiTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
+                    RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(kanjiTargetScreen), scrW, 240);
+                    PresentFrame();
+                }
+            }
+        };
+
+        auto SendKanjiLookup = [&](int scrollY) -> bool {
+            uint8_t targetKanjiScr = (popupTargetScreen == SCREEN_ID_TOP) ? SCREEN_ID_BOTTOM : SCREEN_ID_TOP;
+            uint8_t scrCode = (targetKanjiScr == SCREEN_ID_TOP) ? 1 : 2;
+            uint8_t scrollSteps = (uint8_t)std::min(63, scrollY / 4);
+            scrCode = (uint8_t)(scrCode | (scrollSteps << 2));
+            uint8_t kanjiPacket[5];
+            kanjiPacket[0] = CMD_LOOKUP_KANJI;
+            kanjiPacket[1] = scrCode;
+            kanjiPacket[2] = (uint8_t)((lastKanjiCp >> 16) & 0xFF);
+            uint16_t cpL = htons((uint16_t)(lastKanjiCp & 0xFFFF));
+            memcpy(&kanjiPacket[3], &cpL, 2);
+            return send_encrypted_frame(sock, &tx_stream, kanjiPacket, sizeof(kanjiPacket)) >= 0;
+        };
+
+        auto DismissPopupWindow = [&](void) {
+            DismissKanjiWindow();
+            if (hasPopup) {
+                hasPopup = false;
+                popupBundle.active = false;
+                cachedPopup.active = false;
+                OCR_FreePopupBuffer();
+                for (int b = 0; b < 2; ++b) {
+                    const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
+                    int scrW = (popupTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
+                    RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(popupTargetScreen), scrW, 240);
+                    PresentFrame();
+                }
+            }
+        };
+
+        auto getActivePopupInfo = [&](const PopupEntry *&outEntry, const GlyphMap *&outGlyphs, int &outGlossScroll, int &outPosScroll) -> bool {
+            if (cachedPopup.active && cachedPopup.sourceScreenId < 2 &&
+                screenBundles[cachedPopup.sourceScreenId].ready &&
+                cachedPopup.spotIdx < screenBundles[cachedPopup.sourceScreenId].spots.size()) {
+                const ScreenBundle &sb = screenBundles[cachedPopup.sourceScreenId];
+                const ScreenSpot &sp = sb.spots[cachedPopup.spotIdx];
+                if (!sp.variants.empty()) {
+                    size_t vIdx = std::min(cachedPopup.curVariantIdx, sp.variants.size() - 1);
+                    const ScreenSpotVariant &sv = sp.variants[vIdx];
+                    if (!sv.entryIndices.empty()) {
+                        size_t eIdx = std::min(cachedPopup.curEntryIdx, sv.entryIndices.size() - 1);
+                        uint16_t poolIdx = sv.entryIndices[eIdx];
+                        if (poolIdx < sb.entries.size()) {
+                            outEntry = &sb.entries[poolIdx];
+                            outGlyphs = &sb.glyphs;
+                            outGlossScroll = cachedPopup.glossScrollY;
+                            outPosScroll = cachedPopup.posScrollX;
+                            return true;
+                        }
+                    }
+                }
+            } else if (popupBundle.active && !popupBundle.variants.empty()) {
+                size_t vIdx = std::min(popupBundle.curVariantIdx, popupBundle.variants.size() - 1);
+                const PopupVariant &var = popupBundle.variants[vIdx];
+                if (!var.entries.empty()) {
+                    size_t eIdx = std::min(popupBundle.curEntryIdx, var.entries.size() - 1);
+                    outEntry = &var.entries[eIdx];
+                    outGlyphs = &popupBundle.glyphs;
+                    outGlossScroll = popupBundle.glossScrollY;
+                    outPosScroll = popupBundle.posScrollX;
+                    return true;
+                }
+            }
+            return false;
+        };
+
         // Render initial cursor on both buffers
         SyncBothBuffers();
 
@@ -2515,17 +2864,12 @@ namespace CTRPluginFramework
 
             // Exit / Dismiss Key: Dismiss popup or exit session
             if (kDown & g_ocrKeys.exitSession) {
+                if (hasKanjiWindow) {
+                    DismissKanjiWindow();
+                    continue;
+                }
                 if (hasPopup) {
-                    hasPopup = false;
-                    popupBundle.active = false;
-                    cachedPopup.active = false;
-                    OCR_FreePopupBuffer();
-                    for (int b = 0; b < 2; ++b) {
-                        const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
-                        int scrW = (popupTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
-                        RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(popupTargetScreen), scrW, 240);
-                        PresentFrame();
-                    }
+                    DismissPopupWindow();
                     continue;
                 }
                 break;
@@ -2581,16 +2925,52 @@ namespace CTRPluginFramework
                 }
             }
 
-            // Circle Pad / D-Pad movement
+            // Circle Pad / C-Stick / D-Pad movement
             int newScreen = curScreen;
             int newX = curX, newY = curY;
             bool moved = false;
 
+            // Circle Pad movement
             shortVector cpad = Controller::GetCirclePadPosition();
             if (abs(cpad.x) > CPAD_DEADZONE || abs(cpad.y) > CPAD_DEADZONE) {
                 newX += cpad.x / CPAD_SPEED_DIV;
                 newY -= cpad.y / CPAD_SPEED_DIV;
                 moved = true;
+            }
+
+            // C-Stick movement (New 3DS pointer control)
+            shortVector cstick = GetCStickPosition();
+            if (abs(cstick.x) > CSTICK_DEADZONE) {
+                cstickAccX += (float)cstick.x / CSTICK_SPEED_DIV;
+                int stepX = (int)cstickAccX;
+                if (stepX != 0) {
+                    newX += stepX;
+                    cstickAccX -= (float)stepX;
+                    moved = true;
+                }
+            } else {
+                cstickAccX = 0.0f;
+            }
+
+            if (abs(cstick.y) > CSTICK_DEADZONE) {
+                cstickAccY += (float)cstick.y / CSTICK_SPEED_DIV;
+                int stepY = (int)cstickAccY;
+                if (stepY != 0) {
+                    newY -= stepY;
+                    cstickAccY -= (float)stepY;
+                    moved = true;
+                }
+            } else {
+                cstickAccY = 0.0f;
+            }
+
+            // Fallback: Digital C-Stick directions (e.g. if analog mapping is unavailable or tapped)
+            if (abs(cstick.x) <= CSTICK_DEADZONE && abs(cstick.y) <= CSTICK_DEADZONE) {
+                u32 kHeld = Controller::GetKeysDown();
+                if (kHeld & Key::CStickUp)    { newY -= 2; moved = true; }
+                if (kHeld & Key::CStickDown)  { newY += 2; moved = true; }
+                if (kHeld & Key::CStickLeft)  { newX -= 2; moved = true; }
+                if (kHeld & Key::CStickRight) { newX += 2; moved = true; }
             }
 
             // D-Pad fine-stepping if not navigating popup
@@ -2610,6 +2990,7 @@ namespace CTRPluginFramework
                 }
             }
 
+            bool touchTap = (kDown & Key::Touchpad) != 0;
             // Touch Screen: Instantly jump cursor to bottom screen touch position
             if (Touch::IsDown() && (!selbox.active || selbox.screenId == SCREEN_ID_BOTTOM)) {
                 UIntVector touch = Touch::GetPosition();
@@ -2651,21 +3032,48 @@ namespace CTRPluginFramework
                 }
             }
 
-            // Lookup / Select Point Key: Execute action
-            if (kDown & g_ocrKeys.lookup) {
+            // Lookup / Select Point Key or Touch Screen Tap: Execute action
+            bool lookupTriggered = (kDown & g_ocrKeys.lookup) != 0;
+            bool touchPopupTap = touchTap && hasPopup && popupTargetScreen == SCREEN_ID_BOTTOM && !selbox.active;
+            if (lookupTriggered || touchPopupTap) {
+                int actionScreen = touchPopupTap ? SCREEN_ID_BOTTOM : curScreen;
+                int actionX = touchPopupTap ? newX : curX;
+                int actionY = touchPopupTap ? newY : curY;
+
+                // 1. Check if clicking/tapping inside the active translation popup
+                if (hasPopup && popupTargetScreen == actionScreen) {
+                    int xOff = (actionScreen == SCREEN_ID_TOP) ? ((TOP_WIDTH - POPUP_WIDTH) / 2) : 0;
+                    int popX = actionX - xOff;
+                    int popY = actionY;
+                    if (popX >= 0 && popX < POPUP_WIDTH && popY >= 0 && popY < POPUP_HEIGHT) {
+                        const PopupEntry *pe = nullptr;
+                        const GlyphMap *pg = nullptr;
+                        int gs = 0, ps = 0;
+                        if (getActivePopupInfo(pe, pg, gs, ps)) {
+                            uint32_t kanjiCp = 0;
+                            if (TryGetKanjiAtPopupCoord(popX, popY, *pg, *pe, gs, ps, kanjiCp)) {
+                                lastKanjiCp = kanjiCp;
+                                kanjiScrollY = 0;
+                                if (!SendKanjiLookup(0)) break;
+                                continue;
+                            }
+                        }
+                        // Clicked inside popup, but not on a kanji:
+                        // Dismiss kanji window if open, but DO NOT dismiss the translation popup
+                        if (hasKanjiWindow) {
+                            DismissKanjiWindow();
+                        }
+                        continue;
+                    }
+                }
+
                 if (!translateMode) {
+                    // Clicking outside popup or on other screen dismisses any kanji window
+                    DismissKanjiWindow();
+
                     // Clear existing popup if it occupies the clicked screen
                     if (hasPopup && popupTargetScreen == curScreen) {
-                        hasPopup = false;
-                        popupBundle.active = false;
-                        cachedPopup.active = false;
-                        OCR_FreePopupBuffer();
-                        for (int b = 0; b < 2; ++b) {
-                            const Screen &scr = (curScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
-                            int scrW = (curScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
-                            RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(curScreen), scrW, 240);
-                            PresentFrame();
-                        }
+                        DismissPopupWindow();
                     }
 
                     size_t hitSpotIdx = 0;
@@ -2704,6 +3112,7 @@ namespace CTRPluginFramework
                         break;
                     }
                 } else if (!selbox.active) {
+                    DismissKanjiWindow();
                     // Region translation Point 1
                     selbox.screenId = curScreen;
                     selbox.x1 = curX;
@@ -2740,6 +3149,40 @@ namespace CTRPluginFramework
                     }
                 }
             } else if (hasPopup) {
+                if ((kDown & g_ocrKeys.addAnki) && hasKanjiWindow) {
+                    uint8_t kanjiAnkiPkt[5] = { CMD_ADD_ANKI_KANJI, 0, 0, 0, 0 };
+                    if (send_encrypted_frame(sock, &tx_stream, kanjiAnkiPkt, sizeof(kanjiAnkiPkt)) < 0) {
+                        break;
+                    }
+                    continue;
+                }
+                // D-pad Up/Down scroll the kanji window locally (no network round-trip)
+                if (hasKanjiWindow && s_kanji_tall) {
+                    u32 dpadMask = Key::DPadUp | Key::DPadDown;
+                    u32 held = Controller::GetKeysDown(false) & dpadMask;
+                    u32 trig = kDown & dpadMask;
+                    if (held == 0) {
+                        dpadHoldTicks = 0;
+                    } else {
+                        dpadHoldTicks++;
+                        if (dpadHoldTicks > 14 && ((dpadHoldTicks - 14) % 3) == 0) trig |= held;
+                    }
+                    if (trig & Key::DPadUp) {
+                        s_kanjiScrollY = std::max(0, s_kanjiScrollY - 8);
+                        for (int b = 0; b < 2; ++b) {
+                            DrawKanjiCrop(kanjiTargetScreen, s_kanji_tall, s_kanjiScrollY);
+                            PresentFrame();
+                        }
+                        continue;
+                    } else if (trig & Key::DPadDown) {
+                        s_kanjiScrollY = std::min(s_kanjiMaxScrollY, s_kanjiScrollY + 8);
+                        for (int b = 0; b < 2; ++b) {
+                            DrawKanjiCrop(kanjiTargetScreen, s_kanji_tall, s_kanjiScrollY);
+                            PresentFrame();
+                        }
+                        continue;
+                    }
+                }
                 auto handleLocalNav = [&](size_t numVars, size_t numEntries, const std::string &curEngLbl,
                                           const std::string &nextEngLbl, const std::string &nextOcrTxt,
                                           const PopupEntry &curEntry, size_t &vIdx, size_t &eIdx,
@@ -2902,7 +3345,7 @@ namespace CTRPluginFramework
                     break;
                 }
                 uint8_t flagByte = hdr[0];
-                uint8_t targetScreenId = flagByte & 0x0F;
+                uint8_t targetScreenId = flagByte & 0x01;
                 uint32_t netImgSize = 0;
                 memcpy(&netImgSize, &hdr[1], 4);
                 uint32_t payloadSize = ntohl(netImgSize);
@@ -2948,6 +3391,7 @@ namespace CTRPluginFramework
                     }
                     PopupBundle nextBundle;
                     if (ParsePopupBundle(rawBuf.data(), rawBuf.size(), nextBundle)) {
+                        DismissKanjiWindow();
                         if (hasPopup && popupTargetScreen != targetScreenId) {
                             for (int b = 0; b < 2; ++b) {
                                 const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
@@ -2981,7 +3425,32 @@ namespace CTRPluginFramework
                                                        popupBundle.statusBanner, popupBundle.statusLevel)) {
                         RedrawBundlePopup();
                     }
+                } else if ((flagByte & POPUP_KANJI_FLAG) && payloadSize == KANJI_TALL_PAYLOAD_SIZE &&
+                           (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
+                    if (!s_kanjiTallBuffer.Alloc(0x07360000, KANJI_TALL_PAYLOAD_SIZE)) {
+                        std::vector<u8> dummy(payloadSize);
+                        recv_encrypted_frame(sock, &rx_stream, dummy.data(), payloadSize);
+                        OSD::Notify("OCR Error: Out of memory for kanji window", Color::Red);
+                        continue;
+                    }
+                    if (recv_encrypted_frame(sock, &rx_stream, s_kanji_tall, KANJI_TALL_PAYLOAD_SIZE) < 0) {
+                        OCR_FreeKanjiBuffer();
+                        hasKanjiWindow = false;
+                        break;
+                    }
+                    int contentH = ((int)s_kanji_tall[KANJI_TALL_RGB_SIZE] << 8) | (int)s_kanji_tall[KANJI_TALL_RGB_SIZE + 1];
+                    if (contentH > KANJI_TALL_HEIGHT) contentH = KANJI_TALL_HEIGHT;
+                    // Scrollable viewport is POPUP_HEIGHT - 24 (216px; footer is fixed)
+                    s_kanjiMaxScrollY = std::max(0, contentH - (POPUP_HEIGHT - 24));
+                    s_kanjiScrollY = 0;
+                    kanjiTargetScreen = targetScreenId;
+                    hasKanjiWindow = true;
+                    for (int b = 0; b < 2; ++b) {
+                        DrawKanjiCrop(kanjiTargetScreen, s_kanji_tall, 0);
+                        PresentFrame();
+                    }
                 } else if (payloadSize == POPUP_RGB_SIZE && (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
+                    DismissKanjiWindow();
                     if (!s_popupBuffer.Alloc(0x072E0000, POPUP_RGB_SIZE) ||
                         recv_encrypted_frame(sock, &rx_stream, s_popup_rgb, POPUP_RGB_SIZE) < 0) {
                         OCR_FreePopupBuffer();
@@ -3006,6 +3475,19 @@ namespace CTRPluginFramework
                         DrawPopupImage(popupTargetScreen, s_popup_rgb);
                         PresentFrame();
                     }
+                } else {
+                    // Drain unhandled/unexpected payload so TCP stream stays synchronized
+                    if (payloadSize > 0) {
+                        std::vector<u8> discard(std::min<u32>(payloadSize, 65536));
+                        u32 rem = payloadSize;
+                        while (rem > 0) {
+                            u32 chunk = std::min<u32>(rem, (u32)discard.size());
+                            if (recv_encrypted_frame(sock, &rx_stream, discard.data(), chunk) < 0) {
+                                break;
+                            }
+                            rem -= chunk;
+                        }
+                    }
                 }
             }
 
@@ -3026,6 +3508,8 @@ namespace CTRPluginFramework
 
         // Free session snapshot buffers to return ~750 KB to the game process
         OCR_FreeSessionBuffers();
+
+        OCR_ExitCStick();
 
         // Unpause game
         Process::Play();

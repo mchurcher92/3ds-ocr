@@ -55,6 +55,9 @@ else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DICTIONARIES_DIR = os.environ.get("OCR_DICTIONARIES_DIR", os.path.join(APP_DIR, "dictionaries"))
+WORD_META_DB_PATH = os.path.join(DICTIONARIES_DIR, "word_meta.db")
+JLPT_KANJI_PATH = os.path.join(DICTIONARIES_DIR, "jlpt_kanji.json")
+KANJI_STROKE_FONT_PATH = os.path.join(DICTIONARIES_DIR, "KanjiStrokeOrders.ttf")
 OCR_PSK_PATH = os.path.join(APP_DIR, "ocr_psk.txt")
 ANKI_CONFIG_PATH = os.path.join(APP_DIR, "anki_config.json")
 ANKI_CREDENTIALS_PATH = os.path.join(APP_DIR, "anki_credentials.json")
@@ -227,9 +230,12 @@ CMD_ADD_ANKI_TOP = 0x1C    # X button on cached Top screen spot: x=spot_id, y=(v
 CMD_ADD_ANKI_BOT = 0x1D    # X button on cached Bottom screen spot: x=spot_id, y=(v_idx<<8)|e_idx
 CMD_TRANSLATE_TOP = 0x20  # 2-point selection box on Top Screen (2x 5-byte frames: x1,y1 then x2,y2)
 CMD_TRANSLATE_BOT = 0x21  # 2-point selection box on Bottom Screen (2x 5-byte frames: x1,y1 then x2,y2)
+CMD_LOOKUP_KANJI = 0x22   # Kanji click in translation overlay: [0x22, cp_high16, cp_low16]
+CMD_ADD_ANKI_KANJI = 0x23 # Add currently viewed kanji to Anki deck
 POPUP_BUNDLE_FLAG = 0x80
 POPUP_STATUS_FLAG = 0x40
 POPUP_SCREEN_BUNDLE_FLAG = 0x20
+POPUP_KANJI_FLAG = 0x10
 
 OCR_ENGINE_NAMES: Tuple[str, ...] = ("Manga", "Paddle", "Yomi", "NDL")
 
@@ -258,11 +264,13 @@ POS_SCROLL_STEP = 6
 TOP_DIM = (400, 240)
 BOT_DIM = (320, 240)
 POPUP_DIM = (320, 240)
+KANJI_TALL_DIM = (320, 400)   # Full tall canvas sent to 3DS; plugin crops to 240px and scrolls locally
 BPP = 3
 
 TOP_FB_BYTES = TOP_DIM[0] * TOP_DIM[1] * BPP        # 288,000 bytes
 BOT_FB_BYTES = BOT_DIM[0] * BOT_DIM[1] * BPP        # 230,400 bytes
 POPUP_FB_BYTES = POPUP_DIM[0] * POPUP_DIM[1] * BPP  # 230,400 bytes
+KANJI_FB_BYTES = KANJI_TALL_DIM[0] * KANJI_TALL_DIM[1] * BPP + 2  # 384,002 bytes (384,000 RGB + 2-byte content_height)
 
 OCR_UPSCALE_FACTOR = 3
 MAX_CLICK_DISTANCE_PX = 26.0  # Max cursor distance from a character box to count as a hit
@@ -418,6 +426,7 @@ class DictionaryResult:
     ocr_total_variants: int = 1
     ocr_engines: List[str] = field(default_factory=list)
     ocr_summary_line: str = ""
+    rank_jlpt: str = ""
     _wrapped_lines: Optional[List[str]] = field(default=None, repr=False, compare=False)
 
 
@@ -1488,6 +1497,177 @@ class YomitanDictionaryManager:
         return results
 
 
+class WordMetaManager:
+    """Provides frequency ranking and JLPT level lookup for Japanese words and kanji."""
+
+    def __init__(self, db_path: str = WORD_META_DB_PATH, jlpt_kanji_path: str = JLPT_KANJI_PATH) -> None:
+        self._db_path = db_path
+        self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.Lock()
+        self._jlpt_kanji: Dict[str, int] = {}
+        if os.path.isfile(jlpt_kanji_path):
+            try:
+                with open(jlpt_kanji_path, "r", encoding="utf-8") as f:
+                    self._jlpt_kanji = json.load(f)
+            except Exception as exc:
+                logger.warning("Failed to load JLPT kanji JSON %s: %s", jlpt_kanji_path, exc)
+        self._cache: Dict[Tuple[str, str], str] = {}
+        self._init_db()
+
+    def _init_db(self) -> None:
+        if os.path.isfile(self._db_path):
+            try:
+                self._conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, check_same_thread=False)
+            except Exception as e:
+                logger.warning("Could not open word_meta.db in read-only mode: %s; trying normal connect", e)
+                try:
+                    self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+                except Exception as e2:
+                    logger.warning("Could not open word_meta.db: %s", e2)
+                    self._conn = None
+
+    def get_rank_and_jlpt(self, term: str, reading: str = "", jmdict_entry: Any = None) -> str:
+        """Return formatted ranking and JLPT string, e.g. '#195 · N5', '#106', 'Common · N3', or 'Uncommon'."""
+        if not term or term == "Selection Translation":
+            return ""
+        cache_key = (term, reading)
+        with self._lock:
+            if cache_key in self._cache:
+                return self._cache[cache_key]
+
+        freq_rank: Optional[Union[int, str]] = None
+        jlpt_lvl: Optional[int] = None
+
+        if self._conn:
+            try:
+                with self._lock:
+                    cur = self._conn.cursor()
+                    if reading:
+                        cur.execute("SELECT freq_rank, jlpt FROM word_meta WHERE term = ? AND reading = ? LIMIT 1", (term, reading))
+                        row = cur.fetchone()
+                        if row:
+                            freq_rank, jlpt_lvl = row[0], row[1]
+                    if freq_rank is None and jlpt_lvl is None:
+                        cur.execute("SELECT freq_rank, jlpt FROM word_meta WHERE term = ? LIMIT 1", (term,))
+                        row = cur.fetchone()
+                        if row:
+                            freq_rank, jlpt_lvl = row[0], row[1]
+            except Exception:
+                pass
+
+        if freq_rank is None and jmdict_entry is not None:
+            pri_tags = set()
+            for kf in getattr(jmdict_entry, "kanji_forms", []) or []:
+                pri_tags.update(getattr(kf, "pri", []) or [])
+            for kn in getattr(jmdict_entry, "kana_forms", []) or []:
+                pri_tags.update(getattr(kn, "pri", []) or [])
+            nf_tags = [int(p[2:]) for p in pri_tags if p.startswith("nf") and p[2:].isdigit()]
+            if nf_tags:
+                min_nf = min(nf_tags)
+                freq_rank = min_nf * 500
+            elif any(p in pri_tags for p in ("ichi1", "news1", "spec1", "gai1")):
+                freq_rank = "Common"
+
+        if jlpt_lvl is None and len(term) == 1 and term in self._jlpt_kanji:
+            jlpt_lvl = self._jlpt_kanji[term]
+
+        parts = []
+        if freq_rank is not None:
+            if isinstance(freq_rank, int):
+                parts.append(f"#{freq_rank}")
+            else:
+                parts.append(str(freq_rank))
+        if jlpt_lvl:
+            parts.append(f"N{jlpt_lvl}")
+
+        res = " · ".join(parts) if parts else "Uncommon"
+        with self._lock:
+            if len(self._cache) < 8192:
+                self._cache[cache_key] = res
+        return res
+
+    def get_kanji_details(self, kanji_char: str, jam: Any = None) -> DictionaryResult:
+        """Lookup kanji in Kanjidic2 and return a DictionaryResult with stroke count, readings, and meanings."""
+        stroke_count = None
+        grade = None
+        freq = None
+        jlpt = self._jlpt_kanji.get(kanji_char)
+        rad_num = None
+        rad_char = ""
+        on_readings: List[str] = []
+        kun_readings: List[str] = []
+        nanori: List[str] = []
+        meanings: List[str] = []
+
+        if jam is not None:
+            try:
+                kd_res = jam.lookup(kanji_char)
+                if kd_res and kd_res.chars:
+                    c = kd_res.chars[0]
+                    stroke_count = c.stroke_count
+                    grade = c.grade
+                    freq = c.freq
+                    if jlpt is None and c.jlpt is not None:
+                        jlpt = c.jlpt
+                    if c.radicals:
+                        try:
+                            rad_num = int(c.radicals[0].value)
+                            if 1 <= rad_num <= 214:
+                                rad_char = chr(0x2F00 + rad_num - 1)
+                        except (ValueError, TypeError):
+                            pass
+                    if c.rm_groups:
+                        rm0 = c.rm_groups[0]
+                        on_readings = [str(r) for r in getattr(rm0, "on_readings", []) or []]
+                        kun_readings = [str(r) for r in getattr(rm0, "kun_readings", []) or []]
+                        meanings = [
+                            getattr(m, "value", str(m))
+                            for m in getattr(rm0, "meanings", []) or []
+                            if getattr(m, "m_lang", "") in ("", "en")
+                        ]
+                    nanori = [getattr(n, "value", str(n)) for n in getattr(c, "nanori", []) or []]
+            except Exception as ex:
+                logger.debug("Kanjidic lookup error for %s: %s", kanji_char, ex)
+
+        readings_parts = []
+        if on_readings:
+            readings_parts.append("音: " + "・".join(on_readings))
+        if kun_readings:
+            readings_parts.append("訓: " + "・".join(kun_readings))
+        reading_str = "  ".join(readings_parts) if readings_parts else ""
+
+        pos_parts = ["Kanji"]
+        if stroke_count is not None:
+            pos_parts.append(f"Strokes: {stroke_count}")
+        if grade is not None:
+            pos_parts.append(f"Grade: {grade}")
+        if jlpt is not None:
+            pos_parts.append(f"JLPT N{jlpt}")
+        if freq is not None:
+            pos_parts.append(f"Freq: #{freq}")
+        if rad_char or rad_num:
+            pos_parts.append(f"Radical: {rad_char or '#' + str(rad_num)}")
+
+        rank_jlpt = ""
+        if freq is not None and jlpt is not None:
+            rank_jlpt = f"#{freq} · N{jlpt}"
+        elif freq is not None:
+            rank_jlpt = f"#{freq}"
+        elif jlpt is not None:
+            rank_jlpt = f"N{jlpt}"
+
+        return DictionaryResult(
+            headword=kanji_char,
+            reading=reading_str,
+            glosses=meanings if meanings else ["(No definition found in Kanjidic)"],
+            pos=" · ".join(pos_parts),
+            matched_surface=kanji_char,
+            context_text=f"Kanji {kanji_char} ({reading_str})",
+            found=True,
+            rank_jlpt=rank_jlpt,
+        )
+
+
 class JapaneseOCRDictionaryPipeline:
     """
     Thread-safe layout-aware 4-Engine Japanese OCR ensemble (MangaOCR + PaddleOCR + YomiToku + NDLOCR),
@@ -1516,6 +1696,7 @@ class JapaneseOCRDictionaryPipeline:
         self._custom_dict: Dict[str, List[dict]] = {}
         self._custom_voicing_index: Dict[str, List[str]] = {}
         self._yomitan_mgr: Optional[YomitanDictionaryManager] = None
+        self._word_meta_mgr = WordMetaManager(WORD_META_DB_PATH, JLPT_KANJI_PATH)
 
         self._load_custom_dictionaries()
 
@@ -1648,6 +1829,14 @@ class JapaneseOCRDictionaryPipeline:
                 if ent not in existing:
                     existing.append(ent)
 
+    @property
+    def jamdict(self):
+        return self._jamdict
+
+    @property
+    def word_meta_mgr(self) -> WordMetaManager:
+        return self._word_meta_mgr
+
     def _load_custom_dictionaries(self) -> None:
         """Scan and load all custom / game dictionaries from dictionaries/ and APP_DIR."""
         self._custom_dict.clear()
@@ -1658,7 +1847,12 @@ class JapaneseOCRDictionaryPipeline:
         ]
         if os.path.isdir(DICTIONARIES_DIR):
             for fname in sorted(os.listdir(DICTIONARIES_DIR)):
-                if fname.endswith(".json") and fname not in ("index.json",) and not fname.startswith("term_bank_"):
+                if (
+                    fname.endswith(".json")
+                    and fname not in ("index.json",)
+                    and not fname.startswith("term_bank_")
+                    and not fname.startswith("jlpt_")
+                ):
                     fpath = os.path.join(DICTIONARIES_DIR, fname)
                     if fpath not in custom_dict_candidates:
                         custom_dict_candidates.append(fpath)
@@ -5234,6 +5428,7 @@ class JapaneseOCRDictionaryPipeline:
                                     glosses=gloss_list or ["(No English glosses listed)"],
                                     word_bboxes=word_bboxes,
                                     found=True,
+                                    rank_jlpt=self._word_meta_mgr.get_rank_and_jlpt(headword, reading, entry),
                                 )
                             )
 
@@ -5322,6 +5517,9 @@ class JapaneseOCRDictionaryPipeline:
 
             results.sort(key=_result_sort_key, reverse=True)
             results.extend(name_results)
+            for r in results:
+                if not getattr(r, "rank_jlpt", ""):
+                    r.rank_jlpt = self._word_meta_mgr.get_rank_and_jlpt(r.headword or r.matched_surface, r.reading)
             if results:
                 return results
 
@@ -6824,7 +7022,13 @@ def render_dictionary_popup(
         )
 
     max_header_w = max(125, 312 - badge_w - ocr_badge_w - 14)
-    header_text = f"[{screen_label} {x},{y}] {surf_info}"
+    if result.headword == "Selection Translation":
+        prefix_tag = "[Translate] "
+    elif getattr(result, "rank_jlpt", ""):
+        prefix_tag = f"[{result.rank_jlpt}] "
+    else:
+        prefix_tag = ""
+    header_text = f"{prefix_tag}{surf_info}"
     try:
         while font_small.getlength(header_text) > max_header_w and len(header_text) > 8:
             header_text = header_text[:-2] + "…"
@@ -6936,6 +7140,219 @@ def render_dictionary_popup(
     return raw_bytes
 
 
+def render_kanji_popup(
+    kanji_char: str,
+    target_screen_id: int,
+    jamdict: Any = None,
+    word_meta_mgr: Optional[WordMetaManager] = None,
+) -> bytes:
+    """
+    Render a 320x400 RGB bitmap for the kanji popup. The 3DS receives the full tall canvas
+    and handles scrolling locally by cropping the visible 240px window.
+    """
+    popup = Image.new("RGB", KANJI_TALL_DIM, color=(20, 24, 34))
+    draw = ImageDraw.Draw(popup)
+
+    # Theme colors
+    bg_body = (20, 24, 34)
+    bg_header = (34, 42, 64)
+    bg_footer = (28, 34, 50)
+    border_col = (88, 166, 255)
+
+    # 1. Body fill (no border drawn here — C++ overlays it at fixed screen coords every frame)
+    draw.rectangle([0, 0, KANJI_TALL_DIM[0] - 1, KANJI_TALL_DIM[1] - 1], fill=bg_body)
+    # Header background (y: 2..31)
+    draw.rectangle([2, 2, KANJI_TALL_DIM[0] - 3, 31], fill=bg_header)
+
+    font_hdr = load_cjk_ttf_font(13)
+    font_body = load_cjk_ttf_font(12)
+    font_small = load_cjk_ttf_font(11)
+
+    # Header text
+    hdr_label = f"[Kanji Details]  {kanji_char}"
+    draw.text((10, 8), hdr_label, fill=(185, 215, 255), font=font_hdr)
+    draw.text((250, 9), "[B: Close]", fill=(150, 175, 210), font=font_small)
+
+    # Get kanji details
+    stroke_count = None
+    grade = None
+    freq = None
+    jlpt = None
+    rad_num = None
+    rad_char = ""
+    on_readings: List[str] = []
+    kun_readings: List[str] = []
+    nanori: List[str] = []
+    meanings: List[str] = []
+
+    if word_meta_mgr is not None and jamdict is not None:
+        try:
+            kd_res = jamdict.lookup(kanji_char)
+            if kd_res and kd_res.chars:
+                c = kd_res.chars[0]
+                stroke_count = c.stroke_count
+                grade = c.grade
+                freq = c.freq
+                jlpt = word_meta_mgr._jlpt_kanji.get(kanji_char)
+                if jlpt is None and c.jlpt is not None:
+                    jlpt = c.jlpt
+                if c.radicals:
+                    try:
+                        rad_num = int(c.radicals[0].value)
+                        if 1 <= rad_num <= 214:
+                            rad_char = chr(0x2F00 + rad_num - 1)
+                    except (ValueError, TypeError):
+                        pass
+                if c.rm_groups:
+                    rm0 = c.rm_groups[0]
+                    on_readings = [str(r) for r in getattr(rm0, "on_readings", []) or []]
+                    kun_readings = [str(r) for r in getattr(rm0, "kun_readings", []) or []]
+                    meanings = [
+                        getattr(m, "value", str(m))
+                        for m in getattr(rm0, "meanings", []) or []
+                        if getattr(m, "m_lang", "") in ("", "en")
+                    ]
+                nanori = [getattr(n, "value", str(n)) for n in getattr(c, "nanori", []) or []]
+        except Exception as exc:
+            logger.warning("Error fetching Kanjidic info for %s: %s", kanji_char, exc)
+
+    # Helper: pixel-width line wrapper (wraps a list of items joined by sep)
+    def _wrap_items(items: List[str], sep: str, font: ImageFont.ImageFont, max_w: int) -> List[str]:
+        """Join items with sep, wrapping into new lines when max_w is exceeded."""
+        lines: List[str] = []
+        current = ""
+        for item in items:
+            candidate = current + (sep if current else "") + item
+            if font.getlength(candidate) <= max_w:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = item
+        if current:
+            lines.append(current)
+        return lines or [""]
+
+    # Helper: truncate a single string to fit max_w pixels
+    def _fit_text(text: str, font: ImageFont.ImageFont, max_w: int) -> str:
+        if not text:
+            return ""
+        cur = text
+        while font.getlength(cur) > max_w and len(cur) > 3:
+            cur = cur[:-2] + "…"
+        return cur
+
+    # --- Stroke order font (load once, used after body paste) ---
+    stroke_font = None
+    if os.path.isfile(KANJI_STROKE_FONT_PATH):
+        try:
+            stroke_font = ImageFont.truetype(KANJI_STROKE_FONT_PATH, size=106)
+        except Exception:
+            stroke_font = None
+    if stroke_font is None:
+        stroke_font = load_cjk_ttf_font(84)
+
+    # --- Render all content directly onto the tall popup image ---
+    # Header occupies y=0..31. Stroke box occupies x=8..134, y=36..162 (drawn below).
+    # Right column and meanings draw freely from y=36 downward.
+    # The 3DS shows a 240px window and scrolls it locally.
+
+    right_x = 140
+    READ_MAX_W = 168   # pixel width for reading lines in right column
+
+    # Meta line (JLPT / Grade / Freq) — wrapped, no truncation
+    meta_parts = []
+    if jlpt:
+        meta_parts.append(f"JLPT N{jlpt}")
+    if grade:
+        meta_parts.append(f"Grade {grade}")
+    if freq:
+        meta_parts.append(f"Freq #{freq}")
+    if not meta_parts:
+        meta_parts = ["General Kanji"]
+
+    meta_lines = _wrap_items(meta_parts, " · ", font_small, READ_MAX_W)
+    y_cur = 36
+    for ln in meta_lines:
+        draw.text((right_x, y_cur), ln, fill=(255, 220, 110), font=font_small)
+        y_cur += 14
+    y_cur += 2  # spacing before readings
+
+    # Readings: On, Kun, Nanori — wrapped, no truncation
+    def _draw_readings(label: str, items: List[str], font: ImageFont.ImageFont, color: tuple) -> None:
+        nonlocal y_cur
+        lines = _wrap_items(items, "・", font, READ_MAX_W - 22)
+        for i, ln in enumerate(lines):
+            if i == 0:
+                draw.text((right_x, y_cur), label, fill=(125, 210, 175), font=font_small)
+                draw.text((right_x + 22, y_cur), ln, fill=color, font=font)
+            else:
+                draw.text((right_x + 22, y_cur), ln, fill=color, font=font)
+            y_cur += 16
+
+    if on_readings:
+        _draw_readings("音:", on_readings, font_body, (255, 230, 115))
+    if kun_readings:
+        _draw_readings("訓:", kun_readings, font_body, (255, 230, 115))
+    if nanori:
+        _draw_readings("名:", nanori, font_small, (215, 225, 235))
+
+    # Strokes & Radical (right column, right after readings — no forced min-y)
+    y_cur += 4
+    draw.line([(right_x, y_cur - 2), (308, y_cur - 2)], fill=(40, 50, 70), width=1)
+    strk_lbl = f"Strokes: {stroke_count}" if stroke_count else "Strokes: -"
+    draw.text((right_x, y_cur), strk_lbl, fill=(200, 220, 240), font=font_small)
+    rad_lbl = (
+        f"Radical: {rad_char} (#{rad_num})" if rad_char and rad_num
+        else (f"Radical: #{rad_num}" if rad_num else "Radical: -")
+    )
+    draw.text((right_x, y_cur + 14), _fit_text(rad_lbl, font_small, READ_MAX_W), fill=(160, 185, 215), font=font_small)
+    y_cur += 32
+
+    # Meanings (full width, below stroke box and right column)
+    y_meanings_start = max(y_cur + 8, 170)
+    draw.line([(8, y_meanings_start - 4), (312, y_meanings_start - 4)], fill=(55, 68, 95), width=1)
+    draw.text((10, y_meanings_start), "Meanings:", fill=(120, 195, 255), font=font_small)
+    meanings_str = ", ".join(meanings) if meanings else "(No English meanings in Kanjidic)"
+    wrapped_meanings = textwrap.wrap(meanings_str, width=46)
+    y_m = y_meanings_start + 14
+    for ln in wrapped_meanings:
+        draw.text((12, y_m), ln, fill=(240, 245, 255), font=font_body)
+        y_m += 14
+
+    # Track actual content bottom (clamped to tall canvas height)
+    content_height = min(y_m + 4, KANJI_TALL_DIM[1])
+
+    # Stroke order diagram (drawn last so it's always on top of body content)
+    box_x0, box_y0, box_x1, box_y1 = 8, 36, 134, 162
+    draw.rectangle([box_x0, box_y0, box_x1, box_y1], fill=(14, 17, 24), outline=(55, 68, 95), width=1)
+    cx = (box_x0 + box_x1) // 2
+    cy = (box_y0 + box_y1) // 2
+    draw.line([(box_x0 + 4, cy), (box_x1 - 4, cy)], fill=(35, 45, 60), width=1)
+    draw.line([(cx, box_y0 + 4), (cx, box_y1 - 4)], fill=(35, 45, 60), width=1)
+    try:
+        bbox = stroke_font.getbbox(kanji_char)
+        gw = bbox[2] - bbox[0]
+        gh = bbox[3] - bbox[1]
+        gx = box_x0 + ((box_x1 - box_x0) - gw) // 2 - bbox[0]
+        gy = box_y0 + ((box_y1 - box_y0) - gh) // 2 - bbox[1]
+        draw.text((gx, gy), kanji_char, fill=(255, 255, 255), font=stroke_font)
+    except Exception:
+        draw.text((box_x0 + 10, box_y0 + 10), kanji_char, fill=(255, 255, 255), font=font_hdr)
+
+    # Footer and outer border are drawn by C++ at fixed screen coords every frame —
+    # not embedded in the scrollable tall canvas.
+    # BUT: we do place the footer text at the bottom of the tall canvas so C++ can copy it.
+    footer_y = KANJI_TALL_DIM[1] - 24  # y=376..399
+    draw.rectangle([2, footer_y, KANJI_TALL_DIM[0] - 3, KANJI_TALL_DIM[1] - 3], fill=(28, 34, 50))
+    draw.text((8, footer_y + 5), "X: Add Kanji to Anki", fill=(125, 230, 165), font=font_small)
+
+    raw_bytes = popup.tobytes("raw", "RGB")
+    # Append 2-byte big-endian content_height so the 3DS can compute the real max scroll.
+    # max scroll = max(0, content_height - SCROLLABLE_VIEWPORT) where SCROLLABLE_VIEWPORT = POPUP_HEIGHT - 24 = 216
+    return raw_bytes + content_height.to_bytes(2, "big")
+
+
 def _pack_str_u8(text: str) -> bytes:
     b = (text or "").encode("utf-8")[:255]
     return struct.pack("<B", len(b)) + b
@@ -7037,6 +7454,10 @@ def _collect_entry_glyphs(glyph_set: set, r: DictionaryResult) -> Tuple[str, Lis
     _collect_glyph_text(glyph_set, 1, r.pos or "Word")
     for ln in wrapped:
         _collect_glyph_text(glyph_set, 1, ln)
+    rank_jlpt = getattr(r, "rank_jlpt", "")
+    if rank_jlpt:
+        _collect_glyph_text(glyph_set, 0, f"[{rank_jlpt}] ")
+    _collect_glyph_text(glyph_set, 0, "[Translate]")
     return badge, wrapped
 
 
@@ -7087,6 +7508,7 @@ def build_popup_bundle(
             out.extend(_pack_str_u16(r.pos or "Word"))
             out.extend(struct.pack("<BB", 1 if r.found else 0, 1 if r.ocr_disagreement else 0))
             out.extend(_pack_str_u8(badge))
+            out.extend(_pack_str_u8(getattr(r, "rank_jlpt", "")))
             out.extend(struct.pack("<H", len(wrapped)))
             for ln in wrapped:
                 out.extend(_pack_str_u16(ln))
@@ -7176,6 +7598,7 @@ def build_screen_bundle(
                     context_pool.append(ctx_txt)
                 ctx_idx = context_map[ctx_txt]
                 badge, wrapped = _collect_entry_glyphs(glyph_set, r)
+                rank_jlpt = getattr(r, "rank_jlpt", "")
                 ekey = (
                     r.matched_surface,
                     ctx_idx,
@@ -7185,11 +7608,12 @@ def build_screen_bundle(
                     1 if r.found else 0,
                     1 if r.ocr_disagreement else 0,
                     badge,
+                    rank_jlpt,
                     tuple(wrapped),
                 )
                 if ekey not in entry_map:
                     entry_map[ekey] = len(entry_pool)
-                    entry_pool.append((r, ctx_idx, badge, wrapped))
+                    entry_pool.append((r, ctx_idx, badge, rank_jlpt, wrapped))
                 e_indices.append(entry_map[ekey])
             v_encoded.append((eng_str, v.ocr_text, e_indices))
         prepared_spots.append((x1, y1, x2, y2, v_encoded))
@@ -7206,7 +7630,7 @@ def build_screen_bundle(
         out.extend(_pack_str_u16(ctx_txt))
 
     out.extend(struct.pack("<H", len(entry_pool)))
-    for r, ctx_idx, badge, wrapped in entry_pool:
+    for r, ctx_idx, badge, rank_jlpt, wrapped in entry_pool:
         out.extend(_pack_str_u16(r.matched_surface))
         out.extend(struct.pack("<H", ctx_idx))
         out.extend(_pack_str_u16(r.headword))
@@ -7214,6 +7638,7 @@ def build_screen_bundle(
         out.extend(_pack_str_u16(r.pos or "Word"))
         out.extend(struct.pack("<BB", 1 if r.found else 0, 1 if r.ocr_disagreement else 0))
         out.extend(_pack_str_u8(badge))
+        out.extend(_pack_str_u8(rank_jlpt))
         out.extend(struct.pack("<H", len(wrapped)))
         for ln in wrapped:
             out.extend(_pack_str_u16(ln))
@@ -8849,6 +9274,7 @@ def handle_3ds_session(
             last_target_screen_id: int = SCREEN_ID_BOTTOM
             last_x: int = 0
             last_y: int = 0
+            last_kanji_char: str = ""
             status_banner: str = ""
             last_ocr_time: float = 0.0
             active_footer_keys = ["A", "SEL", "X"]
@@ -9546,6 +9972,85 @@ def handle_3ds_session(
                                 session_anki_pending = max(0, session_anki_pending - 1)
                             _send_status_update(immediate_banner, target_scr_override=target_scr_snap)
                         continue
+                elif cmd_or_screen == CMD_LOOKUP_KANJI:
+                    scr_code = (x >> 8) & 0xFF
+                    cp_val = ((x & 0xFF) << 16) | (y & 0xFFFF)
+                    scr_code = scr_code & 0x03  # ignore any scroll bits from old clients
+                    try:
+                        kanji_char = chr(cp_val)
+                    except (ValueError, OverflowError):
+                        continue
+                    last_kanji_char = kanji_char
+                    if scr_code == 1:
+                        target_kanji_scr = SCREEN_ID_TOP
+                    elif scr_code == 2:
+                        target_kanji_scr = SCREEN_ID_BOTTOM
+                    else:
+                        target_kanji_scr = SCREEN_ID_BOTTOM if last_target_screen_id == SCREEN_ID_TOP else SCREEN_ID_TOP
+                    logger.info("Lookup Kanji '%s' (U+%04X) -> target screen %d", kanji_char, cp_val, target_kanji_scr)
+                    kanji_rgb = render_kanji_popup(
+                        kanji_char,
+                        target_kanji_scr,
+                        jamdict=pipeline.jamdict,
+                        word_meta_mgr=pipeline.word_meta_mgr,
+                    )
+                    hdr = struct.pack(POPUP_HEADER_FMT, target_kanji_scr | POPUP_KANJI_FLAG, len(kanji_rgb))
+                    _safe_send_pair(hdr, kanji_rgb)
+                    continue
+                elif cmd_or_screen == CMD_ADD_ANKI_KANJI:
+                    if not last_kanji_char:
+                        continue
+                    kanji_res = pipeline.word_meta_mgr.get_kanji_details(last_kanji_char, pipeline.jamdict)
+                    target_scr_snap = last_target_screen_id
+                    ss_mode = str(_load_anki_config().get("screenshot_mode", "clicked") or "clicked").strip().lower()
+                    if ss_mode == "none":
+                        ss_img: Optional[Image.Image] = None
+                    elif ss_mode == "both":
+                        ss_img = Image.new("RGB", (400, 484), color=(18, 20, 26))
+                        ss_img.paste(top_img, (0, 0))
+                        ss_img.paste(bot_img, (40, 244))
+                    else:
+                        ss_img = top_img if last_screen_id == SCREEN_ID_TOP else bot_img
+
+                    with anki_state_lock:
+                        anki_req_seq += 1
+                        req_id = anki_req_seq
+                        session_anki_pending += 1
+
+                        def _on_anki_kanji_done(
+                            done_banner: str,
+                            _global_remaining: int,
+                            rid: int = req_id,
+                            kch: str = last_kanji_char,
+                            tid: int = active_title_id,
+                            t_scr: int = target_scr_snap,
+                        ) -> None:
+                            logger.info(
+                                "Anki export for kanji '%s' (Title_ID=0x%016X): %s",
+                                kch,
+                                tid,
+                                _sanitize_log_str(done_banner),
+                            )
+                            with anki_state_lock:
+                                nonlocal session_anki_pending
+                                session_anki_pending = max(0, session_anki_pending - 1)
+                                if session_closed.is_set():
+                                    return
+                                try:
+                                    _send_status_update(done_banner, target_scr_override=t_scr)
+                                except OSError:
+                                    pass
+
+                        q_len, immediate_banner = _anki_exporter.enqueue_card_for_game(
+                            kanji_res,
+                            active_title_id,
+                            screenshot_img=ss_img,
+                            on_done=_on_anki_kanji_done,
+                        )
+                        if q_len == 0:
+                            session_anki_pending = max(0, session_anki_pending - 1)
+                        _send_status_update(immediate_banner, target_scr_override=target_scr_snap)
+                    continue
                 else:
                     logger.warning("Unknown Screen_ID/Cmd=0x%02X; ignoring packet.", cmd_or_screen)
                     continue

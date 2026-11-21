@@ -80,3 +80,6 @@ The server runs out of the box with `manga-ocr` / `rapidocr-onnxruntime`. To als
 1. Enable **Game Patching** and **Plugin Loader** in Luma3DS (`Select` on boot).
 2. Copy the built `default.3gx` to `/luma/plugins/default.3gx` on your 3DS SD card (or `/luma/plugins/<TitleID>/default.3gx` for a specific game).
 3. Launch the desktop server (`ocr_launcher.py`), pair your 3DS by scanning the QR code in the plugin, and press **`R + Start + Select`** in-game to capture and translate text.
+4. Move the cursor using the **Circle Pad** or **C-Stick** (New 3DS), D-Pad fine-stepping, or directly by tapping the touch screen.
+5. **Word Frequency & JLPT**: Word cards display their frequency ranking (e.g. `#195`) and JLPT level (e.g. `N5`) in the top banner instead of raw screen coordinates.
+6. **Kanji Stroke Order & Kanjidic Details**: Clicking or stylus-tapping any kanji character inside an active translation overlay opens a companion window on the opposite screen showing numbered stroke order diagrams, On/Kun/Nanori readings, radical, grade, frequency, and English definitions from Kanjidic. Press **`X`** while viewing this window to create an Anki card for the kanji, or **`B`** to close it.
