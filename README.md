@@ -4,8 +4,9 @@ Real-time dual-screen Japanese OCR, dictionary lookup, AI/neural translation, an
 
 ## Repository Layout
 
-- `ocr_launcher.py` — Desktop GUI launcher (QR code pairing, live OCR preview, settings, logs).
+- `ocr_launcher.py` — Desktop GUI launcher (QR code pairing, Paired 3DSes management, live OCR preview, settings, logs).
 - `ocr_server.py` — Socket/OCR/translation/Anki backend server.
+- `psk_store.py` — Thread-safe per-3DS PSK store and pairing registry (`ocr_psks.json`).
 - `anki_dialog.py` & `ui_theme.py` — Configuration dialogs and dark-mode UI helpers.
 - `3gx_plugin/` — Full CTRPluginFramework `.3gx` plugin source (`build_plugin.ps1` / `build_plugin.bat`).
 - `3gx_plugin_slim/` — Headless slim `.3gx` plugin for Old 3DS / extended memory games (`build_slim_plugin.ps1`).
@@ -32,7 +33,7 @@ Copy the example config files if you want to customize settings before launching
 - `anki_credentials.example.json` → `anki_credentials.json` *(only needed for direct AnkiWeb sync)*
 - `gemini_credentials.example.json` → `gemini_credentials.json` *(or set `GEMINI_API_KEY` / `GEMINI_FALLBACK_API_KEY` environment variables)*
 
-> A pre-shared encryption key (`ocr_psk.txt`) is generated automatically on first launch.
+> Per-3DS pre-shared encryption keys are managed automatically in `ocr_psks.json` (any existing `ocr_psk.txt` key is migrated automatically on first launch).
 
 ### Run
 Start the desktop launcher:
@@ -95,3 +96,30 @@ When a word translation popup is open on-screen, you can inspect any kanji in it
 2. **Scroll**: Use **D-Pad Up / Down** to scroll through long reading lists and meanings (if all details fit on one screen, scrolling is disabled).
 3. **Add to Anki**: Press **`X`** *(or your configured Anki keybind)* while the Kanji Details window is open to create an Anki flashcard for that kanji.
 4. **Close**: Press **`B`** (or click/tap a non-kanji area of the translation popup) to close only the Kanji Details window and return to your word popup. Press **`B`** again to close the word popup.
+
+---
+
+## 3. Multi-User Mode & Per-3DS Pairing
+
+Multiple 3DS consoles can connect concurrently to the same server, each with its own encryption key and AnkiWeb account.
+
+### Per-3DS PSKs & QR Pairing
+- Each 3DS receives its own 256-bit pre-shared key stored in `ocr_psks.json`.
+- When a 3DS scans the QR code in the launcher GUI, it immediately pings the server over the encrypted channel with its System Settings nickname, hardware model, and hardware-unique console ID.
+- The server records the console in `ocr_psks.json` and automatically rotates the QR code to a fresh pending key for the next 3DS. *(If the server is offline during the QR scan, the 3DS registers itself automatically on its next OCR session.)*
+
+### Managing Paired 3DSes
+- Open the **Paired 3DSes** tab in `ocr_launcher.py` to view all paired consoles (3DS name, model, console ID, masked PSK, paired time, and last-seen time).
+- You can **Rename** a console or **Invalidate PSK** to revoke a single 3DS's key—invalidating a PSK immediately rejects new handshakes and terminates any active session using that key without affecting other paired 3DSes.
+
+### Server Mode: Single 3DS vs. Multiple 3DS
+In the launcher's **Dictionaries & Anki Sync** card, switch **Server Mode** (`multi_user_mode` in `anki_config.json`):
+- **Single 3DS** *(default)*: Uses the server's configured Anki Desktop (AnkiConnect) or AnkiWeb login unless the connecting 3DS has set its own AnkiWeb credentials.
+- **Multiple 3DS**: Ignores the server's Anki login completely. Each connecting 3DS must use its own AnkiWeb credentials (synced through isolated per-account mirrors under `anki_sync/users/<hash>/` so concurrent sessions never cross accounts). If a 3DS without saved credentials tries to add a card, the server prompts it to open its AnkiWeb login dialog.
+
+### Setting AnkiWeb Login on the 3DS
+- **Full / Homebrew builds**: Press **`Select`** to open the Plugin Menu → **`AnkiWeb Login: [...]`**.
+- **Slim build**: Press **`Start + Select + L`** (default `Slim Menu` hotkey) → **`AnkiWeb Login`**.
+- **Mid-session (all builds)**: Press **`Start + Select + L`** *(or your configured `Slim Menu` hotkey)* while an OCR session is open to set, update, or clear credentials live; changes are immediately pushed to the active server session.
+
+Credentials are saved on the 3DS SD card at `/luma/ocr_anki.txt` and transmitted over the X25519-encrypted session stream. Choosing **Clear (Use Server Default)** removes the per-3DS login.

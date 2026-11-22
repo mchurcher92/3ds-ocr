@@ -12,11 +12,13 @@ Handles:
 """
 
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 import base64
 import hashlib
 import hmac
 import html
 import http.client
+import http.server
 import io
 import json
 import logging
@@ -1604,6 +1606,7 @@ class WordMetaManager:
             "jlpt": self._jlpt_kanji.get(kanji_char),
             "rad_num": None,
             "rad_char": "",
+            "rad_base": "",
             "rad_reading": "",
             "rad_meaning": "",
             "on_readings": [],
@@ -1615,6 +1618,7 @@ class WordMetaManager:
             try:
                 _kanjidic_lookup_aliases = {
                     "\u2ecc": ("\u8fb6", 3),  # ⻌ (1-dot Joyo shinnyou) -> query 辶 in Kanjidic2, 3 strokes
+                    "\u2e8c": ("小", 3),      # ⺌ (small variant) -> query 小 in Kanjidic2, 3 strokes
                 }
                 lookup_char, override_strokes = _kanjidic_lookup_aliases.get(kanji_char, (kanji_char, None))
                 kd_res = jam.lookup(lookup_char)
@@ -1630,9 +1634,33 @@ class WordMetaManager:
                             rad_num = int(c.radicals[0].value)
                             info["rad_num"] = rad_num
                             if 1 <= rad_num <= 214:
-                                # Use recognizable Japanese radical forms where the classical Kangxi
-                                # standalone character rarely/never appears in modern Japanese kanji;
-                                # otherwise NFKC-normalize U+2F00..U+2FD5 so msgothic.ttc doesn't draw □.
+                                # Detect which radical variant actually appears in this kanji via
+                                # Jamdict's KRADFILE decomposition (`jam.krad`), and pair it with
+                                # the canonical base form when they differ.
+                                _RADICAL_VARIANT_MAP = {
+                                    9: [("⺅", "亻")],
+                                    18: [("刂", "刂")],
+                                    42: [("⺌", "⺌")],
+                                    58: [("彑", "彑"), ("ヨ", "彐")],
+                                    61: [("忄", "忄")],
+                                    64: [("扌", "扌")],
+                                    66: [("攵", "攵")],
+                                    80: [("母", "母")],
+                                    85: [("氵", "氵")],
+                                    86: [("灬", "灬")],
+                                    94: [("犭", "犭")],
+                                    96: [("王", "王")],
+                                    113: [("礻", "礻")],
+                                    122: [("罒", "罒")],
+                                    125: [("⺹", "耂")],
+                                    130: [("月", "月")],
+                                    140: [("⺾", "艹")],
+                                    145: [("衤", "衤")],
+                                    146: [("西", "西")],
+                                    162: [("辶", "\u2ecc")],
+                                    163: [("⻏", "阝")],
+                                    170: [("⻖", "阝")],
+                                }
                                 _jp_rad_overrides = {
                                     122: "罒",      # 网 -> 罒 (あみがしら)
                                     140: "艹",      # 艸 -> 艹 (くさかんむり)
@@ -1640,9 +1668,23 @@ class WordMetaManager:
                                     163: "阝",      # 邑 -> 阝 (おおざと)
                                     170: "阝",      # 阜 -> 阝 (こざとへん)
                                 }
-                                info["rad_char"] = _jp_rad_overrides.get(
-                                    rad_num, unicodedata.normalize("NFKC", chr(0x2F00 + rad_num - 1))
-                                )
+                                base_char = unicodedata.normalize("NFKC", chr(0x2F00 + rad_num - 1))
+                                krad_dict = getattr(jam, "krad", None) or {}
+                                comps = krad_dict.get(kanji_char) or krad_dict.get(lookup_char) or []
+                                matched_variant = ""
+                                for krad_c, disp_v in _RADICAL_VARIANT_MAP.get(rad_num, ()):
+                                    if krad_c in comps and disp_v != base_char:
+                                        matched_variant = disp_v
+                                        break
+                                if matched_variant:
+                                    info["rad_char"] = matched_variant
+                                    info["rad_base"] = base_char
+                                elif rad_num in _jp_rad_overrides and kanji_char != base_char:
+                                    info["rad_char"] = _jp_rad_overrides[rad_num]
+                                    info["rad_base"] = base_char
+                                else:
+                                    info["rad_char"] = base_char
+                                    info["rad_base"] = ""
                                 rad_meta = self._kangxi_radicals.get(str(rad_num))
                                 if rad_meta and len(rad_meta) >= 2:
                                     info["rad_reading"] = rad_meta[0]
@@ -1672,6 +1714,7 @@ class WordMetaManager:
         jlpt = info["jlpt"]
         rad_num = info["rad_num"]
         rad_char = info["rad_char"]
+        rad_base = info.get("rad_base", "")
         on_readings = info["on_readings"]
         kun_readings = info["kun_readings"]
         meanings = info["meanings"]
@@ -1693,7 +1736,10 @@ class WordMetaManager:
         if freq is not None:
             pos_parts.append(f"Freq: #{freq}")
         if rad_char or rad_num:
-            pos_parts.append(f"Radical: {rad_char or '#' + str(rad_num)}")
+            if rad_char and rad_base and rad_char != rad_base:
+                pos_parts.append(f"Radical: {rad_char} ({rad_base})")
+            else:
+                pos_parts.append(f"Radical: {rad_char or '#' + str(rad_num)}")
 
         rank_jlpt = ""
         if freq is not None and jlpt is not None:
@@ -7283,6 +7329,7 @@ def render_kanji_popup(
     jlpt = info.get("jlpt")
     rad_num = info.get("rad_num")
     rad_char = info.get("rad_char", "")
+    rad_base = info.get("rad_base", "")
     rad_reading = info.get("rad_reading", "")
     rad_meaning = info.get("rad_meaning", "")
     on_readings: List[str] = info.get("on_readings", [])
@@ -7327,13 +7374,19 @@ def render_kanji_popup(
         )
 
     def _record_text_hotspots(
-        text: str, x0: int, y0: int, font: ImageFont.ImageFont, line_h: int
+        text: str,
+        x0: int,
+        y0: int,
+        font: ImageFont.ImageFont,
+        line_h: int,
+        rad_font: Optional[ImageFont.ImageFont] = None,
     ) -> None:
         if out_hotspots is None or not text:
             return
         pen_x = float(x0)
         for ch in text:
-            adv = float(font.getlength(ch))
+            use_font = rad_font if (rad_font is not None and 0x2E80 <= ord(ch) <= 0x2EFF) else font
+            adv = float(use_font.getlength(ch))
             if _is_clickable_kanji_or_rad(ch):
                 out_hotspots.append(
                     (int(pen_x) - 1, y0 - 1, int(pen_x + adv) + 1, y0 + line_h, ord(ch))
@@ -7404,18 +7457,24 @@ def render_kanji_popup(
     strk_lbl = f"Strokes: {stroke_count}" if stroke_count else "Strokes: -"
     draw.text((right_x, y_cur), strk_lbl, fill=(200, 220, 240), font=font_small)
     y_cur += 14
-    rad_lbl = (
-        f"Radical: {rad_char} (#{rad_num})" if rad_char and rad_num
-        else (f"Radical: #{rad_num}" if rad_num else "Radical: -")
-    )
+    if rad_char and rad_base and rad_char != rad_base and rad_num:
+        rad_lbl = f"Radical: {rad_char} ({rad_base}) #{rad_num}"
+    elif rad_char and rad_num:
+        rad_lbl = f"Radical: {rad_char} (#{rad_num})"
+    elif rad_num:
+        rad_lbl = f"Radical: #{rad_num}"
+    else:
+        rad_lbl = "Radical: -"
     rad_y0 = y_cur
+    rad_lbl_disp = _fit_text(rad_lbl, font_small, READ_MAX_W)
     _draw_text_with_rad_fallback(
         (right_x, y_cur),
-        _fit_text(rad_lbl, font_small, READ_MAX_W),
+        rad_lbl_disp,
         (160, 185, 215),
         font_small,
         rad_font_small,
     )
+    _record_text_hotspots(rad_lbl_disp, right_x, y_cur, font_small, 14, rad_font=rad_font_small)
     y_cur += 14
     if rad_reading or rad_meaning:
         rad_sub_parts = []
@@ -8685,7 +8744,6 @@ class AnkiExporter:
 
                 os.makedirs(sync_dir, exist_ok=True)
                 col_path = os.path.join(sync_dir, "collection.anki2")
-                media_db_path = os.path.join(sync_dir, "collection.media.db2")
                 col = Collection(col_path)
 
                 auth = self._cached_auths.get(auth_key)
@@ -8712,27 +8770,34 @@ class AnkiExporter:
                     )
 
                 if has_media:
-                    if os.path.exists(media_db_path):
-                        try:
-                            mconn = sqlite3.connect(media_db_path)
-                            if sync_out.server_media_usn > 0:
-                                mconn.execute(
-                                    "UPDATE meta SET lastUsn = ? WHERE lastUsn < ?",
-                                    (sync_out.server_media_usn, sync_out.server_media_usn),
-                                )
-                            mconn.execute("UPDATE media SET dirty = 0 WHERE fname NOT LIKE '3ds_%'")
-                            mconn.commit()
-                            mconn.close()
-                        except Exception as mexc:
-                            logger.warning("Could not fast-forward media lastUsn: %s", mexc)
+                    upstream_endpoint = auth.endpoint
+                    if not upstream_endpoint:
+                        host_num = getattr(sync_out, "host_number", 0)
+                        upstream_endpoint = (
+                            f"https://sync{host_num}.ankiweb.net/"
+                            if host_num
+                            else "https://sync.ankiweb.net/"
+                        )
 
-                    col.sync_media(auth)
-                    deadline = time.monotonic() + 10.0
-                    while time.monotonic() < deadline:
-                        st = col.media_sync_status()
-                        if not st.active:
-                            break
-                        time.sleep(0.05)
+                    with _upload_only_media_proxy(upstream_endpoint) as proxy_url:
+                        proxy_auth = SyncAuth(hkey=auth.hkey, endpoint=proxy_url)
+                        col.sync_media(proxy_auth)
+                        deadline = time.monotonic() + 30.0
+                        still_active = False
+                        try:
+                            while time.monotonic() < deadline:
+                                st = col.media_sync_status()
+                                if not st.active:
+                                    break
+                                time.sleep(0.05)
+                            else:
+                                still_active = True
+                        finally:
+                            if still_active:
+                                try:
+                                    col.abort_media_sync()
+                                except Exception:
+                                    pass
 
                 logger.info("Background AnkiWeb sync completed.")
             except Exception as exc:
@@ -8744,6 +8809,116 @@ class AnkiExporter:
                         col.close()
                     except Exception:
                         pass
+
+
+def _zstd_raw_frame(data: bytes) -> bytes:
+    """Wrap raw bytes in a Zstandard single-segment raw-block frame (no external deps)."""
+    out = bytearray(b"\x28\xb5\x2f\xfd\xa0") + bytearray(struct.pack("<I", len(data)))
+    max_blk = 128 * 1024
+    offset = 0
+    while True:
+        chunk = data[offset : offset + max_blk]
+        offset += len(chunk)
+        is_last = 1 if offset >= len(data) else 0
+        hdr = (len(chunk) << 3) | is_last
+        out.extend(hdr.to_bytes(3, "little"))
+        out.extend(chunk)
+        if is_last:
+            break
+    return bytes(out)
+
+
+def _read_http_body(handler: http.server.BaseHTTPRequestHandler) -> bytes:
+    """Read an HTTP request body, supporting both chunked transfer encoding and Content-Length."""
+    te = handler.headers.get("Transfer-Encoding", "").lower()
+    if "chunked" in te:
+        chunks = []
+        while True:
+            line = handler.rfile.readline().strip()
+            if not line:
+                break
+            size = int(line.split(b";", 1)[0], 16)
+            if size == 0:
+                handler.rfile.readline()
+                break
+            chunks.append(handler.rfile.read(size))
+            handler.rfile.readline()
+        return b"".join(chunks)
+    length = int(handler.headers.get("Content-Length", 0))
+    return handler.rfile.read(length) if length > 0 else b""
+
+
+@contextmanager
+def _upload_only_media_proxy(upstream_endpoint: str):
+    """
+    Local HTTP proxy that turns `col.sync_media()` into an upload-only sync:
+    intercepts `msync/mediaChanges` (empty) and `msync/mediaSanity` ("OK")
+    while forwarding `msync/begin` and `msync/uploadChanges` to AnkiWeb.
+    """
+    import requests
+
+    upstream = upstream_endpoint.rstrip("/")
+    sess = requests.Session()
+
+    class ProxyHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def handle(self) -> None:
+            try:
+                super().handle()
+            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+                pass
+
+        def _send_zstd_json(self, raw_json: bytes) -> None:
+            resp_body = _zstd_raw_frame(raw_json)
+            self.send_response(200)
+            self.send_header("anki-original-size", str(len(raw_json)))
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(resp_body)))
+            self.end_headers()
+            self.wfile.write(resp_body)
+
+        def do_POST(self) -> None:
+            body = _read_http_body(self)
+            path = self.path
+            if path.endswith("/msync/mediaChanges"):
+                self._send_zstd_json(b'{"data":[]}')
+                return
+            if path.endswith("/msync/mediaSanity"):
+                self._send_zstd_json(b'{"data":"OK"}')
+                return
+            fwd_headers = {
+                k: v
+                for k, v in self.headers.items()
+                if k.lower() not in ("host", "content-length", "connection", "transfer-encoding")
+            }
+            r = sess.post(upstream + path, data=body, headers=fwd_headers, timeout=30)
+            resp_body = r.content
+            self.send_response(r.status_code)
+            for k, v in r.headers.items():
+                if k.lower() not in (
+                    "transfer-encoding",
+                    "connection",
+                    "content-length",
+                    "content-encoding",
+                ):
+                    self.send_header(k, v)
+            self.send_header("Content-Length", str(len(resp_body)))
+            self.end_headers()
+            self.wfile.write(resp_body)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}/"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        sess.close()
 
 
 _anki_exporter = AnkiExporter()

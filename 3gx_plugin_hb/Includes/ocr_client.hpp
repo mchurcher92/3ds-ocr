@@ -88,6 +88,8 @@ namespace CTRPluginFramework
     // Lifecycle & Interface Functions
     void        OCR_Initialize(void);
     void        OCR_Cleanup(void);
+    void        OCR_OnProcessEvent(Process::Event event);
+    bool        OCR_IsSleeping(void);
     void        OCR_SuspendNetwork(bool closeSoc = false, bool logEvent = true);
     void        OCR_UnlockNetwork(bool logEvent = true);
     void        OCR_RelockNetworkDeferred(void);

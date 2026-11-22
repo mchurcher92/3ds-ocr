@@ -16,6 +16,7 @@ namespace CTRPluginFramework
 
     static void OnProcessEvent(Process::Event event)
     {
+        OCR_OnProcessEvent(event);
         if (event == Process::Event::EXIT) {
             s_running = false;
             OCR_Cleanup();
@@ -31,6 +32,9 @@ namespace CTRPluginFramework
         while (s_running)
         {
             Sleep(Milliseconds(16));
+            if (OCR_IsSleeping()) {
+                continue;
+            }
             Controller::Update();
             if (g_ocrKeys.slimMenu != 0 && Controller::IsKeysPressed(g_ocrKeys.slimMenu)) {
                 OCR_OpenKeyBindingsMenu();

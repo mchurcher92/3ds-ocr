@@ -573,6 +573,7 @@ class OcrServerLauncherGui:
             value=f"Paired 3DSes: {len(store.get('devices', []))}"
         )
         self.server_proc: Optional[subprocess.Popen] = None
+        self._pending_restart: bool = False
         self.log_queue: queue.Queue = queue.Queue()
         self.reader_thread: Optional[threading.Thread] = None
         self.qr_image_tk = None
@@ -635,6 +636,17 @@ class OcrServerLauncherGui:
             font_size=9,
         )
         self.server_btn.pack(side="left")
+
+        self.reset_server_btn = make_action_button(
+            ctrl_col,
+            text="↻  Reset Server",
+            command=self._restart_server,
+            variant="secondary",
+            padx=12,
+            pady=6,
+            font_size=9,
+        )
+        self.reset_server_btn.pack(side="left", padx=(8, 0))
 
         # Sleek Underline Tab Bar & Content Area (replaces Win98 ttk.Notebook)
         tab_bar_container = tk.Frame(self.root, bg=BG_ROOT, bd=0, highlightthickness=0)
@@ -1119,8 +1131,7 @@ class OcrServerLauncherGui:
         self.dict_summary_var.set(self._get_dictionary_summary())
         if self.server_proc and self.server_proc.poll() is None:
             self._log_local("[INFO] Restarting server to apply updated dictionaries & resources...")
-            self._stop_server()
-            self.root.after(1000, self._start_server)
+            self._restart_server()
         else:
             messagebox.showinfo("Dictionaries", "Dictionaries refreshed. Start the server to load them.")
 
@@ -1244,6 +1255,17 @@ class OcrServerLauncherGui:
         else:
             self._start_server()
 
+    def _restart_server(self) -> None:
+        if self.server_proc and self.server_proc.poll() is None:
+            self._pending_restart = True
+            self._log_local("[INFO] Resetting OCR server...")
+            self._set_server_button("⏳  Resetting...", "secondary", state="disabled")
+            self.reset_server_btn.configure(state="disabled")
+            self._set_status_badge("⏳  Resetting server...", WARNING, WARNING_BG)
+            self._stop_server(for_restart=True)
+        else:
+            self._start_server()
+
     def _start_server(self) -> None:
         if self.server_proc and self.server_proc.poll() is None:
             return
@@ -1258,14 +1280,16 @@ class OcrServerLauncherGui:
             port = DEFAULT_PORT
 
         self._set_server_button("⏳  Starting...", "secondary", state="disabled")
+        self.reset_server_btn.configure(state="disabled")
         self._set_status_badge(f"⏳  Starting on :{port}...", WARNING, WARNING_BG)
 
         def run_proc():
             cmd = [self.python_bin, "-u", OCR_SERVER_SCRIPT, "--cli", "--port", str(port)]
             self._log_local(f"[INFO] Executing external server backend: {' '.join(cmd)}")
+            proc: Optional[subprocess.Popen] = None
             try:
                 creation_flags = 0x08000000 if sys.platform == "win32" else 0
-                self.server_proc = subprocess.Popen(
+                proc = self.server_proc = subprocess.Popen(
                     cmd,
                     cwd=APP_DIR,
                     stdout=subprocess.PIPE,
@@ -1274,49 +1298,59 @@ class OcrServerLauncherGui:
                     bufsize=1,
                     creationflags=creation_flags,
                 )
-                pid = self.server_proc.pid
+                pid = proc.pid
                 self.root.after(
                     0,
                     lambda: [
                         self._set_status_badge(f"●  Running :{port} (PID {pid})", SUCCESS, SUCCESS_BG),
                         self._set_server_button("■  Stop Server", "danger", state="normal"),
+                        self.reset_server_btn.configure(state="normal"),
                     ],
                 )
 
-                for raw_line in iter(self.server_proc.stdout.readline, ""):
+                for raw_line in iter(proc.stdout.readline, ""):
                     if raw_line:
                         self.log_queue.put(raw_line)
 
-                self.server_proc.stdout.close()
-                self.server_proc.wait()
+                proc.stdout.close()
+                proc.wait()
             except Exception as e:
                 self._log_local(f"[ERROR] Failed to start server: {e}")
             finally:
-                self.root.after(
-                    0,
-                    lambda: [
-                        self._set_status_badge("○  Server Stopped", DANGER, DANGER_BG),
-                        self._set_server_button("▶  Start Server", "success", state="normal"),
-                    ],
-                )
+                def _on_exit():
+                    if proc is not None and self.server_proc is not proc:
+                        return
+                    if self._pending_restart:
+                        self._pending_restart = False
+                        self.root.after(200, self._start_server)
+                    else:
+                        self._set_status_badge("○  Server Stopped", DANGER, DANGER_BG)
+                        self._set_server_button("▶  Start Server", "success", state="normal")
+                        self.reset_server_btn.configure(state="normal")
+
+                self.root.after(0, _on_exit)
 
         self.reader_thread = threading.Thread(target=run_proc, daemon=True)
         self.reader_thread.start()
 
-    def _stop_server(self) -> None:
-        if self.server_proc and self.server_proc.poll() is None:
-            self._set_server_button("⏳  Stopping...", "secondary", state="disabled")
+    def _stop_server(self, for_restart: bool = False) -> None:
+        proc = self.server_proc
+        if proc and proc.poll() is None:
+            if not for_restart:
+                self._pending_restart = False
+                self._set_server_button("⏳  Stopping...", "secondary", state="disabled")
+                self.reset_server_btn.configure(state="disabled")
             self._log_local("[INFO] Stopping external OCR server process...")
             try:
-                self.server_proc.terminate()
+                proc.terminate()
             except Exception:
                 pass
 
             def killer():
                 time.sleep(2.0)
-                if self.server_proc and self.server_proc.poll() is None:
+                if proc.poll() is None:
                     try:
-                        self.server_proc.kill()
+                        proc.kill()
                     except Exception:
                         pass
 

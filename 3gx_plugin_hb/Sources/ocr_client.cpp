@@ -20,10 +20,60 @@
 #include <algorithm>
 #include <vector>
 #include <unordered_map>
+#include <atomic>
 #include <zlib.h>
+#include <CTRPluginFrameworkImpl/System/SystemImpl.hpp>
 
 namespace CTRPluginFramework
 {
+    static std::atomic<bool> s_sleepOrSuspendActive{false};
+    static std::atomic<int>  s_pausedOverlayDepth{0};
+
+    struct ScopedPausedOverlay {
+        bool active{false};
+        explicit ScopedPausedOverlay(bool track = true) : active(track) {
+            if (active) s_pausedOverlayDepth.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~ScopedPausedOverlay() {
+            if (active) s_pausedOverlayDepth.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    };
+
+    static bool OCR_ShouldAbortForSleep(void)
+    {
+        return s_sleepOrSuspendActive.load(std::memory_order_acquire) || SystemImpl::IsSleeping();
+    }
+
+    bool OCR_IsSleeping(void)
+    {
+        return OCR_ShouldAbortForSleep();
+    }
+
+    void OCR_OnProcessEvent(Process::Event event)
+    {
+        if (event == Process::Event::SLEEP_ENTER ||
+            event == Process::Event::HOME_ENTER ||
+            event == Process::Event::SWAP_ENTER ||
+            event == Process::Event::EXIT)
+        {
+            s_sleepOrSuspendActive.store(true, std::memory_order_release);
+            if (event == Process::Event::SLEEP_ENTER || event == Process::Event::HOME_ENTER) {
+                // Set CTRPF's sleep flag early so any open CTRPF Keyboard/MessageBox also aborts immediately
+                SystemImpl::AptStatus |= BIT(6);
+            }
+            // Wait for any active paused overlay to clean up and call Process::Play() BEFORE PLGLDR__Reply()
+            for (int i = 0; i < 300 && s_pausedOverlayDepth.load(std::memory_order_acquire) > 0; ++i) {
+                svcSleepThread(5000000ULL); // 5ms, max 1.5s
+            }
+        }
+        else if (event == Process::Event::SLEEP_EXIT ||
+                 event == Process::Event::HOME_EXIT ||
+                 event == Process::Event::SWAP_EXIT)
+        {
+            s_sleepOrSuspendActive.store(false, std::memory_order_release);
+        }
+    }
+
     // Global static socket context using Luma3DS system memory allocation
     static bool s_socInitialized = false;
     static bool s_socBorrowed = false;
@@ -310,6 +360,21 @@ namespace CTRPluginFramework
             isSvc = false;
         }
     };
+
+    struct AutoFreeSessionBuffer {
+        SessionBuffer &sb;
+        ~AutoFreeSessionBuffer() { sb.Free(); }
+    };
+
+    static __attribute__((noinline)) bool HeapCanFit(size_t bytes)
+    {
+        if (bytes == 0) return true;
+        void * volatile p = malloc(bytes);
+        if (!p) return false;
+        *(volatile uint8_t *)p = 0;
+        free((void *)p);
+        return true;
+    }
 
     static SessionBuffer s_topBuffer;
     static SessionBuffer s_botBuffer;
@@ -1210,6 +1275,15 @@ namespace CTRPluginFramework
         const uint8_t *p = (const uint8_t *)buf;
         size_t total = 0;
         while (total < len) {
+            if (OCR_ShouldAbortForSleep()) return -1;
+            struct pollfd pfd;
+            pfd.fd = sock;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            int pr = poll(&pfd, 1, 50);
+            if (pr == 0) continue;
+            if (pr < 0) return -1;
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
             size_t chunk = len - total;
             if (chunk > 0x4000) chunk = 0x4000;
             ssize_t n = send(sock, p + total, chunk, 0);
@@ -1224,6 +1298,15 @@ namespace CTRPluginFramework
         uint8_t *p = (uint8_t *)buf;
         size_t total = 0;
         while (total < len) {
+            if (OCR_ShouldAbortForSleep()) return -1;
+            struct pollfd pfd;
+            pfd.fd = sock;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            int pr = poll(&pfd, 1, 50);
+            if (pr == 0) continue;
+            if (pr < 0) return -1;
+            if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) && !(pfd.revents & POLLIN)) return -1;
             size_t chunk = len - total;
             if (chunk > 0x4000) chunk = 0x4000;
             ssize_t n = recv(sock, p + total, chunk, 0);
@@ -1297,6 +1380,36 @@ namespace CTRPluginFramework
         return 0;
     }
 
+    static bool DrainEncryptedPayload(int sock, sha256_stream_t *rx, uint32_t payloadSize)
+    {
+        uint8_t recv_mac[STREAM_MAC_SIZE];
+        uint8_t calc_mac[32];
+        uint8_t aad[9];
+        uint8_t drainBuf[4096];
+        hmac_sha256_ctx_t hctx;
+
+        aad[0] = rx->dir;
+        store_be64(&aad[1], rx->seq++);
+
+        hmac_sha256_init(&hctx, rx->mac_key, 32);
+        hmac_sha256_update(&hctx, aad, sizeof(aad));
+
+        uint32_t rem = payloadSize;
+        while (rem > 0) {
+            uint32_t chunk = (rem < (uint32_t)sizeof(drainBuf)) ? rem : (uint32_t)sizeof(drainBuf);
+            if (recv_all(sock, drainBuf, chunk) < 0) return false;
+            hmac_sha256_update(&hctx, drainBuf, chunk);
+            sha256_stream_xor(rx, drainBuf, chunk);
+            rem -= chunk;
+        }
+        if (recv_all(sock, recv_mac, STREAM_MAC_SIZE) < 0) return false;
+        hmac_sha256_final(&hctx, calc_mac);
+
+        bool ok = (crypto_verify_16(recv_mac, calc_mac) == 0);
+        crypto_wipe(calc_mac, sizeof(calc_mac));
+        return ok;
+    }
+
     static bool OCR_GenerateEphemeralSecret(uint8_t out_secret[32])
     {
         static uint32_t session_counter = 0;
@@ -1357,11 +1470,24 @@ namespace CTRPluginFramework
         int res = connect(sock, (struct sockaddr *)&serverAddr, sizeof(serverAddr));
         if (res < 0) {
             if (errno == EINPROGRESS || errno == EWOULDBLOCK || errno == EAGAIN) {
+                int remaining_ms = timeout_ms;
+                int pollRes = 0;
                 struct pollfd pfd;
                 pfd.fd = sock;
                 pfd.events = POLLOUT;
                 pfd.revents = 0;
-                int pollRes = poll(&pfd, 1, timeout_ms);
+                while (remaining_ms > 0) {
+                    if (OCR_ShouldAbortForSleep()) {
+                        out_err = ECANCELED;
+                        closesocket(sock);
+                        return -1;
+                    }
+                    int slice = (remaining_ms > 50) ? 50 : remaining_ms;
+                    pfd.revents = 0;
+                    pollRes = poll(&pfd, 1, slice);
+                    if (pollRes != 0) break;
+                    remaining_ms -= slice;
+                }
                 if (pollRes > 0) {
                     if (pfd.revents & (POLLERR | POLLHUP)) {
                         int sockErr = 0;
@@ -1462,11 +1588,14 @@ namespace CTRPluginFramework
         }
 
         if (pendingConnEvent != 0) {
-            svcWaitSynchronization(pendingConnEvent, 6000000000ULL);
+            for (int i = 0; i < 120; ++i) {
+                if (OCR_ShouldAbortForSleep()) break;
+                if (R_SUCCEEDED(svcWaitSynchronization(pendingConnEvent, 50000000ULL))) break;
+            }
             svcCloseHandle(pendingConnEvent);
         }
 
-        if (needConnect) {
+        if (needConnect && !OCR_ShouldAbortForSleep()) {
             bool needStart = false;
             {
                 Lock lock(s_netMutex);
@@ -1491,8 +1620,12 @@ namespace CTRPluginFramework
                             }
                         }
                         if (R_SUCCEEDED(cr)) {
-                            // Wait up to 6 seconds for Wi-Fi association
-                            wr = svcWaitSynchronization(connEvent, 6000000000ULL);
+                            // Wait up to 6 seconds for Wi-Fi association in 50ms slices so sleep aborts immediately
+                            for (int i = 0; i < 120; ++i) {
+                                if (OCR_ShouldAbortForSleep()) break;
+                                wr = svcWaitSynchronization(connEvent, 50000000ULL);
+                                if (R_SUCCEEDED(wr)) break;
+                            }
                         }
                         svcCloseHandle(connEvent);
                         u32 postSt = 0;
@@ -2093,7 +2226,6 @@ namespace CTRPluginFramework
         std::string ocrBadge;
         std::string rankJlpt;
         std::vector<std::string> wrappedLines;
-        std::vector<uint32_t> posCodepoints;
     };
 
     struct PopupVariant {
@@ -2261,6 +2393,7 @@ namespace CTRPluginFramework
     {
         uint16_t count = 0;
         if (!ReadU16(buf, len, off, count)) return false;
+        if (count > 4096 || !HeapCanFit((size_t)count * 48 + 49152)) return false;
         for (uint16_t i = 0; i < count; ++i) {
             uint32_t cp = 0;
             uint8_t fid = 0, gw = 0, gh = 0, adv = 0;
@@ -2319,7 +2452,6 @@ namespace CTRPluginFramework
         }
         e.found = (fFlag != 0);
         e.ocrDisagreement = (dFlag != 0);
-        e.posCodepoints = Utf8ToCodepoints(e.pos);
         e.wrappedLines.reserve(numLines);
         for (uint16_t li = 0; li < numLines; ++li) {
             std::string ln;
@@ -2372,26 +2504,36 @@ namespace CTRPluginFramework
         return true;
     }
 
-    static bool ParseScreenBundle(const uint8_t *buf, size_t len, ScreenBundle &out)
+    static bool ParseScreenBundle(SessionBuffer &rawSb, size_t len, ScreenBundle &out)
     {
+        if (!rawSb.ptr) return false;
+        const uint8_t *buf = rawSb.ptr;
         size_t off = 0;
         uint8_t compFlag = 0;
         uint32_t rawLen = 0;
         if (!ReadU8(buf, len, off, compFlag) || !ReadU32(buf, len, off, rawLen)) return false;
         if (rawLen == 0 || rawLen > 2 * 1024 * 1024) return false;
 
-        std::vector<uint8_t> decompressed;
+        SessionBuffer decompSb;
+        AutoFreeSessionBuffer decompGuard{decompSb};
         const uint8_t *raw = buf + off;
         size_t rLen = len - off;
         if (compFlag & 1) {
-            decompressed.resize(rawLen);
-            uLongf destLen = (uLongf)rawLen;
-            if (uncompress(decompressed.data(), &destLen, buf + off, (uLong)(len - off)) != Z_OK || destLen == 0) {
+            if (!decompSb.Alloc(0x07420000, rawLen, 0x073E0000)) {
                 return false;
             }
-            raw = decompressed.data();
+            uLongf destLen = (uLongf)rawLen;
+            if (uncompress(decompSb.ptr, &destLen, buf + off, (uLong)(len - off)) != Z_OK || destLen == 0) {
+                return false;
+            }
+            rawSb.Free();
+            raw = decompSb.ptr;
             rLen = (size_t)destLen;
         } else if (rLen < rawLen) {
+            return false;
+        }
+
+        if (!HeapCanFit(rLen + 98304)) {
             return false;
         }
 
@@ -2414,6 +2556,10 @@ namespace CTRPluginFramework
 
         uint16_t numEntries = 0;
         if (!ReadU16(raw, rLen, pOff, numEntries)) return false;
+        size_t remBytes = (pOff < rLen) ? (rLen - pOff) : 0;
+        if (numEntries > 4096 || !HeapCanFit((size_t)numEntries * sizeof(PopupEntry) + remBytes + 65536)) {
+            return false;
+        }
         b.entries.resize(numEntries);
         for (uint16_t i = 0; i < numEntries; ++i) {
             if (!ParseEntryFields(raw, rLen, pOff, b.entries[i], true, &b.contexts)) return false;
@@ -2735,9 +2881,10 @@ namespace CTRPluginFramework
         }
 
         // Grammar / POS horizontally scrollable line
-        int maxPosX = std::max(0, (int)res.posCodepoints.size() - POS_WINDOW_CHARS);
+        std::vector<uint32_t> posCps = Utf8ToCodepoints(res.pos);
+        int maxPosX = std::max(0, (int)posCps.size() - POS_WINDOW_CHARS);
         int posOff = std::max(0, std::min(posScrollX, maxPosX));
-        std::string posSlice = CodepointsToUtf8(res.posCodepoints, (size_t)posOff, POS_WINDOW_CHARS);
+        std::string posSlice = CodepointsToUtf8(posCps, (size_t)posOff, POS_WINDOW_CHARS);
         if (posOff > 0) {
             DrawGlyphText(screen, xOff, glyphs, 1, "<", 4, tl.posY, Color(255, 220, 110), bgBody, 16);
         }
@@ -2899,9 +3046,10 @@ namespace CTRPluginFramework
         }
 
         // 3. POS line at tl.posY, fontId=1
-        int maxPosX = std::max(0, (int)res.posCodepoints.size() - POS_WINDOW_CHARS);
+        std::vector<uint32_t> posCps = Utf8ToCodepoints(res.pos);
+        int maxPosX = std::max(0, (int)posCps.size() - POS_WINDOW_CHARS);
         int posOff = std::max(0, std::min(posScrollX, maxPosX));
-        std::string posSlice = CodepointsToUtf8(res.posCodepoints, (size_t)posOff, POS_WINDOW_CHARS);
+        std::string posSlice = CodepointsToUtf8(posCps, (size_t)posOff, POS_WINDOW_CHARS);
         int posStartX = (posOff > 0) ? 14 : 12;
         int posMaxRight = (posOff < maxPosX) ? 300 : 312;
         if (TryGetKanjiInText(glyphs, 1, posSlice, posStartX, tl.posY - 4, 24, popX, popY, outKanji, posMaxRight)) {
@@ -3242,7 +3390,11 @@ namespace CTRPluginFramework
 
     bool OCR_ScanQrCode(void)
     {
+        if (OCR_ShouldAbortForSleep()) {
+            return false;
+        }
         bool wasPaused = Process::IsPaused();
+        ScopedPausedOverlay pauseGuard(!wasPaused);
         if (!wasPaused) {
             Process::Pause();
             Sleep(Milliseconds(20));
@@ -3297,6 +3449,9 @@ namespace CTRPluginFramework
         std::string scannedPayload;
 
         while (true) {
+            if (OCR_ShouldAbortForSleep()) {
+                break;
+            }
             Controller::Update();
             if (Controller::IsKeyPressed(Key::B)) {
                 break;
@@ -3308,9 +3463,17 @@ namespace CTRPluginFramework
             Handle camEvent = 0;
             Result rxRes = CAMU_SetReceiving(&camEvent, camBuf, PORT_CAM1, 320 * 240 * sizeof(u16), (s16)bufSize);
             if (R_SUCCEEDED(rxRes)) {
-                Result waitRes = svcWaitSynchronization(camEvent, 300000000ULL);
+                Result waitRes = -1;
+                for (int s = 0; s < 6; ++s) {
+                    if (OCR_ShouldAbortForSleep()) break;
+                    waitRes = svcWaitSynchronization(camEvent, 50000000ULL);
+                    if (R_SUCCEEDED(waitRes)) break;
+                }
                 svcCloseHandle(camEvent);
                 CAMU_StopCapture(PORT_CAM1);
+                if (OCR_ShouldAbortForSleep()) {
+                    break;
+                }
 
                 const Screen &topScreen = OSD::GetTopScreen();
                 const Screen &botScreen = OSD::GetBottomScreen();
@@ -3370,6 +3533,9 @@ namespace CTRPluginFramework
                     botScreen.Draw("Initializing camera sensor...", 55, 110, Color::Yellow, Color(20, 20, 25));
                 }
 
+                if (OCR_ShouldAbortForSleep()) {
+                    break;
+                }
                 // Swap buffers to display frame
                 OSD::SwapBuffers();
 
@@ -3450,6 +3616,10 @@ namespace CTRPluginFramework
 
     void OCR_LaunchSession(void)
     {
+        if (OCR_ShouldAbortForSleep()) {
+            return;
+        }
+
         // Allocate screen buffers dynamically for the session (popup buffer is allocated on-demand)
         if (!s_topBuffer.Alloc(0x07250000, TOP_FB_RGB_SIZE) ||
             !s_botBuffer.Alloc(0x072A0000, BOT_FB_RGB_SIZE)) {
@@ -3459,13 +3629,19 @@ namespace CTRPluginFramework
         }
 
         // 1. Pause game process
+        ScopedPausedOverlay pauseGuard;
         Process::Pause();
         Sleep(Milliseconds(20));
 
         // Wait until trigger buttons are released
-        while (Controller::IsKeysDown(g_ocrKeys.activation)) {
+        while (Controller::IsKeysDown(g_ocrKeys.activation) && !OCR_ShouldAbortForSleep()) {
             Controller::Update();
             Sleep(Milliseconds(16));
+        }
+        if (OCR_ShouldAbortForSleep()) {
+            OCR_FreeSessionBuffers();
+            Process::Play();
+            return;
         }
 
         // 2. Snapshot game screens
@@ -3484,6 +3660,11 @@ namespace CTRPluginFramework
         if ((s_serverLanHost.empty() && s_serverWanHost.empty()) || pskLen == 0) {
             OSD::Notify("OCR Not Paired! Opening QR Scanner...", Color::Yellow);
             if (OCR_ScanQrCode()) {
+                if (OCR_ShouldAbortForSleep()) {
+                    OCR_FreeSessionBuffers();
+                    Process::Play();
+                    return;
+                }
                 for (int b = 0; b < 2; ++b) {
                     RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
                     RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
@@ -3501,6 +3682,12 @@ namespace CTRPluginFramework
         sha256_stream_t tx_stream, rx_stream;
 
         while (true) {
+            if (OCR_ShouldAbortForSleep()) {
+                OCR_FreeSessionBuffers();
+                Process::Play();
+                return;
+            }
+
             // Display "Connecting..." status bar on bottom screen on both buffers
             for (int b = 0; b < 2; ++b) {
                 const Screen &top = OSD::GetTopScreen();
@@ -3514,6 +3701,15 @@ namespace CTRPluginFramework
 
             std::string diag;
             sock = OCR_ConnectServer(&diag);
+            if (OCR_ShouldAbortForSleep()) {
+                if (sock >= 0) {
+                    closesocket(sock);
+                    sock = -1;
+                }
+                OCR_FreeSessionBuffers();
+                Process::Play();
+                return;
+            }
 
             bool handshakeOk = false;
             if (sock >= 0) {
@@ -3522,6 +3718,15 @@ namespace CTRPluginFramework
                     closesocket(sock);
                     sock = -1;
                     diag += "Handshake Failed: Invalid PSK or mismatch.\n";
+                }
+                if (OCR_ShouldAbortForSleep()) {
+                    if (sock >= 0) {
+                        closesocket(sock);
+                        sock = -1;
+                    }
+                    OCR_FreeSessionBuffers();
+                    Process::Play();
+                    return;
                 }
             }
 
@@ -3533,6 +3738,11 @@ namespace CTRPluginFramework
             // Connection or Handshake Failed: Show interactive failure screen
             bool retry = false;
             while (true) {
+                if (OCR_ShouldAbortForSleep()) {
+                    OCR_FreeSessionBuffers();
+                    Process::Play();
+                    return;
+                }
                 Controller::Update();
                 u32 kDown = Controller::GetKeysDown();
 
@@ -3541,6 +3751,11 @@ namespace CTRPluginFramework
                         OCR_LoadConfig();
                         retry = true;
                         break;
+                    }
+                    if (OCR_ShouldAbortForSleep()) {
+                        OCR_FreeSessionBuffers();
+                        Process::Play();
+                        return;
                     }
                 } else if (kDown & Key::A) {
                     OCR_LoadConfig();
@@ -3586,11 +3801,15 @@ namespace CTRPluginFramework
         if (send_encrypted_frame(sock, &tx_stream, titleIdBuf, sizeof(titleIdBuf)) < 0 ||
             send_encrypted_frame(sock, &tx_stream, s_top_rgb, TOP_FB_RGB_SIZE) < 0 ||
             send_encrypted_frame(sock, &tx_stream, s_bot_rgb, BOT_FB_RGB_SIZE) < 0) {
-            OSD::Notify("OCR Error: Screen upload failed", Color::Red);
+            if (!OCR_ShouldAbortForSleep()) {
+                OSD::Notify("OCR Error: Screen upload failed", Color::Red);
+            }
             closesocket(sock);
-            for (int b = 0; b < 2; ++b) {
-                RestoreRect(OSD::GetBottomScreen(), 0, 224, 320, 16, s_bot_rgb, BOT_WIDTH, 240);
-                OSD::SwapBuffers();
+            if (!OCR_ShouldAbortForSleep()) {
+                for (int b = 0; b < 2; ++b) {
+                    RestoreRect(OSD::GetBottomScreen(), 0, 224, 320, 16, s_bot_rgb, BOT_WIDTH, 240);
+                    OSD::SwapBuffers();
+                }
             }
             OCR_FreeSessionBuffers();
             Process::Play();
@@ -3721,6 +3940,159 @@ namespace CTRPluginFramework
             }
         };
 
+        bool serverDisconnected = false;
+        auto ShowOfflineStatus = [&](const char *msg) {
+            if (cachedPopup.active) {
+                cachedPopup.statusBanner = msg;
+                cachedPopup.statusLevel = 2;
+                RedrawBundlePopup();
+            } else if (popupBundle.active) {
+                popupBundle.statusBanner = msg;
+                popupBundle.statusLevel = 2;
+                RedrawBundlePopup();
+            }
+        };
+        auto MarkDisconnected = [&](bool showBanner = false) {
+            if (sock >= 0) {
+                s_activeSessionSock = -1;
+                s_activeSessionTx = nullptr;
+                closesocket(sock);
+                sock = -1;
+            }
+            if (!serverDisconnected) {
+                serverDisconnected = true;
+                if (!OCR_ShouldAbortForSleep()) {
+                    ShowOfflineStatus("Server disconnected (cached lookups still work)");
+                }
+            } else if (showBanner && !OCR_ShouldAbortForSleep()) {
+                ShowOfflineStatus("Offline: server unavailable");
+            }
+        };
+        auto TryReconnectSession = [&](void) -> bool {
+            if (OCR_ShouldAbortForSleep()) return false;
+            if (sock >= 0) return true;
+
+            bool drewBottomBar = false;
+            if (cachedPopup.active || popupBundle.active) {
+                ShowOfflineStatus("Reconnecting to OCR server...");
+            } else if (!hasPopup) {
+                for (int b = 0; b < 2; ++b) {
+                    const Screen &bot = OSD::GetBottomScreen();
+                    bot.DrawRect(0, 224, 320, 16, Color(20, 20, 30));
+                    bot.Draw("Reconnecting to OCR Server...", 10, 227, Color(255, 230, 0), Color::Black);
+                    OSD::SwapBuffers();
+                }
+                drewBottomBar = true;
+            }
+
+            auto RestoreBottomBarIfNeeded = [&](void) {
+                if (drewBottomBar && !OCR_ShouldAbortForSleep()) {
+                    for (int b = 0; b < 2; ++b) {
+                        RestoreRect(OSD::GetBottomScreen(), 0, 224, 320, 16, s_bot_rgb, BOT_WIDTH, 240);
+                        PresentFrame();
+                    }
+                }
+            };
+
+            std::string diag;
+            int newSock = OCR_ConnectServer(&diag);
+            if (OCR_ShouldAbortForSleep() || newSock < 0) {
+                if (newSock >= 0) closesocket(newSock);
+                RestoreBottomBarIfNeeded();
+                ShowOfflineStatus("Offline: reconnect failed");
+                return false;
+            }
+
+            sha256_stream_t newTx, newRx;
+            if (!OCR_PerformHandshake(newSock, &newTx, &newRx)) {
+                closesocket(newSock);
+                crypto_wipe(&newTx, sizeof(newTx));
+                crypto_wipe(&newRx, sizeof(newRx));
+                RestoreBottomBarIfNeeded();
+                ShowOfflineStatus("Offline: handshake failed");
+                return false;
+            }
+
+            u64 reTitleId = Process::GetTitleID();
+            uint8_t reTitleBuf[8];
+            store_be64(reTitleBuf, reTitleId);
+            uint8_t reKeyLabels[5] = {
+                CMD_SET_KEY_LABELS,
+                OCR_KeyToCharCode(g_ocrKeys.lookup),
+                OCR_KeyToCharCode(g_ocrKeys.modeToggle),
+                OCR_KeyToCharCode(g_ocrKeys.addAnki),
+                OCR_KeyToCharCode(g_ocrKeys.switchScreen)
+            };
+            uint8_t reCaps[5] = { CMD_SET_CLIENT_CAPS, 0, 3, 0, 1 };
+
+            bool uploadOk =
+                send_encrypted_frame(newSock, &newTx, reTitleBuf, sizeof(reTitleBuf)) >= 0 &&
+                send_encrypted_frame(newSock, &newTx, s_top_rgb, TOP_FB_RGB_SIZE) >= 0 &&
+                send_encrypted_frame(newSock, &newTx, s_bot_rgb, BOT_FB_RGB_SIZE) >= 0 &&
+                send_encrypted_frame(newSock, &newTx, reKeyLabels, sizeof(reKeyLabels)) >= 0 &&
+                send_encrypted_frame(newSock, &newTx, reCaps, sizeof(reCaps)) >= 0;
+
+            if (uploadOk && !s_ankiUser.empty() && !s_ankiPass.empty()) {
+                if (!OCR_SendAnkiCredentials(newSock, &newTx)) uploadOk = false;
+            }
+            if (uploadOk) {
+                if (!OCR_SendDeviceInfo(newSock, &newTx)) uploadOk = false;
+            }
+            if (uploadOk && translateMode) {
+                uint8_t modePacket[5] = { CMD_SET_MODE, 1, 0, 0, 0 };
+                if (send_encrypted_frame(newSock, &newTx, modePacket, sizeof(modePacket)) < 0) uploadOk = false;
+            }
+
+            if (!uploadOk || OCR_ShouldAbortForSleep()) {
+                closesocket(newSock);
+                crypto_wipe(&newTx, sizeof(newTx));
+                crypto_wipe(&newRx, sizeof(newRx));
+                RestoreBottomBarIfNeeded();
+                ShowOfflineStatus("Offline: reconnect upload failed");
+                return false;
+            }
+
+            crypto_wipe(&tx_stream, sizeof(tx_stream));
+            crypto_wipe(&rx_stream, sizeof(rx_stream));
+            tx_stream = newTx;
+            rx_stream = newRx;
+            crypto_wipe(&newTx, sizeof(newTx));
+            crypto_wipe(&newRx, sizeof(newRx));
+            sock = newSock;
+            s_activeSessionSock = sock;
+            s_activeSessionTx = &tx_stream;
+            serverDisconnected = false;
+
+            RestoreBottomBarIfNeeded();
+            ShowOfflineStatus("Reconnected to OCR server!");
+            return true;
+        };
+
+        auto SendSessionPacket = [&](const void *buf, size_t len, bool showBannerOnOffline = true) -> bool {
+            if (OCR_ShouldAbortForSleep()) return false;
+            if (sock < 0) {
+                if (!TryReconnectSession()) {
+                    if (showBannerOnOffline && !OCR_ShouldAbortForSleep()) {
+                        ShowOfflineStatus("Offline: server unavailable");
+                    }
+                    return false;
+                }
+            }
+            if (send_encrypted_frame(sock, &tx_stream, buf, len) < 0) {
+                MarkDisconnected(false);
+                if (!OCR_ShouldAbortForSleep() && TryReconnectSession()) {
+                    if (send_encrypted_frame(sock, &tx_stream, buf, len) >= 0) {
+                        return true;
+                    }
+                    MarkDisconnected(showBannerOnOffline);
+                } else if (showBannerOnOffline && !OCR_ShouldAbortForSleep()) {
+                    ShowOfflineStatus("Offline: server unavailable");
+                }
+                return false;
+            }
+            return true;
+        };
+
         // Send a CMD_LOOKUP_KANJI packet for a given codepoint (plain, no scroll encoding).
         auto SendKanjiLookup = [&](uint32_t kanjiCp) -> bool {
             uint8_t targetKanjiScr = (popupTargetScreen == SCREEN_ID_TOP) ? SCREEN_ID_BOTTOM : SCREEN_ID_TOP;
@@ -3731,7 +4103,7 @@ namespace CTRPluginFramework
             kanjiPacket[2] = (uint8_t)((kanjiCp >> 16) & 0xFF);
             uint16_t cpL = htons((uint16_t)(kanjiCp & 0xFFFF));
             memcpy(&kanjiPacket[3], &cpL, 2);
-            return send_encrypted_frame(sock, &tx_stream, kanjiPacket, sizeof(kanjiPacket)) >= 0;
+            return SendSessionPacket(kanjiPacket, sizeof(kanjiPacket), true);
         };
 
         auto DismissPopupWindow = [&](void) {
@@ -3794,17 +4166,22 @@ namespace CTRPluginFramework
 
         // 6. Interactive Modal Loop
         while (true) {
+            if (OCR_ShouldAbortForSleep()) {
+                break;
+            }
             Controller::Update();
             u32 kDown = Controller::GetKeysPressed();
 
             // Mid-session AnkiWeb credentials dialog (post-handshake live update)
             if (Controller::IsKeysPressed(Key::Start | Key::Select | Key::L)) {
-                while (true) {
+                while (!OCR_ShouldAbortForSleep()) {
                     Controller::Update();
                     if ((Controller::GetKeysDown(false) & (Key::Start | Key::Select | Key::L)) == 0) break;
                     Sleep(Milliseconds(16));
                 }
+                if (OCR_ShouldAbortForSleep()) break;
                 OCR_OpenAnkiCredentialsDialog();
+                if (OCR_ShouldAbortForSleep()) break;
                 for (int b = 0; b < 2; ++b) {
                     RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
                     RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
@@ -3832,7 +4209,7 @@ namespace CTRPluginFramework
 
             // [Start] Button: Launch Camera QR Scanner to scan new PSK and IP/port
             if (kDown & Key::Start) {
-                if (OCR_ScanQrCode()) {
+                if (OCR_ScanQrCode() || OCR_ShouldAbortForSleep()) {
                     break;
                 }
                 for (int b = 0; b < 2; ++b) {
@@ -3875,7 +4252,7 @@ namespace CTRPluginFramework
                         RedrawBundlePopup();
                     } else {
                         uint8_t modePacket[5] = { CMD_SET_MODE, (uint8_t)(translateMode ? 1 : 0), 0, 0, 0 };
-                        if (send_encrypted_frame(sock, &tx_stream, modePacket, sizeof(modePacket)) < 0) break;
+                        SendSessionPacket(modePacket, sizeof(modePacket), false);
                     }
                 }
             }
@@ -3979,9 +4356,7 @@ namespace CTRPluginFramework
                         kWinPkt[0] = CMD_CLICK_KANJI_WIN;
                         memcpy(&kWinPkt[1], &netX, 2);
                         memcpy(&kWinPkt[3], &netY, 2);
-                        if (send_encrypted_frame(sock, &tx_stream, kWinPkt, sizeof(kWinPkt)) < 0) {
-                            break;
-                        }
+                        SendSessionPacket(kWinPkt, sizeof(kWinPkt), true);
                         continue;
                     }
                 }
@@ -4000,7 +4375,7 @@ namespace CTRPluginFramework
                             if (TryGetKanjiAtPopupCoord(popX, popY, *pg, *pe, gs, ps, kanjiCp)) {
                                 s_kanjiScrollY = 0;
                                 s_kanjiMaxScrollY = 0;
-                                if (!SendKanjiLookup(kanjiCp)) break;
+                                SendKanjiLookup(kanjiCp);
                                 continue;
                             }
                         }
@@ -4054,9 +4429,7 @@ namespace CTRPluginFramework
                     memcpy(&clickPacket[1], &netX, 2);
                     memcpy(&clickPacket[3], &netY, 2);
 
-                    if (send_encrypted_frame(sock, &tx_stream, clickPacket, sizeof(clickPacket)) < 0) {
-                        break;
-                    }
+                    SendSessionPacket(clickPacket, sizeof(clickPacket), false);
                 } else if (!selbox.active) {
                     DismissKanjiWindow();
                     // Region translation Point 1
@@ -4089,17 +4462,14 @@ namespace CTRPluginFramework
                     memcpy(&pkt2[1], &netX2, 2);
                     memcpy(&pkt2[3], &netY2, 2);
 
-                    if (send_encrypted_frame(sock, &tx_stream, pkt1, sizeof(pkt1)) < 0 ||
-                        send_encrypted_frame(sock, &tx_stream, pkt2, sizeof(pkt2)) < 0) {
-                        break;
+                    if (SendSessionPacket(pkt1, sizeof(pkt1), false)) {
+                        SendSessionPacket(pkt2, sizeof(pkt2), false);
                     }
                 }
             } else if (hasPopup) {
                 if ((kDown & g_ocrKeys.addAnki) && hasKanjiWindow) {
                     uint8_t kanjiAnkiPkt[5] = { CMD_ADD_ANKI_KANJI, 0, 0, 0, 0 };
-                    if (send_encrypted_frame(sock, &tx_stream, kanjiAnkiPkt, sizeof(kanjiAnkiPkt)) < 0) {
-                        break;
-                    }
+                    SendSessionPacket(kanjiAnkiPkt, sizeof(kanjiAnkiPkt), true);
                     continue;
                 }
                 // D-pad Up/Down scroll the kanji window locally (no network round-trip)
@@ -4185,7 +4555,7 @@ namespace CTRPluginFramework
                         if (trig != 0) {
                             int visGloss = ComputePopupTitleLayout(activeGlyphs, curEntry).visibleGlossLines;
                             int maxGlossY = std::max(0, (int)curEntry.wrappedLines.size() - visGloss);
-                            int maxPosX = std::max(0, (int)curEntry.posCodepoints.size() - POS_WINDOW_CHARS);
+                            int maxPosX = std::max(0, (int)Utf8ToCodepoints(curEntry.pos).size() - POS_WINDOW_CHARS);
                             int oldG = gScroll;
                             int oldP = pScroll;
                             if (trig & Key::DPadUp)        gScroll = std::max(0, gScroll - 1);
@@ -4230,7 +4600,7 @@ namespace CTRPluginFramework
                                     memcpy(&cmdPacket[1], &netSpot, 2);
                                     cmdPacket[3] = (uint8_t)std::min<size_t>(255, cachedPopup.curVariantIdx);
                                     cmdPacket[4] = (uint8_t)std::min<size_t>(255, cachedPopup.curEntryIdx);
-                                    if (send_encrypted_frame(sock, &tx_stream, cmdPacket, sizeof(cmdPacket)) < 0) break;
+                                    SendSessionPacket(cmdPacket, sizeof(cmdPacket), true);
                                 } else if (needRedraw) {
                                     RedrawBundlePopup();
                                 }
@@ -4257,7 +4627,7 @@ namespace CTRPluginFramework
                         cmdPacket[0] = CMD_ADD_ANKI;
                         memcpy(&cmdPacket[1], &netV, 2);
                         memcpy(&cmdPacket[3], &netE, 2);
-                        if (send_encrypted_frame(sock, &tx_stream, cmdPacket, sizeof(cmdPacket)) < 0) break;
+                        SendSessionPacket(cmdPacket, sizeof(cmdPacket), true);
                     } else if (needRedraw) {
                         RedrawBundlePopup();
                     }
@@ -4276,192 +4646,240 @@ namespace CTRPluginFramework
 
                     if (navCmd != 0) {
                         uint8_t cmdPacket[5] = { navCmd, 0, 0, 0, 0 };
-                        if (send_encrypted_frame(sock, &tx_stream, cmdPacket, sizeof(cmdPacket)) < 0) {
-                            break;
-                        }
+                        SendSessionPacket(cmdPacket, sizeof(cmdPacket), false);
                     }
                 }
             }
 
             // Non-blocking poll for incoming popup image or bundle from server
-            struct pollfd pfd;
-            pfd.fd = sock;
-            pfd.events = POLLIN;
-            pfd.revents = 0;
-            int pollRes = poll(&pfd, 1, 0);
-            if (pollRes > 0 && (pfd.revents & POLLIN)) {
-                uint8_t hdr[5];
-                if (recv_encrypted_frame(sock, &rx_stream, hdr, sizeof(hdr)) < 0) {
-                    break;
-                }
-                uint8_t flagByte = hdr[0];
-                uint8_t targetScreenId = flagByte & 0x01;
-                uint32_t netImgSize = 0;
-                memcpy(&netImgSize, &hdr[1], 4);
-                uint32_t payloadSize = ntohl(netImgSize);
+            if (sock >= 0) {
+                struct pollfd pfd;
+                pfd.fd = sock;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
+                int pollRes = poll(&pfd, 1, 0);
+                if (pollRes < 0 || (pollRes > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) && !(pfd.revents & POLLIN))) {
+                    MarkDisconnected(false);
+                } else if (pollRes > 0 && (pfd.revents & POLLIN)) {
+                    uint8_t hdr[5];
+                    if (recv_encrypted_frame(sock, &rx_stream, hdr, sizeof(hdr)) < 0) {
+                        MarkDisconnected(false);
+                    } else {
+                        uint8_t flagByte = hdr[0];
+                        uint8_t targetScreenId = flagByte & 0x01;
+                        uint32_t netImgSize = 0;
+                        memcpy(&netImgSize, &hdr[1], 4);
+                        uint32_t payloadSize = ntohl(netImgSize);
 
-                if ((flagByte & POPUP_SCREEN_BUNDLE_FLAG) && payloadSize > 0 && payloadSize <= 2 * 1024 * 1024 &&
-                    (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
-                    std::vector<uint8_t> rawBuf(payloadSize);
-                    if (recv_encrypted_frame(sock, &rx_stream, rawBuf.data(), payloadSize) < 0) {
-                        break;
-                    }
-                    ScreenBundle nextSb;
-                    if (ParseScreenBundle(rawBuf.data(), rawBuf.size(), nextSb) && nextSb.sourceScreenId < 2) {
-                        uint8_t replacedScr = nextSb.sourceScreenId;
-                        screenBundles[replacedScr] = std::move(nextSb);
-                        if (cachedPopup.active && cachedPopup.sourceScreenId == replacedScr) {
-                            size_t newSpotIdx = 0;
-                            if (FindScreenSpot(screenBundles[replacedScr], cachedPopup.clickX, cachedPopup.clickY, newSpotIdx)) {
-                                cachedPopup.spotIdx = newSpotIdx;
-                                cachedPopup.curVariantIdx = 0;
-                                cachedPopup.curEntryIdx = 0;
-                                cachedPopup.glossScrollY = 0;
-                                cachedPopup.posScrollX = 0;
-                                cachedPopup.statusBanner.clear();
-                                cachedPopup.statusLevel = 0;
-                                RedrawBundlePopup();
+                        if ((flagByte & POPUP_SCREEN_BUNDLE_FLAG) && payloadSize > 0 && payloadSize <= 2 * 1024 * 1024 &&
+                            (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
+                            SessionBuffer rawSb;
+                            AutoFreeSessionBuffer rawGuard{rawSb};
+                            if (!rawSb.Alloc(0x073E0000, payloadSize, 0x07420000)) {
+                                if (!DrainEncryptedPayload(sock, &rx_stream, payloadSize)) MarkDisconnected(false);
+                                continue;
+                            }
+                            if (recv_encrypted_frame(sock, &rx_stream, rawSb.ptr, payloadSize) < 0) {
+                                MarkDisconnected(false);
+                                continue;
+                            }
+                            bool hadCachedForScr = (cachedPopup.active && cachedPopup.sourceScreenId == targetScreenId);
+                            uint16_t savedX = cachedPopup.clickX;
+                            uint16_t savedY = cachedPopup.clickY;
+                            screenBundles[targetScreenId] = ScreenBundle();
+
+                            ScreenBundle nextSb;
+                            if (ParseScreenBundle(rawSb, payloadSize, nextSb) && nextSb.sourceScreenId < 2) {
+                                rawSb.Free();
+                                uint8_t replacedScr = nextSb.sourceScreenId;
+                                screenBundles[replacedScr] = std::move(nextSb);
+                                if (cachedPopup.active && cachedPopup.sourceScreenId == replacedScr) {
+                                    size_t newSpotIdx = 0;
+                                    if (FindScreenSpot(screenBundles[replacedScr], cachedPopup.clickX, cachedPopup.clickY, newSpotIdx)) {
+                                        cachedPopup.spotIdx = newSpotIdx;
+                                        cachedPopup.curVariantIdx = 0;
+                                        cachedPopup.curEntryIdx = 0;
+                                        cachedPopup.glossScrollY = 0;
+                                        cachedPopup.posScrollX = 0;
+                                        cachedPopup.statusBanner.clear();
+                                        cachedPopup.statusLevel = 0;
+                                        RedrawBundlePopup();
+                                    } else {
+                                        cachedPopup.active = false;
+                                        hasPopup = false;
+                                        for (int b = 0; b < 2; ++b) {
+                                            const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
+                                            int scrW = (popupTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
+                                            RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(popupTargetScreen), scrW, 240);
+                                            PresentFrame();
+                                        }
+                                    }
+                                }
                             } else {
+                                rawSb.Free();
+                                if (hadCachedForScr) {
+                                    cachedPopup.active = false;
+                                    uint8_t clickPacket[5];
+                                    uint16_t netX = htons(savedX);
+                                    uint16_t netY = htons(savedY);
+                                    clickPacket[0] = targetScreenId;
+                                    memcpy(&clickPacket[1], &netX, 2);
+                                    memcpy(&clickPacket[3], &netY, 2);
+                                    SendSessionPacket(clickPacket, sizeof(clickPacket), false);
+                                }
+                            }
+                        } else if ((flagByte & POPUP_BUNDLE_FLAG) && payloadSize > 0 && payloadSize <= 2 * 1024 * 1024 &&
+                            (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
+                            SessionBuffer rawSb;
+                            AutoFreeSessionBuffer rawGuard{rawSb};
+                            if (!rawSb.Alloc(0x073E0000, payloadSize, 0x07420000)) {
+                                if (!DrainEncryptedPayload(sock, &rx_stream, payloadSize)) MarkDisconnected(false);
+                                continue;
+                            }
+                            if (recv_encrypted_frame(sock, &rx_stream, rawSb.ptr, payloadSize) < 0) {
+                                MarkDisconnected(false);
+                                continue;
+                            }
+                            if (!HeapCanFit(payloadSize * 2 + 49152)) {
+                                screenBundles[0] = ScreenBundle();
+                                screenBundles[1] = ScreenBundle();
+                                popupBundle = PopupBundle();
+                            }
+                            PopupBundle nextBundle;
+                            bool parsed = ParsePopupBundle(rawSb.ptr, payloadSize, nextBundle);
+                            rawSb.Free();
+                            if (parsed) {
+                                DismissKanjiWindow();
+                                if (hasPopup && popupTargetScreen != targetScreenId) {
+                                    for (int b = 0; b < 2; ++b) {
+                                        const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
+                                        int scrW = (popupTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
+                                        RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(popupTargetScreen), scrW, 240);
+                                        PresentFrame();
+                                    }
+                                }
+                                OCR_FreePopupBuffer();
                                 cachedPopup.active = false;
-                                hasPopup = false;
+                                popupBundle = std::move(nextBundle);
+                                popupTargetScreen = targetScreenId;
+                                hasPopup = true;
+                                dpadHoldTicks = 0;
+                                RedrawBundlePopup();
+                            }
+                        } else if ((flagByte & POPUP_STATUS_FLAG) && payloadSize > 0 && payloadSize <= 65536 &&
+                                   (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
+                            SessionBuffer rawSb;
+                            AutoFreeSessionBuffer rawGuard{rawSb};
+                            if (!rawSb.Alloc(0x073E0000, payloadSize, 0x07420000)) {
+                                if (!DrainEncryptedPayload(sock, &rx_stream, payloadSize)) MarkDisconnected(false);
+                                continue;
+                            }
+                            if (recv_encrypted_frame(sock, &rx_stream, rawSb.ptr, payloadSize) < 0) {
+                                MarkDisconnected(false);
+                                continue;
+                            }
+                            if (cachedPopup.active && cachedPopup.sourceScreenId < 2) {
+                                if (ParseStatusBannerPacket(rawSb.ptr, payloadSize,
+                                                            screenBundles[cachedPopup.sourceScreenId].glyphs,
+                                                            cachedPopup.statusBanner, cachedPopup.statusLevel)) {
+                                    RedrawBundlePopup();
+                                }
+                            } else if (popupBundle.active &&
+                                       ParseStatusBannerPacket(rawSb.ptr, payloadSize, popupBundle.glyphs,
+                                                               popupBundle.statusBanner, popupBundle.statusLevel)) {
+                                RedrawBundlePopup();
+                            }
+                            rawSb.Free();
+                            if (flagByte & POPUP_ANKI_LOGIN_PROMPT_FLAG) {
+                                bool updated = OCR_OpenAnkiCredentialsDialog();
+                                if (updated && !s_ankiUser.empty() && !s_ankiPass.empty()) {
+                                    std::string readyMsg = "AnkiWeb login set! Press [" + OCR_KeyToString(g_ocrKeys.addAnki) + "] to add";
+                                    if (cachedPopup.active) {
+                                        cachedPopup.statusBanner = readyMsg;
+                                        cachedPopup.statusLevel = 1;
+                                    } else if (popupBundle.active) {
+                                        popupBundle.statusBanner = readyMsg;
+                                        popupBundle.statusLevel = 1;
+                                    }
+                                }
                                 for (int b = 0; b < 2; ++b) {
-                                    const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
-                                    int scrW = (popupTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
-                                    RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(popupTargetScreen), scrW, 240);
+                                    RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
+                                    RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
+                                    if (hasPopup) {
+                                        if (isClientBundlePopup()) popupDirty[activeBuf] = true;
+                                        else if (s_popup_rgb) DrawPopupImage(popupTargetScreen, s_popup_rgb);
+                                    }
                                     PresentFrame();
+                                }
+                            }
+                        } else if ((flagByte & POPUP_KANJI_FLAG) && payloadSize == KANJI_TALL_PAYLOAD_SIZE &&
+                                   (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
+                            if (!s_kanjiTallBuffer.Alloc(0x07360000, KANJI_TALL_PAYLOAD_SIZE)) {
+                                // Drain payload using stack buffer so TCP stream stays in sync without heap OOM
+                                if (!DrainEncryptedPayload(sock, &rx_stream, payloadSize)) {
+                                    MarkDisconnected(false);
+                                } else {
+                                    OSD::Notify("OCR Error: Out of memory for kanji window", Color::Red);
+                                }
+                                continue;
+                            }
+                            if (recv_encrypted_frame(sock, &rx_stream, s_kanji_tall, KANJI_TALL_PAYLOAD_SIZE) < 0) {
+                                OCR_FreeKanjiBuffer();
+                                hasKanjiWindow = false;
+                                MarkDisconnected(false);
+                            } else {
+                                int contentH = ((int)s_kanji_tall[KANJI_TALL_RGB_SIZE] << 8) | (int)s_kanji_tall[KANJI_TALL_RGB_SIZE + 1];
+                                if (contentH > KANJI_TALL_HEIGHT) contentH = KANJI_TALL_HEIGHT;
+                                // Scrollable viewport is POPUP_HEIGHT - 24 (216px; footer is fixed)
+                                s_kanjiMaxScrollY = std::max(0, contentH - (POPUP_HEIGHT - 24));
+                                s_kanjiScrollY = 0;
+                                kanjiTargetScreen = targetScreenId;
+                                hasKanjiWindow = true;
+                                for (int b = 0; b < 2; ++b) {
+                                    DrawKanjiCrop(kanjiTargetScreen, s_kanji_tall, 0);
+                                    PresentFrame();
+                                }
+                            }
+                        } else if (payloadSize == POPUP_RGB_SIZE && (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
+                            DismissKanjiWindow();
+                            if (!s_popupBuffer.Alloc(0x072E0000, POPUP_RGB_SIZE) ||
+                                recv_encrypted_frame(sock, &rx_stream, s_popup_rgb, POPUP_RGB_SIZE) < 0) {
+                                OCR_FreePopupBuffer();
+                                MarkDisconnected(false);
+                            } else {
+                                if (hasPopup && popupTargetScreen != targetScreenId) {
+                                    for (int b = 0; b < 2; ++b) {
+                                        const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
+                                        int scrW = (popupTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
+                                        RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(popupTargetScreen), scrW, 240);
+                                        PresentFrame();
+                                    }
+                                }
+
+                                cachedPopup.active = false;
+                                popupBundle.active = false;
+                                popupTargetScreen = targetScreenId;
+                                hasPopup = true;
+
+                                for (int b = 0; b < 2; ++b) {
+                                    DrawPopupImage(popupTargetScreen, s_popup_rgb);
+                                    PresentFrame();
+                                }
+                            }
+                        } else {
+                            // Drain unhandled/unexpected payload so TCP stream stays synchronized
+                            if (payloadSize > 0) {
+                                if (!DrainEncryptedPayload(sock, &rx_stream, payloadSize)) {
+                                    MarkDisconnected(false);
                                 }
                             }
                         }
                     }
-                } else if ((flagByte & POPUP_BUNDLE_FLAG) && payloadSize > 0 && payloadSize <= 2 * 1024 * 1024 &&
-                    (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
-                    std::vector<uint8_t> rawBuf(payloadSize);
-                    if (recv_encrypted_frame(sock, &rx_stream, rawBuf.data(), payloadSize) < 0) {
-                        break;
-                    }
-                    PopupBundle nextBundle;
-                    if (ParsePopupBundle(rawBuf.data(), rawBuf.size(), nextBundle)) {
-                        DismissKanjiWindow();
-                        if (hasPopup && popupTargetScreen != targetScreenId) {
-                            for (int b = 0; b < 2; ++b) {
-                                const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
-                                int scrW = (popupTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
-                                RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(popupTargetScreen), scrW, 240);
-                                PresentFrame();
-                            }
-                        }
-                        OCR_FreePopupBuffer();
-                        cachedPopup.active = false;
-                        popupBundle = std::move(nextBundle);
-                        popupTargetScreen = targetScreenId;
-                        hasPopup = true;
-                        dpadHoldTicks = 0;
-                        RedrawBundlePopup();
-                    }
-                } else if ((flagByte & POPUP_STATUS_FLAG) && payloadSize > 0 && payloadSize <= 65536 &&
-                           (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
-                    std::vector<uint8_t> rawBuf(payloadSize);
-                    if (recv_encrypted_frame(sock, &rx_stream, rawBuf.data(), payloadSize) < 0) {
-                        break;
-                    }
-                    if (cachedPopup.active && cachedPopup.sourceScreenId < 2) {
-                        if (ParseStatusBannerPacket(rawBuf.data(), rawBuf.size(),
-                                                    screenBundles[cachedPopup.sourceScreenId].glyphs,
-                                                    cachedPopup.statusBanner, cachedPopup.statusLevel)) {
-                            RedrawBundlePopup();
-                        }
-                    } else if (popupBundle.active &&
-                               ParseStatusBannerPacket(rawBuf.data(), rawBuf.size(), popupBundle.glyphs,
-                                                       popupBundle.statusBanner, popupBundle.statusLevel)) {
-                        RedrawBundlePopup();
-                    }
-                    if (flagByte & POPUP_ANKI_LOGIN_PROMPT_FLAG) {
-                        bool updated = OCR_OpenAnkiCredentialsDialog();
-                        if (updated && !s_ankiUser.empty() && !s_ankiPass.empty()) {
-                            std::string readyMsg = "AnkiWeb login set! Press [" + OCR_KeyToString(g_ocrKeys.addAnki) + "] to add";
-                            if (cachedPopup.active) {
-                                cachedPopup.statusBanner = readyMsg;
-                                cachedPopup.statusLevel = 1;
-                            } else if (popupBundle.active) {
-                                popupBundle.statusBanner = readyMsg;
-                                popupBundle.statusLevel = 1;
-                            }
-                        }
-                        for (int b = 0; b < 2; ++b) {
-                            RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
-                            RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
-                            if (hasPopup) {
-                                if (isClientBundlePopup()) popupDirty[activeBuf] = true;
-                                else if (s_popup_rgb) DrawPopupImage(popupTargetScreen, s_popup_rgb);
-                            }
-                            PresentFrame();
-                        }
-                    }
-                } else if ((flagByte & POPUP_KANJI_FLAG) && payloadSize == KANJI_TALL_PAYLOAD_SIZE &&
-                           (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
-                    if (!s_kanjiTallBuffer.Alloc(0x07360000, KANJI_TALL_PAYLOAD_SIZE)) {
-                        // Drain payload so TCP stream stays in sync
-                        std::vector<u8> dummy(payloadSize);
-                        recv_encrypted_frame(sock, &rx_stream, dummy.data(), payloadSize);
-                        OSD::Notify("OCR Error: Out of memory for kanji window", Color::Red);
-                        continue;
-                    }
-                    if (recv_encrypted_frame(sock, &rx_stream, s_kanji_tall, KANJI_TALL_PAYLOAD_SIZE) < 0) {
-                        OCR_FreeKanjiBuffer();
-                        hasKanjiWindow = false;
-                        break;
-                    }
-                    int contentH = ((int)s_kanji_tall[KANJI_TALL_RGB_SIZE] << 8) | (int)s_kanji_tall[KANJI_TALL_RGB_SIZE + 1];
-                    if (contentH > KANJI_TALL_HEIGHT) contentH = KANJI_TALL_HEIGHT;
-                    // Scrollable viewport is POPUP_HEIGHT - 24 (216px; footer is fixed)
-                    s_kanjiMaxScrollY = std::max(0, contentH - (POPUP_HEIGHT - 24));
-                    s_kanjiScrollY = 0;
-                    kanjiTargetScreen = targetScreenId;
-                    hasKanjiWindow = true;
-                    for (int b = 0; b < 2; ++b) {
-                        DrawKanjiCrop(kanjiTargetScreen, s_kanji_tall, 0);
-                        PresentFrame();
-                    }
-                } else if (payloadSize == POPUP_RGB_SIZE && (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
-                    DismissKanjiWindow();
-                    if (!s_popupBuffer.Alloc(0x072E0000, POPUP_RGB_SIZE) ||
-                        recv_encrypted_frame(sock, &rx_stream, s_popup_rgb, POPUP_RGB_SIZE) < 0) {
-                        OCR_FreePopupBuffer();
-                        break;
-                    }
-
-                    if (hasPopup && popupTargetScreen != targetScreenId) {
-                        for (int b = 0; b < 2; ++b) {
-                            const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
-                            int scrW = (popupTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
-                            RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(popupTargetScreen), scrW, 240);
-                            PresentFrame();
-                        }
-                    }
-
-                    cachedPopup.active = false;
-                    popupBundle.active = false;
-                    popupTargetScreen = targetScreenId;
-                    hasPopup = true;
-
-                    for (int b = 0; b < 2; ++b) {
-                        DrawPopupImage(popupTargetScreen, s_popup_rgb);
-                        PresentFrame();
-                    }
-                } else {
-                    // Drain unhandled/unexpected payload so TCP stream stays synchronized
-                    if (payloadSize > 0) {
-                        std::vector<u8> discard(std::min<u32>(payloadSize, 65536));
-                        u32 rem = payloadSize;
-                        while (rem > 0) {
-                            u32 chunk = std::min<u32>(rem, (u32)discard.size());
-                            if (recv_encrypted_frame(sock, &rx_stream, discard.data(), chunk) < 0) {
-                                break;
-                            }
-                            rem -= chunk;
-                        }
-                    }
                 }
+            }
+
+            if (OCR_ShouldAbortForSleep()) {
+                break;
             }
 
             // Control frame rate
@@ -4469,16 +4887,22 @@ namespace CTRPluginFramework
         }
 
         // 7. Cleanup & Restore Original Game Screens (both buffers to prevent tearing)
-        for (int b = 0; b < 2; ++b) {
-            RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
-            RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
-            OSD::SwapBuffers();
+        const bool abortedForSleep = OCR_ShouldAbortForSleep();
+        if (!abortedForSleep) {
+            for (int b = 0; b < 2; ++b) {
+                RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
+                RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
+                OSD::SwapBuffers();
+            }
         }
 
         s_activeSessionSock = -1;
         s_activeSessionTx = nullptr;
 
-        closesocket(sock);
+        if (sock >= 0) {
+            closesocket(sock);
+            sock = -1;
+        }
         crypto_wipe(&tx_stream, sizeof(tx_stream));
         crypto_wipe(&rx_stream, sizeof(rx_stream));
 
@@ -4487,7 +4911,9 @@ namespace CTRPluginFramework
 
         // Unpause game
         Process::Play();
-        Sleep(Milliseconds(30));
+        if (!abortedForSleep) {
+            Sleep(Milliseconds(30));
+        }
     }
 
     extern "C" void HbBootLog(const char *msg);
@@ -4566,6 +4992,9 @@ namespace CTRPluginFramework
 
     void OCR_UpdateFrame(void)
     {
+        if (OCR_ShouldAbortForSleep()) {
+            return;
+        }
         OCR_PollNetworkState();
 
         static bool s_loggedZlZr = false;

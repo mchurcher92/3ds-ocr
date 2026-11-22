@@ -91,6 +91,8 @@ namespace CTRPluginFramework
     // Lifecycle & Interface Functions
     void        OCR_Initialize(void);
     void        OCR_Cleanup(void);
+    void        OCR_OnProcessEvent(Process::Event event);
+    bool        OCR_IsSleeping(void);
     bool        OCR_TestServerConnection(std::string &out_msg);
     void        OCR_LaunchSession(void);
     void        OCR_OpenKeyBindingsMenu(void);

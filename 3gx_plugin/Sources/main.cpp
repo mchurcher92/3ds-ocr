@@ -14,6 +14,7 @@ namespace CTRPluginFramework
 
     static void OnProcessEvent(Process::Event event)
     {
+        OCR_OnProcessEvent(event);
         if (event == Process::Event::EXIT) {
             OCR_Cleanup();
         }
