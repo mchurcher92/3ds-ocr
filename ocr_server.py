@@ -1608,7 +1608,9 @@ class WordMetaManager:
                             rad_num = int(c.radicals[0].value)
                             info["rad_num"] = rad_num
                             if 1 <= rad_num <= 214:
-                                info["rad_char"] = chr(0x2F00 + rad_num - 1)
+                                # Normalize Kangxi Radical (U+2F00..U+2FD5) to standard CJK Unified Ideograph
+                                # so fonts without the Kangxi Radicals block (e.g., msgothic.ttc) don't draw □
+                                info["rad_char"] = unicodedata.normalize("NFKC", chr(0x2F00 + rad_num - 1))
                         except (ValueError, TypeError):
                             pass
                     if c.rm_groups:
