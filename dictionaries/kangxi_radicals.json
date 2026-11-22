@@ -1,27 +1,27 @@
 {
   "1": [
     "いち",
-    "one"
+    "one, horizontal stroke"
   ],
   "2": [
     "たてぼう",
-    "line"
+    "vertical stroke"
   ],
   "3": [
     "てん",
     "dot"
   ],
   "4": [
-    "の",
-    "slash"
+    "の・のかんむり",
+    "diagonal sweeping stroke"
   ],
   "5": [
     "おつ",
-    "second"
+    "the second"
   ],
   "6": [
     "はねぼう",
-    "hook"
+    "vertical stroke with a hook"
   ],
   "7": [
     "に",
@@ -29,47 +29,47 @@
   ],
   "8": [
     "なべぶた",
-    "lid"
+    "lid, top"
   ],
   "9": [
-    "ひと・にんべん",
+    "ひと・にんべん・ひとやね",
     "person"
   ],
   "10": [
     "ひとあし",
-    "legs"
+    "human legs"
   ],
   "11": [
     "いる",
-    "enter"
+    "to enter"
   ],
   "12": [
-    "はち",
+    "はち・はちがしら",
     "eight"
   ],
   "13": [
     "けいがまえ",
-    "down box"
+    "to enclose"
   ],
   "14": [
     "わかんむり",
-    "cover"
+    "cover, crown"
   ],
   "15": [
     "にすい",
     "ice"
   ],
   "16": [
-    "きにょう・つくえ",
+    "きにょう・かぜかんむり",
     "table"
   ],
   "17": [
-    "うけばこ",
-    "open box"
+    "かんにょう",
+    "container, open box"
   ],
   "18": [
     "かたな・りっとう",
-    "knife / sword"
+    "knife, sword"
   ],
   "19": [
     "ちから",
@@ -77,7 +77,7 @@
   ],
   "20": [
     "つつみがまえ",
-    "wrap"
+    "to wrap"
   ],
   "21": [
     "さじ",
@@ -85,23 +85,23 @@
   ],
   "22": [
     "はこがまえ",
-    "right open box"
+    "box"
   ],
   "23": [
     "かくしがまえ",
-    "hiding enclosure"
+    "to conceal, hide"
   ],
   "24": [
     "じゅう",
     "ten"
   ],
   "25": [
-    "ぼく・うらない",
-    "divination"
+    "ぼく",
+    "oracle"
   ],
   "26": [
     "ふしづくり",
-    "seal"
+    "stamp, seal"
   ],
   "27": [
     "がんだれ",
@@ -109,11 +109,11 @@
   ],
   "28": [
     "む",
-    "private"
+    "private, Katakana Mu"
   ],
   "29": [
     "また",
-    "again / right hand"
+    "again, right hand"
   ],
   "30": [
     "くち・くちへん",
@@ -121,31 +121,31 @@
   ],
   "31": [
     "くにがまえ",
-    "enclosure"
+    "border, territorial boundaries"
   ],
   "32": [
     "つち・つちへん",
     "earth"
   ],
   "33": [
-    "さむらい",
-    "scholar"
+    "さむらい・さむらいかんむり",
+    "man, scholar, samurai"
   ],
   "34": [
-    "ふゆがしら",
-    "go"
+    "のまた",
+    "to follow"
   ],
   "35": [
-    "すいにょう",
-    "go slowly"
+    "なつあし",
+    "to go slowly"
   ],
   "36": [
     "ゆうべ",
     "evening"
   ],
   "37": [
-    "おおきい",
-    "big"
+    "だい",
+    "large, big"
   ],
   "38": [
     "おんな・おんなへん",
@@ -153,99 +153,99 @@
   ],
   "39": [
     "こ・こへん",
-    "child"
+    "child, son"
   ],
   "40": [
     "うかんむり",
-    "roof"
+    "roof, house"
   ],
   "41": [
-    "すん",
-    "inch"
+    "すん・すんづくり",
+    "inch, (2.25 cm)"
   ],
   "42": [
-    "ちいさい",
+    "しょう・しょうかんむり",
     "small"
   ],
   "43": [
-    "まげあし",
-    "lame"
+    "だいのまげあし",
+    "lame leg"
   ],
   "44": [
     "しかばね",
-    "corpse"
+    "corpse, awning"
   ],
   "45": [
-    "めばえ",
+    "くさのめ",
     "sprout"
   ],
   "46": [
-    "やま・やまへん",
+    "やま・やまへん・やまかんむり",
     "mountain"
   ],
   "47": [
-    "かわ・まがりがわ",
-    "river"
+    "まがりがわ・さんぼんがわ",
+    "winding river"
   ],
   "48": [
-    "たくみ",
-    "work"
+    "たくみ・たくみへん",
+    "work, carpenter, skill"
   ],
   "49": [
     "おのれ",
-    "oneself"
+    "self"
   ],
   "50": [
-    "はば・きぬへん",
-    "turban / cloth"
+    "はば・はばへん",
+    "cloth"
   ],
   "51": [
-    "ほす",
-    "dry"
+    "かん",
+    "to dry, shield"
   ],
   "52": [
     "いとがしら",
-    "short thread"
+    "young, slight"
   ],
   "53": [
     "まだれ",
-    "dotted cliff"
+    "slanting roof"
   ],
   "54": [
     "えんにょう",
-    "long stride"
+    "to move, stretch"
   ],
   "55": [
     "にじゅうあし",
-    "two hands"
+    "folded hands"
   ],
   "56": [
     "いぐるみ",
-    "shoot"
+    "javelin"
   ],
   "57": [
     "ゆみ・ゆみへん",
-    "bow"
+    "bow（in archery）"
   ],
   "58": [
     "けいがしら",
-    "snout"
+    "pig’s head"
   ],
   "59": [
     "さんづくり",
-    "bristle"
+    "hair-style, light rays"
   ],
   "60": [
     "ぎょうにんべん",
-    "step"
+    "step, stride, street, to go"
   ],
   "61": [
-    "こころ・りっしんべん",
-    "heart / mind"
+    "こころ・りっしんべん・したごころ",
+    "heart, mind, spirit"
   ],
   "62": [
-    "ほこ・ほこづくり",
-    "halberd"
+    "ほこ",
+    "spear, weapon"
   ],
   "63": [
     "と・とだれ",
@@ -256,104 +256,104 @@
     "hand"
   ],
   "65": [
-    "えだ・しにょう",
+    "しにょう",
     "branch"
   ],
   "66": [
-    "ぼくづくり・のぶん",
-    "rap / strike"
+    "ぼくづくり",
+    "activity, to strike, hit"
   ],
   "67": [
     "ぶん",
-    "script / literature"
+    "literature, letters"
   ],
   "68": [
-    "とます",
-    "dipper"
+    "ますづくり",
+    "big dipper, ladle, 18 liters"
   ],
   "69": [
     "おのづくり",
     "axe"
   ],
   "70": [
-    "ほう・かた",
-    "square"
+    "ほう・ほうへん",
+    "direction, flag"
   ],
   "71": [
-    "なし",
+    "むにょう",
     "not"
   ],
   "72": [
-    "ひ・にちへん",
-    "sun / day"
+    "ひ・ひへん",
+    "sun, day, time"
   ],
   "73": [
     "ひらび",
-    "say"
+    "to say"
   ],
   "74": [
     "つき・つきへん",
-    "moon / month"
+    "moon, month, period"
   ],
   "75": [
     "き・きへん",
-    "tree / wood"
+    "tree, wood"
   ],
   "76": [
     "あくび",
-    "lack / yawn"
+    "to lack, yawn"
   ],
   "77": [
     "とめる",
-    "stop"
+    "to stop"
   ],
   "78": [
-    "がつへん",
-    "death / decay"
+    "がつ・がつへん",
+    "death & dying, to decompose"
   ],
   "79": [
     "るまた",
-    "weapon / lance"
+    "lance shaft, action"
   ],
   "80": [
     "なかれ",
-    "do not"
+    "not, mother"
   ],
   "81": [
     "くらべる",
-    "compare"
+    "to compare"
   ],
   "82": [
     "け",
-    "fur / hair"
+    "hair"
   ],
   "83": [
     "うじ",
-    "clan"
+    "family, clan"
   ],
   "84": [
     "きがまえ",
-    "steam / breath"
+    "steam, air"
   ],
   "85": [
-    "みず・さんずい",
+    "みず・さんずい・したみず",
     "water"
   ],
   "86": [
-    "ひ・れっか",
+    "ひ・ひへん・れっか",
     "fire"
   ],
   "87": [
     "つめ・つめかんむり",
-    "claw"
+    "claw, nail"
   ],
   "88": [
     "ちち",
     "father"
   ],
   "89": [
-    "めめ",
-    "double x"
+    "こう",
+    "to mix"
   ],
   "90": [
     "しょうへん",
@@ -361,11 +361,11 @@
   ],
   "91": [
     "かた・かたへん",
-    "slice"
+    "split wood"
   ],
   "92": [
-    "きば",
-    "fang"
+    "きば・きばへん",
+    "fang, canine tooth"
   ],
   "93": [
     "うし・うしへん",
@@ -373,15 +373,15 @@
   ],
   "94": [
     "いぬ・けものへん",
-    "dog / beast"
+    "dog"
   ],
   "95": [
     "げん",
-    "profound / dark"
+    "darkness"
   ],
   "96": [
     "たま・おうへん",
-    "jade / jewel"
+    "jewelry"
   ],
   "97": [
     "うり",
@@ -397,18 +397,18 @@
   ],
   "100": [
     "うまれる",
-    "life / birth"
+    "birth, to be born, live"
   ],
   "101": [
     "もちいる",
-    "use"
+    "to use"
   ],
   "102": [
     "た・たへん",
-    "field"
+    "rice paddy"
   ],
   "103": [
-    "ひき",
+    "ひき・ひきへん",
     "bolt of cloth"
   ],
   "104": [
@@ -417,27 +417,27 @@
   ],
   "105": [
     "はつがしら",
-    "footsteps"
+    "outspread legs, departure"
   ],
   "106": [
-    "しろ",
+    "しろ・はくへん",
     "white"
   ],
   "107": [
-    "かわ",
-    "skin"
+    "けがわ",
+    "skin, hide"
   ],
   "108": [
     "さら",
-    "dish"
+    "plate, bowl"
   ],
   "109": [
-    "め・めへん",
+    "め・めへん・よこめ",
     "eye"
   ],
   "110": [
     "ほこ・ほこへん",
-    "spear"
+    "halberd"
   ],
   "111": [
     "や・やへん",
@@ -448,12 +448,12 @@
     "stone"
   ],
   "113": [
-    "しめす・ねへん",
-    "spirit / altar"
+    "しめす・しめすへん",
+    "altar, festival, religious service"
   ],
   "114": [
-    "ぐうのあし",
-    "track"
+    "じゅうのあし",
+    "footprint"
   ],
   "115": [
     "のぎへん",
@@ -461,11 +461,11 @@
   ],
   "116": [
     "あな・あなかんむり",
-    "cave"
+    "hole, cave"
   ],
   "117": [
     "たつ・たつへん",
-    "stand"
+    "to stand"
   ],
   "118": [
     "たけ・たけかんむり",
@@ -477,14 +477,14 @@
   ],
   "120": [
     "いと・いとへん",
-    "thread / silk"
+    "thread"
   ],
   "121": [
-    "ほとぎ",
-    "jar"
+    "みずがめ",
+    "earthen jar"
   ],
   "122": [
-    "あみがしら",
+    "あみめ・あみがしら",
     "net"
   ],
   "123": [
@@ -493,18 +493,18 @@
   ],
   "124": [
     "はね",
-    "feather"
+    "feather, wing"
   ],
   "125": [
-    "おいる",
-    "old"
+    "おいかんむり",
+    "old, old-age"
   ],
   "126": [
-    "しかして",
-    "and"
+    "しこうして",
+    "and also"
   ],
   "127": [
-    "すきへん",
+    "らいすき",
     "plow"
   ],
   "128": [
@@ -513,51 +513,51 @@
   ],
   "129": [
     "ふでづくり",
-    "brush"
+    "writing brush"
   ],
   "130": [
     "にく・にくづき",
-    "meat / flesh"
+    "flesh, meat"
   ],
   "131": [
     "しん",
-    "minister"
+    "retainer, minister"
   ],
   "132": [
     "みずから",
     "self"
   ],
   "133": [
-    "いたる",
-    "arrive"
+    "いたる・いたるへん",
+    "to arrive, reach"
   ],
   "134": [
     "うす",
-    "mortar"
+    "mortar, quern"
   ],
   "135": [
-    "した・したへん",
+    "した",
     "tongue"
   ],
   "136": [
     "まいあし",
-    "oppose"
+    "contrary, to err"
   ],
   "137": [
     "ふね・ふねへん",
-    "boat"
+    "ship, boat"
   ],
   "138": [
-    "うしとら",
-    "stopping"
+    "こん",
+    "boundary"
   ],
   "139": [
     "いろ",
     "color"
   ],
   "140": [
-    "くさかんむり",
-    "grass"
+    "くさ・くさかんむり",
+    "grass, plant"
   ],
   "141": [
     "とらがしら",
@@ -565,42 +565,42 @@
   ],
   "142": [
     "むし・むしへん",
-    "insect"
+    "worm, insect, bug"
   ],
   "143": [
     "ち",
     "blood"
   ],
   "144": [
-    "ゆく・ぎょうがまえ",
-    "walk enclosure"
+    "ぎょうがまえ",
+    "to go"
   ],
   "145": [
     "ころも・ころもへん",
-    "clothes"
+    "clothing"
   ],
   "146": [
-    "にし・おおいかんむり",
-    "west / cover"
+    "にし",
+    "cover, west"
   ],
   "147": [
     "みる",
-    "see"
+    "to see"
   ],
   "148": [
     "つの・つのへん",
-    "horn"
+    "horn, corner"
   ],
   "149": [
     "げん・ごんべん",
-    "speech / words"
+    "words, to speak, say"
   ],
   "150": [
-    "たに",
+    "たに・たにへん",
     "valley"
   ],
   "151": [
-    "まめ",
+    "まめ・まめへん",
     "bean"
   ],
   "152": [
@@ -613,7 +613,7 @@
   ],
   "154": [
     "かい・かいへん",
-    "shell / wealth"
+    "shell, property, wealth"
   ],
   "155": [
     "あか",
@@ -621,11 +621,11 @@
   ],
   "156": [
     "はしる・そうにょう",
-    "run"
+    "to run"
   ],
   "157": [
     "あし・あしへん",
-    "foot"
+    "foot, leg"
   ],
   "158": [
     "み・みへん",
@@ -633,7 +633,7 @@
   ],
   "159": [
     "くるま・くるまへん",
-    "cart / vehicle"
+    "vehicle, wheel, car"
   ],
   "160": [
     "からい",
@@ -641,51 +641,51 @@
   ],
   "161": [
     "しんのたつ",
-    "morning"
+    "Fifth zodiac sign, 7–9 A.M."
   ],
   "162": [
     "しんにょう",
-    "walk / road"
+    "to advance, move ahead"
   ],
   "163": [
-    "おおざと",
-    "city / village"
+    "むら・おおざと",
+    "community"
   ],
   "164": [
-    "とり・とりへん",
-    "wine / alcohol"
+    "ひよみのとり・とりへん",
+    "sake jar, bird"
   ],
   "165": [
-    "のごめ",
-    "distinguish"
+    "のごめ・のごめへん",
+    "to separate"
   ],
   "166": [
     "さと・さとへん",
-    "village / mile"
+    "village, (3.93 km)"
   ],
   "167": [
     "かね・かねへん",
-    "metal / gold"
+    "metal, gold, mineral"
   ],
   "168": [
     "ながい",
     "long"
   ],
   "169": [
-    "もん・もんがまえ",
-    "gate"
+    "もんがまえ",
+    "gate, door"
   ],
   "170": [
-    "こざとへん",
-    "mound / hill"
+    "こざと・こざとへん",
+    "hill"
   ],
   "171": [
     "れいづくり",
-    "slave / capture"
+    "to capture"
   ],
   "172": [
     "ふるとり",
-    "short-tailed bird"
+    "small bird"
   ],
   "173": [
     "あめ・あめかんむり",
@@ -693,23 +693,23 @@
   ],
   "174": [
     "あお",
-    "blue / green"
+    "blue, green"
   ],
   "175": [
     "あらず",
-    "wrong"
+    "wrong, non-"
   ],
   "176": [
-    "おもて",
-    "face"
+    "めん",
+    "face, surface"
   ],
   "177": [
-    "かわ・かわへん",
+    "つくりがわ",
     "leather"
   ],
   "178": [
     "なめしがわ",
-    "tanned leather"
+    "leather"
   ],
   "179": [
     "にら",
@@ -717,11 +717,11 @@
   ],
   "180": [
     "おと",
-    "sound"
+    "sound, noise"
   ],
   "181": [
     "おおがい",
-    "leaf / head"
+    "head, page"
   ],
   "182": [
     "かぜ",
@@ -729,19 +729,19 @@
   ],
   "183": [
     "とぶ",
-    "fly"
+    "to fly"
   ],
   "184": [
     "しょく・しょくへん",
-    "eat / food"
+    "food, to eat"
   ],
   "185": [
     "くび",
-    "head / neck"
+    "head"
   ],
   "186": [
     "かおり",
-    "fragrant"
+    "scent"
   ],
   "187": [
     "うま・うまへん",
@@ -753,27 +753,27 @@
   ],
   "189": [
     "たかい",
-    "tall / high"
+    "high"
   ],
   "190": [
-    "かみがしら",
+    "かみかんむり",
     "long hair"
   ],
   "191": [
-    "とうがまえ",
-    "fight"
+    "たたかいがまえ",
+    "fighting"
   ],
   "192": [
-    "ちょう",
-    "sacrificial wine"
+    "においざけ",
+    "herbs"
   ],
   "193": [
     "れき",
-    "cauldron"
+    "tripod"
   ],
   "194": [
     "おに",
-    "ghost / demon"
+    "demon"
   ],
   "195": [
     "うお・うおへん",
@@ -796,7 +796,7 @@
     "wheat"
   ],
   "200": [
-    "あさ",
+    "あさ・あさかんむり",
     "hemp"
   ],
   "201": [
@@ -812,11 +812,11 @@
     "black"
   ],
   "204": [
-    "ふつ",
-    "embroidery"
+    "ぬいとり",
+    "embroider"
   ],
   "205": [
-    "べん",
+    "かえる",
     "frog"
   ],
   "206": [
@@ -829,7 +829,7 @@
   ],
   "208": [
     "ねずみ",
-    "rat"
+    "rat, mouse"
   ],
   "209": [
     "はな",
@@ -837,7 +837,7 @@
   ],
   "210": [
     "せい",
-    "even"
+    "alike"
   ],
   "211": [
     "は",
