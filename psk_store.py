@@ -9,7 +9,9 @@ Manages:
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -21,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _STORE_LOCK = threading.Lock()
 _CACHE_LOCK = threading.Lock()
 _VALID_PSK_CACHE: Dict[str, Tuple[float, set]] = {}  # store_path -> (mtime_ns, set_of_psks)
+_LAST_GOOD_STORE: Dict[str, Dict[str, Any]] = {}    # store_path -> last successfully parsed store
 
 STORE_FILENAME = "ocr_psks.json"
 LEGACY_PSK_FILENAME = "ocr_psk.txt"
@@ -76,6 +79,7 @@ def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
             time.sleep(0.03 * (attempt + 1))
 
     _apply_restricted_permissions(path)
+    _LAST_GOOD_STORE[path] = copy.deepcopy(data)
     with _CACHE_LOCK:
         _VALID_PSK_CACHE.pop(path, None)
 
@@ -127,18 +131,33 @@ def _normalize_store(raw: Any) -> Tuple[Dict[str, Any], bool]:
     return {"pending_psk": pending, "devices": devices}, changed
 
 
-def _load_or_init_locked(app_dir: str) -> Dict[str, Any]:
+def _load_or_init_locked(app_dir: str, allow_fallback: bool = False) -> Dict[str, Any]:
     path = get_store_path(app_dir)
     if os.path.isfile(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            store, changed = _normalize_store(raw)
-            if changed:
-                _atomic_write_json(path, store)
-            return store
-        except Exception:
-            pass
+        last_exc: Optional[Exception] = None
+        for attempt in range(5):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                store, changed = _normalize_store(raw)
+                if changed:
+                    _atomic_write_json(path, store)
+                else:
+                    _LAST_GOOD_STORE[path] = copy.deepcopy(store)
+                return store
+            except (OSError, json.JSONDecodeError) as exc:
+                last_exc = exc
+                if attempt < 4:
+                    time.sleep(0.03 * (attempt + 1))
+
+        # File exists on disk but could not be read/parsed — never overwrite it with an empty store!
+        if os.path.exists(path):
+            if allow_fallback:
+                cached = _LAST_GOOD_STORE.get(path)
+                if cached is not None:
+                    return copy.deepcopy(cached)
+                return {"pending_psk": "", "devices": []}
+            raise RuntimeError(f"Failed to read existing PSK store '{path}': {last_exc}") from last_exc
 
     devices: List[Dict[str, Any]] = []
     legacy_path = os.path.join(app_dir, LEGACY_PSK_FILENAME)
@@ -174,7 +193,7 @@ def _load_or_init_locked(app_dir: str) -> Dict[str, Any]:
 
 def load_or_init_store(app_dir: str) -> Dict[str, Any]:
     with _STORE_LOCK:
-        return _load_or_init_locked(app_dir)
+        return _load_or_init_locked(app_dir, allow_fallback=True)
 
 
 def get_all_valid_psks(app_dir: str) -> List[Tuple[bytes, str, Optional[str]]]:
@@ -208,7 +227,7 @@ def is_psk_valid(app_dir: str, psk_str: str) -> bool:
     if not psk_str:
         return False
     env_psk = os.environ.get("OCR_PSK", "").strip()
-    if env_psk and psk_str == env_psk:
+    if env_psk and hmac.compare_digest(psk_str, env_psk):
         return True
 
     path = get_store_path(app_dir)

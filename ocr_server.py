@@ -5562,6 +5562,40 @@ class JapaneseOCRDictionaryPipeline:
                     if not y_entries and matched_surface and matched_surface != query_term:
                         y_entries = self._yomitan_mgr.lookup(matched_surface)
 
+                    deinf_steps_by_reading: Dict[str, List[str]] = {}
+                    if y_entries:
+                        expected_readings: set[str] = set()
+                        if not self._has_kanji(query_term):
+                            expected_readings.add(self._katakana_to_hiragana(query_term))
+                        if matched_surface and not self._has_kanji(matched_surface):
+                            surf_hira = self._katakana_to_hiragana(matched_surface)
+                            expected_readings.add(surf_hira)
+                            for dc in self._deinflector.deinflect(surf_hira):
+                                r_hira = self._katakana_to_hiragana(dc.root)
+                                expected_readings.add(r_hira)
+                                deinf_steps_by_reading.setdefault(r_hira, dc.steps)
+                        if reading_hint:
+                            rh_hira = self._katakana_to_hiragana(reading_hint)
+                            expected_readings.add(rh_hira)
+                            for dc in self._deinflector.deinflect(rh_hira):
+                                r_hira = self._katakana_to_hiragana(dc.root)
+                                expected_readings.add(r_hira)
+                                deinf_steps_by_reading.setdefault(r_hira, dc.steps)
+
+                        if expected_readings:
+                            reading_matched = [
+                                ye
+                                for ye in y_entries
+                                if ye.reading and self._katakana_to_hiragana(ye.reading) in expected_readings
+                            ]
+                            if reading_matched:
+                                y_entries = reading_matched
+
+                        y_entries = sorted(
+                            y_entries,
+                            key=lambda ye: 0 if ye.term == ye.headword else 1,
+                        )
+
                     for y_ent in y_entries:
                         y_key = ("yomi", y_ent.dict_title, y_ent.headword, y_ent.reading, tuple(y_ent.glosses))
                         if y_key in seen_idseq:
@@ -5573,6 +5607,28 @@ class JapaneseOCRDictionaryPipeline:
                             if matched_surface.startswith(query_term):
                                 hw = query_term
 
+                        y_active_steps = c_steps or (
+                            first_morph.conjugation_steps
+                            if first_morph
+                            and s_idx == anchor_idx
+                            and e_idx == morph_end_in_full
+                            and query_term in (first_morph.lemma, first_morph.kanji_lemma)
+                            else []
+                        )
+                        if not y_active_steps and y_ent.reading:
+                            ent_hira = self._katakana_to_hiragana(y_ent.reading)
+                            if (
+                                matched_surface != y_ent.headword
+                                and self._katakana_to_hiragana(matched_surface) != ent_hira
+                            ):
+                                y_active_steps = deinf_steps_by_reading.get(ent_hira, [])
+
+                        y_pos = (
+                            f"[{' -> '.join(y_active_steps)}] {y_ent.pos}"
+                            if y_active_steps
+                            else y_ent.pos
+                        )
+
                         formatted_glosses = [
                             f"{idx}. {g}" if not re.match(r"^\d+\.", g) else g
                             for idx, g in enumerate(y_ent.glosses, start=1)
@@ -5583,18 +5639,24 @@ class JapaneseOCRDictionaryPipeline:
                                 context_text=ctx_text,
                                 headword=hw,
                                 reading=y_ent.reading,
-                                pos=y_ent.pos,
+                                pos=y_pos,
                                 glosses=formatted_glosses,
                                 word_bboxes=word_bboxes,
                                 found=True,
                             )
                         )
 
-            # Preserve Yomitan ranking: Custom terms first, then longest matched surface prefix
-            def _result_sort_key(res: DictionaryResult) -> Tuple[int, int]:
+            # Preserve Yomitan ranking: Custom terms first, then longest matched surface prefix,
+            # with JMdict beating external Yomitan dictionaries (e.g. Babylon) on ties
+            yomi_tags = tuple(
+                f"[{t}]" for t, _ in (self._yomitan_mgr.loaded_dicts if self._yomitan_mgr else ())
+            )
+
+            def _result_sort_key(res: DictionaryResult) -> Tuple[int, int, int]:
                 is_custom = 1 if ("Custom" in res.pos or "Trainer Name" in res.pos or "Pok" in res.pos) else 0
                 eff_len = len(res.matched_surface)
-                return (is_custom, eff_len)
+                is_not_external = 0 if (yomi_tags and any(tag in res.pos for tag in yomi_tags)) else 1
+                return (is_custom, eff_len, is_not_external)
 
             results.sort(key=_result_sort_key, reverse=True)
             results.extend(name_results)
@@ -10306,7 +10368,7 @@ def handle_3ds_session(
                         target_kanji_scr = SCREEN_ID_BOTTOM if last_target_screen_id == SCREEN_ID_TOP else SCREEN_ID_TOP
                     last_kanji_target_scr = target_kanji_scr
                     last_kanji_hotspots = []
-                    logger.info("Lookup Kanji '%s' (U+%04X) -> target screen %d", kanji_char, cp_val, target_kanji_scr)
+                    logger.info("Lookup Kanji '%s' (U+%04X) -> target screen %d", _sanitize_log_str(kanji_char), cp_val, target_kanji_scr)
                     kanji_rgb = render_kanji_popup(
                         kanji_char,
                         target_kanji_scr,
@@ -10339,7 +10401,7 @@ def handle_3ds_session(
                             last_kanji_hotspots = []
                             logger.info(
                                 "Lookup Kanji (in-window) '%s' (U+%04X) -> target screen %d",
-                                next_kanji,
+                                _sanitize_log_str(next_kanji),
                                 hit_cp,
                                 last_kanji_target_scr,
                             )
@@ -10390,7 +10452,7 @@ def handle_3ds_session(
                         ) -> None:
                             logger.info(
                                 "Anki export for kanji '%s' (Title_ID=0x%016X): %s",
-                                kch,
+                                _sanitize_log_str(kch),
                                 tid,
                                 _sanitize_log_str(done_banner),
                             )
