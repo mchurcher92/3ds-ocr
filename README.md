@@ -82,4 +82,16 @@ The server runs out of the box with `manga-ocr` / `rapidocr-onnxruntime`. To als
 3. Launch the desktop server (`ocr_launcher.py`), pair your 3DS by scanning the QR code in the plugin, and press **`R + Start + Select`** in-game to capture and translate text.
 4. Move the cursor using the **Circle Pad** or **C-Stick** (New 3DS), D-Pad fine-stepping, or directly by tapping the touch screen.
 5. **Word Frequency & JLPT**: Word cards display their frequency ranking (e.g. `#195`) and JLPT level (e.g. `N5`) in the top banner instead of raw screen coordinates.
-6. **Kanji Stroke Order & Kanjidic Details**: Clicking or stylus-tapping any kanji character inside an active translation overlay opens a companion window on the opposite screen showing numbered stroke order diagrams, On/Kun/Nanori readings, radical, grade, frequency, and English definitions from Kanjidic. Press **`X`** while viewing this window to create an Anki card for the kanji, or **`B`** to close it.
+
+### Using Kanji Lookup
+When a word translation popup is open on-screen, you can inspect any kanji in it without losing your current translation:
+
+1. **Open Kanji Details**: Move the cursor over any kanji character in the translation popup and press **`A`** (or tap it directly on the touchscreen). A **Kanji Details** window will open on the **opposite screen** containing:
+   - Numbered stroke order diagram (`KanjiStrokeOrders.ttf`)
+   - JLPT level, school grade, and frequency rank
+   - On (`音`), Kun (`訓`), and Nanori (`名`) readings
+   - Stroke count and radical
+   - English meanings (from Kanjidic)
+2. **Scroll**: Use **D-Pad Up / Down** to scroll through long reading lists and meanings (if all details fit on one screen, scrolling is disabled).
+3. **Add to Anki**: Press **`X`** *(or your configured Anki keybind)* while the Kanji Details window is open to create an Anki flashcard for that kanji.
+4. **Close**: Press **`B`** (or click/tap a non-kanji area of the translation popup) to close only the Kanji Details window and return to your word popup. Press **`B`** again to close the word popup.
