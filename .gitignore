@@ -53,10 +53,12 @@ CTRPluginFramework_Slim/Library/release/
 ocr_models/*.onnx
 ocr_models/*.safetensors
 
-# Large dictionary databases and zip archives
+# Large dictionary databases, fonts, manifests, and zip archives
 dictionaries/*.db
+dictionaries/*.ttf
 dictionaries/*.zip
 dictionaries/.cache/
+dictionaries/.dict_manifest.json
 
 # OS / Editor temporary files
 .DS_Store

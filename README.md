@@ -7,11 +7,13 @@ Real-time dual-screen Japanese OCR, dictionary lookup, AI/neural translation, an
 - `ocr_launcher.py` — Desktop GUI launcher (QR code pairing, Paired 3DSes management, live OCR preview, settings, logs).
 - `ocr_server.py` — Socket/OCR/translation/Anki backend server.
 - `psk_store.py` — Thread-safe per-3DS PSK store and pairing registry (`ocr_psks.json`).
+- `dict_updater.py` & `dict_updater_dialog.py` — First-run open-licensed dictionary downloader & in-app Dictionary Updater.
 - `anki_dialog.py` & `ui_theme.py` — Configuration dialogs and dark-mode UI helpers.
 - `3gx_plugin/` — Full CTRPluginFramework `.3gx` plugin source (`build_plugin.ps1` / `build_plugin.bat`).
 - `3gx_plugin_slim/` — Headless slim `.3gx` plugin for Old 3DS / extended memory games (`build_slim_plugin.ps1`).
 - `3gx_plugin_hb/` & `CTRPluginFramework_Hb/` — Homebrew-compatible `.3gx` plugin build (`build_hb_plugin.ps1`).
-- `dictionaries/` — Custom proper-noun glossary (`custom_dict.json`), kanji stroke order font, JLPT metadata, and JMdict lookup support.
+- `dictionaries/` — Custom proper-noun glossary (`custom_dict.json`), JLPT & Kangxi radical metadata, plus downloaded open-licensed dictionaries (`jamdict.db`, `KanjiStrokeOrders.ttf`) and optional user-supplied Yomitan `.zip` dictionaries.
+- `THIRD_PARTY_LICENSES.md` — Attributions and licenses for open-licensed dictionary datasets and fonts.
 - `ocr_models/` — Model charsets/configs (`NDLmoji.yaml`, `japan_dict.txt`, `yomitoku_charset.txt`).
 
 ---
@@ -41,6 +43,12 @@ Start the desktop launcher:
 python ocr_launcher.py
 ```
 *(Or run the backend directly with `python ocr_server.py`.)*
+
+### Dictionaries & First-Run Setup
+- **Automatic First-Run Setup**: On first launch, if `dictionaries/jamdict.db` or `dictionaries/KanjiStrokeOrders.ttf` is missing, the launcher opens the **First-Run Dictionary Setup** dialog to download the open-licensed core dictionaries (**JMdict + KANJIDIC2 + JMnedict** under CC-BY-SA 4.0 and **KanjiStrokeOrders.ttf** under BSD-like / CC-BY-SA 3.0) from their official upstream sources.
+- **Built-In Dictionary Updater**: Click **Update Dictionaries...** in the launcher at any time to refresh `jamdict.db`, `KanjiStrokeOrders.ttf`, or `kangxi_radicals.json`.
+- **Optional (Bring Your Own Yomitan Dictionaries)**: Proprietary dictionaries (such as Babylon, Daijirin, or Kenkyusha) are intentionally excluded from automatic downloads for licensing reasons. You can drop any Yomitan-format `.zip` dictionary you already own into `dictionaries/` and click **Reload Dictionaries**.
+- See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for dataset attributions and licenses.
 
 ### Optional: Build Standalone Launcher Executable
 ```bash

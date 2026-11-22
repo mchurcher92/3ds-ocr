@@ -24,7 +24,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import qrcode
 from PIL import Image, ImageDraw, ImageFont, ImageTk
+import dict_updater
 import psk_store
+from dict_updater_dialog import DictionaryUpdaterDialog
 
 from anki_dialog import (
     AI_MODEL_OPTIONS,
@@ -590,8 +592,8 @@ class OcrServerLauncherGui:
         self._poll_log_queue()
         self._poll_psk_store()
 
-        # Auto-start server on launch
-        self.root.after(300, self._start_server)
+        # Check for missing core open-licensed dictionaries (first-run setup), then start server
+        self.root.after(300, self._startup_check_and_launch)
 
     def _build_ui(self) -> None:
         # Top Header Bar
@@ -778,6 +780,9 @@ class OcrServerLauncherGui:
         dict_btns.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
         make_secondary_button(
             dict_btns, text="Reload Dictionaries", command=self._reload_resources, padx=12, pady=4
+        ).pack(side="left", padx=(0, 8))
+        make_secondary_button(
+            dict_btns, text="Update Dictionaries...", command=self._open_dict_updater_dialog, padx=12, pady=4
         ).pack(side="left", padx=(0, 8))
         make_secondary_button(
             dict_btns, text="Open Folder", command=self._open_dict_folder, padx=12, pady=4
@@ -1178,6 +1183,42 @@ class OcrServerLauncherGui:
             self.ai_model_var.set(ai_model_to_label(cfg.get("gemini_model", "gemini-3.5-flash-lite")))
 
         AnkiSettingsDialog(self.root, on_save_callback=on_saved)
+
+    def _startup_check_and_launch(self) -> None:
+        missing = dict_updater.get_missing_first_run_assets(APP_DIR)
+        if missing:
+            self._log_local(
+                f"[INFO] First-run setup: missing open-licensed dictionary assets ({', '.join(missing)})."
+            )
+            self._open_dict_updater_dialog(first_run=True, auto_start_after=True)
+        else:
+            self._start_server()
+
+    def _open_dict_updater_dialog(self, first_run: bool = False, auto_start_after: bool = False) -> None:
+        was_running = bool(self.server_proc and self.server_proc.poll() is None)
+        stopped_for_update = {"flag": False}
+
+        def _before_write() -> None:
+            if self.server_proc and self.server_proc.poll() is None:
+                stopped_for_update["flag"] = True
+                self._log_local("[INFO] Pausing OCR server while updating dictionaries...")
+                self._stop_server(for_restart=True)
+
+        def _on_complete(did_update: bool) -> None:
+            self.dict_summary_var.set(self._get_dictionary_summary())
+            if did_update:
+                self._log_local("[INFO] Open-licensed dictionaries updated.")
+            if auto_start_after or stopped_for_update["flag"] or (was_running and did_update):
+                if not (self.server_proc and self.server_proc.poll() is None):
+                    self.root.after(200, self._start_server)
+
+        DictionaryUpdaterDialog(
+            self.root,
+            app_dir=APP_DIR,
+            first_run=first_run,
+            on_before_write=_before_write,
+            on_complete=_on_complete,
+        )
 
     def _classify_log_tag(self, line: str) -> Optional[str]:
         upper = line.upper()
