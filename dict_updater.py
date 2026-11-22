@@ -53,6 +53,8 @@ class DictAssetSpec:
     approx_size: str
     required_for_first_run: bool = False
     description: str = ""
+    category: str = "dictionary"      # "dictionary" or "ocr_model"
+    target_subdir: str = "dictionaries"
 
 
 OPEN_DICT_ASSETS: Tuple[DictAssetSpec, ...] = (
@@ -66,6 +68,8 @@ OPEN_DICT_ASSETS: Tuple[DictAssetSpec, ...] = (
         approx_size="~54 MB download (~325 MB unpacked)",
         required_for_first_run=True,
         description="Core Japanese-English word dictionary, kanji readings/meanings, and proper names.",
+        category="dictionary",
+        target_subdir="dictionaries",
     ),
     DictAssetSpec(
         asset_id="kanji_stroke_font",
@@ -77,6 +81,8 @@ OPEN_DICT_ASSETS: Tuple[DictAssetSpec, ...] = (
         approx_size="~9 MB download (~18 MB unpacked)",
         required_for_first_run=True,
         description="Renders numbered stroke-order diagrams in the 3DS Kanji Details popup.",
+        category="dictionary",
+        target_subdir="dictionaries",
     ),
     DictAssetSpec(
         asset_id="kangxi_radicals",
@@ -88,10 +94,75 @@ OPEN_DICT_ASSETS: Tuple[DictAssetSpec, ...] = (
         approx_size="~18 KB",
         required_for_first_run=False,
         description="Japanese readings and English meanings for all 214 Kangxi radicals.",
+        category="dictionary",
+        target_subdir="dictionaries",
     ),
 )
 
-ASSETS_BY_ID: Dict[str, DictAssetSpec] = {a.asset_id: a for a in OPEN_DICT_ASSETS}
+OPEN_OCR_MODEL_ASSETS: Tuple[DictAssetSpec, ...] = (
+    DictAssetSpec(
+        asset_id="paddle_jp_v4",
+        title="PaddleOCR Japanese PP-OCRv4 (ONNX)",
+        filename="japan_PP-OCRv4_rec.onnx",
+        license_label="Apache 2.0 (Baidu PaddleOCR)",
+        attribution="PaddleOCR / Baidu",
+        source_label="HuggingFace (pinned v4)",
+        approx_size="~9.7 MB",
+        required_for_first_run=True,
+        description="Fast Japanese line recognition engine for local ensemble OCR.",
+        category="ocr_model",
+        target_subdir="ocr_models",
+    ),
+    DictAssetSpec(
+        asset_id="ndlocr_lite",
+        title="NDLOCR-Lite PARSeq 16x384 (ONNX)",
+        filename="ndlocr_parseq_16x384.onnx",
+        license_label="CC-BY 4.0 (National Diet Library)",
+        attribution="National Diet Library of Japan (NDL Lab)",
+        source_label="GitHub ndl-lab/ndlocr-lite (v1.1.1)",
+        approx_size="~36.9 MB",
+        required_for_first_run=True,
+        description="High-accuracy Japanese PARSeq recognizer from Japan's National Diet Library.",
+        category="ocr_model",
+        target_subdir="ocr_models",
+    ),
+    DictAssetSpec(
+        asset_id="yomitoku_parseq_small",
+        title="YomiToku PARSeq-Small (Safetensors)",
+        filename="yomitoku_parseq_small.safetensors",
+        license_label="CC-BY-NC-SA 4.0 (Non-Commercial)",
+        attribution="Kotaro Kinoshita (YomiToku)",
+        source_label="HuggingFace (official open-beta)",
+        approx_size="~97.3 MB",
+        required_for_first_run=False,
+        description="Optional high-accuracy Japanese recognizer (non-commercial personal use only).",
+        category="ocr_model",
+        target_subdir="ocr_models",
+    ),
+)
+
+ALL_ASSETS: Tuple[DictAssetSpec, ...] = OPEN_DICT_ASSETS + OPEN_OCR_MODEL_ASSETS
+ASSETS_BY_ID: Dict[str, DictAssetSpec] = {a.asset_id: a for a in ALL_ASSETS}
+
+
+PINNED_OCR_MODEL_SOURCES: Dict[str, Tuple[str, str, str]] = {
+    # asset_id -> (https_url, expected_sha256, version_label)
+    "paddle_jp_v4": (
+        "https://huggingface.co/cycloneboy/japan_PP-OCRv4_rec_infer/resolve/main/model.onnx",
+        "bb0f23444c059d27a615c1a426414240bbd02d3658900d0455e007dc47d3e4a4",
+        "PP-OCRv4",
+    ),
+    "ndlocr_lite": (
+        "https://raw.githubusercontent.com/ndl-lab/ndlocr-lite/1.1.1/src/model/parseq-ndl-16x384-50-tiny-146epoch-tegaki2.onnx",
+        "1a60e88c9ffeaefdfe286677146f39fdeb4d0e1acd94ccd974c8943f761d9a08",
+        "v1.1.1 (16x384)",
+    ),
+    "yomitoku_parseq_small": (
+        "https://huggingface.co/KotaroKinoshita/yomitoku-text-recognizer-parseq-small-open-beta/resolve/main/model.safetensors",
+        "a23f8e6870d1c23e999b66d86819b9fa5145a3bcfb141d61f13828bf9b50b2e4",
+        "open-beta",
+    ),
+}
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -168,8 +239,8 @@ def _locate_existing_jamdict_db(app_dir: str) -> Optional[str]:
 
 def get_asset_status(app_dir: str, asset_id: str) -> Dict[str, Any]:
     spec = ASSETS_BY_ID[asset_id]
-    dict_dir = get_dictionaries_dir(app_dir)
-    local_path = os.path.join(dict_dir, spec.filename)
+    target_dir = os.path.join(app_dir, spec.target_subdir)
+    local_path = os.path.join(target_dir, spec.filename)
     manifest = load_manifest(app_dir)
     meta = manifest.get(asset_id, {}) if isinstance(manifest.get(asset_id), dict) else {}
 
@@ -193,7 +264,7 @@ def get_asset_status(app_dir: str, asset_id: str) -> Dict[str, Any]:
 def get_missing_first_run_assets(app_dir: str) -> List[str]:
     """Return asset_ids that are recommended for first-run setup and currently missing."""
     missing: List[str] = []
-    for spec in OPEN_DICT_ASSETS:
+    for spec in ALL_ASSETS:
         if not spec.required_for_first_run:
             continue
         if not get_asset_status(app_dir, spec.asset_id)["installed"]:
@@ -478,21 +549,59 @@ def _update_kangxi_radicals(
     return f"{len(ordered)} radicals"
 
 
+def _update_pinned_ocr_model(
+    app_dir: str,
+    asset_id: str,
+    progress_cb: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> str:
+    spec = ASSETS_BY_ID[asset_id]
+    url, expected_sha256, version = PINNED_OCR_MODEL_SOURCES[asset_id]
+    target_dir = os.path.join(app_dir, spec.target_subdir)
+    os.makedirs(target_dir, exist_ok=True)
+    dest_path = os.path.join(target_dir, spec.filename)
+    tmp_path = f"{dest_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+
+    try:
+        _download_to_file(
+            url,
+            tmp_path,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+            label=f"Downloading {spec.title} ({version})...",
+            expected_sha256=expected_sha256,
+        )
+        _atomic_replace(tmp_path, dest_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    return version
+
+
 def download_or_update_asset(
     app_dir: str,
     asset_id: str,
     progress_cb: Optional[ProgressCallback] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
-    """Download/update a single open-licensed dictionary asset and update manifest."""
+    """Download/update a single open-licensed dictionary or OCR model asset and update manifest."""
     if asset_id == "jamdict":
         version = _update_jamdict(app_dir, progress_cb=progress_cb, cancel_event=cancel_event)
     elif asset_id == "kanji_stroke_font":
         version = _update_kanji_stroke_font(app_dir, progress_cb=progress_cb, cancel_event=cancel_event)
     elif asset_id == "kangxi_radicals":
         version = _update_kangxi_radicals(app_dir, progress_cb=progress_cb, cancel_event=cancel_event)
+    elif asset_id in PINNED_OCR_MODEL_SOURCES:
+        version = _update_pinned_ocr_model(
+            app_dir, asset_id, progress_cb=progress_cb, cancel_event=cancel_event
+        )
     else:
-        raise ValueError(f"Unknown dictionary asset_id: {asset_id!r}")
+        raise ValueError(f"Unknown asset_id: {asset_id!r}")
 
     manifest = load_manifest(app_dir)
     manifest[asset_id] = {

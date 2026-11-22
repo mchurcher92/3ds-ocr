@@ -782,7 +782,7 @@ class OcrServerLauncherGui:
             dict_btns, text="Reload Dictionaries", command=self._reload_resources, padx=12, pady=4
         ).pack(side="left", padx=(0, 8))
         make_secondary_button(
-            dict_btns, text="Update Dictionaries...", command=self._open_dict_updater_dialog, padx=12, pady=4
+            dict_btns, text="Update Dicts & Models...", command=self._open_dict_updater_dialog, padx=12, pady=4
         ).pack(side="left", padx=(0, 8))
         make_secondary_button(
             dict_btns, text="Open Folder", command=self._open_dict_folder, padx=12, pady=4

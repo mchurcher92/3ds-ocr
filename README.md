@@ -44,23 +44,19 @@ python ocr_launcher.py
 ```
 *(Or run the backend directly with `python ocr_server.py`.)*
 
-### Dictionaries & First-Run Setup
-- **Automatic First-Run Setup**: On first launch, if `dictionaries/jamdict.db` or `dictionaries/KanjiStrokeOrders.ttf` is missing, the launcher opens the **First-Run Dictionary Setup** dialog to download the open-licensed core dictionaries (**JMdict + KANJIDIC2 + JMnedict** under CC-BY-SA 4.0 and **KanjiStrokeOrders.ttf** under BSD-like / CC-BY-SA 3.0) from their official upstream sources.
-- **Built-In Dictionary Updater**: Click **Update Dictionaries...** in the launcher at any time to refresh `jamdict.db`, `KanjiStrokeOrders.ttf`, or `kangxi_radicals.json`.
-- **Optional (Bring Your Own Yomitan Dictionaries)**: Proprietary dictionaries (such as Babylon, Daijirin, or Kenkyusha) are intentionally excluded from automatic downloads for licensing reasons. You can drop any Yomitan-format `.zip` dictionary you already own into `dictionaries/` and click **Reload Dictionaries**.
-- See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for dataset attributions and licenses.
+### Dictionaries, Local OCR Models & First-Run Setup
+- **Automatic First-Run Setup**: On first launch, if core open-licensed dictionaries (`jamdict.db`, `KanjiStrokeOrders.ttf`) or recommended local OCR models (`japan_PP-OCRv4_rec.onnx`, `ndlocr_parseq_16x384.onnx`) are missing, the launcher opens the **First-Run Setup** dialog to download them from their official upstream sources with SHA-256 verification.
+- **Built-In Updater**: Click **Update Dicts & Models...** in the launcher at any time to download or refresh:
+  - **Dictionaries**: `jamdict.db` (CC-BY-SA 4.0), `KanjiStrokeOrders.ttf` (BSD-like / CC-BY-SA 3.0), and `kangxi_radicals.json` (CC-BY 4.0).
+  - **Local OCR Models**: `japan_PP-OCRv4_rec.onnx` (Apache 2.0), `ndlocr_parseq_16x384.onnx` (CC-BY 4.0), and optional opt-in `yomitoku_parseq_small.safetensors` (CC-BY-NC-SA 4.0, non-commercial personal use only). *(RapidOCR & Manga-OCR auto-download via their Python packages.)*
+- **Optional (Bring Your Own Yomitan Dictionaries)**: Proprietary dictionaries (such as Babylon, Daijirin, or Kenkyusha) are excluded from automatic downloads for licensing reasons. Drop any Yomitan-format `.zip` dictionary you already own into `dictionaries/` and click **Reload Dictionaries**.
+- See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for full attributions and licenses.
 
 ### Optional: Build Standalone Launcher Executable
 ```bash
 pyinstaller OCR_Server.spec
 ```
 Output is written to `dist/OCR_Server.exe`.
-
-### Optional: Extra Local OCR Models
-The server runs out of the box with `manga-ocr` / `rapidocr-onnxruntime`. To also enable PaddleOCR Japanese v4, YomiToku PARSeq-Small, or NDLOCR-Lite, place their model weights in `ocr_models/`:
-- `japan_PP-OCRv4_rec.onnx`
-- `yomitoku_parseq_small.safetensors`
-- `ndlocr_parseq_16x384.onnx`
 
 ---
 

@@ -1,5 +1,5 @@
 """
-dict_updater_dialog.py - First-run setup and Dictionary Updater dialog for the desktop launcher.
+dict_updater_dialog.py - First-run setup and Dictionaries & OCR Models Updater dialog.
 """
 
 from __future__ import annotations
@@ -10,20 +10,19 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 import dict_updater
 from ui_theme import (
-    ACCENT,
     BG_ELEVATED,
     BG_ROOT,
     BG_SURFACE,
     BORDER,
-    DANGER,
     FG_MUTED,
     FG_PRIMARY,
     FG_SECONDARY,
     MONO_FONT,
+    ModernTabBar,
     SUCCESS,
     UI_FONT,
     WARNING,
@@ -53,7 +52,7 @@ def _fmt_size(num_bytes: int) -> str:
 
 
 class DictionaryUpdaterDialog:
-    """Modal dialog for first-run open-licensed dictionary setup and on-demand updates."""
+    """Modal dialog for first-run setup and on-demand updates of open-licensed dictionaries & OCR models."""
 
     def __init__(
         self,
@@ -75,7 +74,11 @@ class DictionaryUpdaterDialog:
         self._closed = False
 
         self.win = tk.Toplevel(parent)
-        self.win.title("First-Run Dictionary Setup" if first_run else "Dictionary Updater")
+        self.win.title(
+            "First-Run Setup: Dictionaries & OCR Models"
+            if first_run
+            else "Dictionaries & OCR Models Updater"
+        )
         self.win.configure(bg=BG_ROOT)
         self.win.resizable(False, False)
         self.win.transient(parent)
@@ -89,58 +92,38 @@ class DictionaryUpdaterDialog:
 
         self._build_ui()
         self._refresh_statuses()
-        _center_dialog(self.win, 660, 540)
+        _center_dialog(self.win, 680, 585)
 
-    def _build_ui(self) -> None:
-        outer = tk.Frame(self.win, bg=BG_ROOT, padx=18, pady=16)
-        outer.pack(fill="both", expand=True)
-
-        heading = (
-            "First-Run Dictionary Setup"
-            if self.first_run
-            else "Open-Licensed Dictionary Updater"
-        )
-        subtitle = (
-            "Core Japanese dictionaries are not bundled in Git. Download the open-licensed "
-            "dictionaries below to get started right away."
-            if self.first_run
-            else "Download or refresh openly licensed Japanese dictionaries and stroke-order fonts "
-            "from their official upstream sources."
-        )
-
-        tk.Label(
-            outer, text=heading, bg=BG_ROOT, fg=FG_PRIMARY, font=(UI_FONT, 13, "bold")
-        ).pack(anchor="w")
-        tk.Label(
-            outer,
-            text=subtitle,
-            bg=BG_ROOT,
-            fg=FG_SECONDARY,
-            font=(UI_FONT, 9),
-            wraplength=620,
-            justify="left",
-        ).pack(anchor="w", pady=(4, 12))
-
-        # Asset cards list
-        list_frame = tk.Frame(outer, bg=BORDER, bd=0)
-        list_frame.pack(fill="x", pady=(0, 12))
+    def _build_asset_list(
+        self,
+        parent: tk.Widget,
+        assets: Sequence[dict_updater.DictAssetSpec],
+        missing_first_run: set,
+    ) -> None:
+        list_frame = tk.Frame(parent, bg=BORDER, bd=0)
+        list_frame.pack(fill="x", pady=(8, 10))
         inner = tk.Frame(list_frame, bg=BG_SURFACE, padx=12, pady=10)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
 
-        missing_first_run = set(dict_updater.get_missing_first_run_assets(self.app_dir))
-
-        for idx, spec in enumerate(dict_updater.OPEN_DICT_ASSETS):
+        for idx, spec in enumerate(assets):
             if idx > 0:
                 tk.Frame(inner, bg=BORDER, height=1).pack(fill="x", pady=8)
 
             row = tk.Frame(inner, bg=BG_SURFACE)
             row.pack(fill="x")
 
-            default_checked = (
-                (spec.asset_id in missing_first_run)
-                if self.first_run
-                else (not dict_updater.get_asset_status(self.app_dir, spec.asset_id)["installed"] or spec.asset_id == "jamdict")
-            )
+            installed = dict_updater.get_asset_status(self.app_dir, spec.asset_id)["installed"]
+            if self.first_run:
+                default_checked = spec.asset_id in missing_first_run
+            else:
+                default_checked = (not installed) and spec.required_for_first_run
+                if not default_checked and spec.asset_id == "jamdict" and not any(
+                    not dict_updater.get_asset_status(self.app_dir, a.asset_id)["installed"]
+                    for a in dict_updater.ALL_ASSETS
+                    if a.required_for_first_run
+                ):
+                    default_checked = True
+
             var = tk.BooleanVar(value=default_checked)
             self._check_vars[spec.asset_id] = var
 
@@ -165,11 +148,11 @@ class DictionaryUpdaterDialog:
 
             tk.Label(
                 meta_row,
-                text=f"{spec.description}",
+                text=spec.description,
                 bg=BG_SURFACE,
                 fg=FG_SECONDARY,
                 font=(UI_FONT, 8),
-                wraplength=580,
+                wraplength=600,
                 justify="left",
             ).pack(anchor="w")
 
@@ -194,12 +177,55 @@ class DictionaryUpdaterDialog:
             ver_lbl.pack(side="right")
             self._version_labels[spec.asset_id] = ver_lbl
 
-        # Bring-your-own Yomitan dictionaries info box
-        byo_border = tk.Frame(outer, bg=BORDER)
-        byo_border.pack(fill="x", pady=(0, 12))
+    def _build_ui(self) -> None:
+        outer = tk.Frame(self.win, bg=BG_ROOT, padx=18, pady=14)
+        outer.pack(fill="both", expand=True)
+
+        heading = (
+            "First-Run Setup: Dictionaries & OCR Models"
+            if self.first_run
+            else "Dictionaries & OCR Models Updater"
+        )
+        subtitle = (
+            "Large open-licensed dictionaries and local OCR models are not bundled in Git. "
+            "Download the recommended assets below (checked across both tabs) to get started."
+            if self.first_run
+            else "Download or refresh openly licensed dictionaries and pinned, SHA-256-verified "
+            "local OCR models from their official upstream sources."
+        )
+
+        tk.Label(
+            outer, text=heading, bg=BG_ROOT, fg=FG_PRIMARY, font=(UI_FONT, 13, "bold")
+        ).pack(anchor="w")
+        tk.Label(
+            outer,
+            text=subtitle,
+            bg=BG_ROOT,
+            fg=FG_SECONDARY,
+            font=(UI_FONT, 9),
+            wraplength=640,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 10))
+
+        # Modern tab bar: Dictionaries | OCR Models
+        tab_bar_wrap = tk.Frame(outer, bg=BG_ROOT)
+        tab_bar_wrap.pack(fill="x")
+        tab_content = tk.Frame(outer, bg=BG_ROOT)
+        tab_content.pack(fill="both", expand=True)
+
+        self.tab_bar = ModernTabBar(tab_bar_wrap, tab_content)
+        self.tab_bar.pack(fill="x")
+
+        missing_first_run = set(dict_updater.get_missing_first_run_assets(self.app_dir))
+
+        # Tab 1: Dictionaries
+        tab_dicts = tk.Frame(tab_content, bg=BG_ROOT)
+        self._build_asset_list(tab_dicts, dict_updater.OPEN_DICT_ASSETS, missing_first_run)
+
+        byo_border = tk.Frame(tab_dicts, bg=BORDER)
+        byo_border.pack(fill="x", pady=(0, 6))
         byo = tk.Frame(byo_border, bg=BG_ELEVATED, padx=12, pady=8)
         byo.pack(fill="x", padx=1, pady=1)
-
         tk.Label(
             byo,
             text="Optional: Bring Your Own Yomitan Dictionaries",
@@ -211,25 +237,64 @@ class DictionaryUpdaterDialog:
             byo,
             text=(
                 "Proprietary dictionaries (e.g. Babylon, Daijirin, Kenkyusha) are excluded from "
-                "automatic downloads for licensing reasons. To use any Yomitan-format .zip dictionary "
-                "you already own, drop it into the dictionaries/ folder and click Reload Dictionaries."
+                "automatic downloads for licensing reasons. Drop any Yomitan .zip dictionary you "
+                "own into dictionaries/ and click Reload Dictionaries."
             ),
             bg=BG_ELEVATED,
             fg=FG_SECONDARY,
             font=(UI_FONT, 8),
-            wraplength=595,
+            wraplength=610,
             justify="left",
         ).pack(anchor="w", pady=(2, 0))
+
+        # Tab 2: OCR Models
+        tab_ocr = tk.Frame(tab_content, bg=BG_ROOT)
+        self._build_asset_list(tab_ocr, dict_updater.OPEN_OCR_MODEL_ASSETS, missing_first_run)
+
+        ocr_note_border = tk.Frame(tab_ocr, bg=BORDER)
+        ocr_note_border.pack(fill="x", pady=(0, 6))
+        ocr_note = tk.Frame(ocr_note_border, bg=BG_ELEVATED, padx=12, pady=8)
+        ocr_note.pack(fill="x", padx=1, pady=1)
+        tk.Label(
+            ocr_note,
+            text="Note on OCR Models & Licensing",
+            bg=BG_ELEVATED,
+            fg=FG_PRIMARY,
+            font=(UI_FONT, 9, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            ocr_note,
+            text=(
+                "• RapidOCR & Manga-OCR (Apache 2.0) auto-download via Python packages on first use.\n"
+                "• Local ONNX/Safetensors models above are pinned & SHA-256 verified to match ocr_server.py.\n"
+                "• YomiToku PARSeq-Small is CC-BY-NC-SA 4.0 (personal/non-commercial use only; opt-in)."
+            ),
+            bg=BG_ELEVATED,
+            fg=FG_SECONDARY,
+            font=(UI_FONT, 8),
+            wraplength=610,
+            justify="left",
+        ).pack(anchor="w", pady=(2, 0))
+
+        self.tab_bar.add_tab("dictionaries", "Dictionaries", tab_dicts)
+        self.tab_bar.add_tab("ocr_models", "OCR Models", tab_ocr)
+        # If only OCR models are missing on first run, focus OCR Models tab
+        if self.first_run and missing_first_run and not any(
+            a.asset_id in missing_first_run for a in dict_updater.OPEN_DICT_ASSETS
+        ):
+            self.tab_bar.select("ocr_models")
+        else:
+            self.tab_bar.select("dictionaries")
 
         # Progress bar & status
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_bar = ttk.Progressbar(
             outer, variable=self.progress_var, maximum=100.0, mode="determinate"
         )
-        self.progress_bar.pack(fill="x", pady=(0, 4))
+        self.progress_bar.pack(fill="x", pady=(8, 4))
 
         self.progress_text_var = tk.StringVar(
-            value="Select the dictionaries to download or update."
+            value="Select items across Dictionaries and OCR Models to download or update."
         )
         tk.Label(
             outer,
@@ -237,7 +302,7 @@ class DictionaryUpdaterDialog:
             bg=BG_ROOT,
             fg=FG_SECONDARY,
             font=(UI_FONT, 9),
-        ).pack(anchor="w", pady=(0, 12))
+        ).pack(anchor="w", pady=(0, 10))
 
         # Bottom action buttons
         btns = tk.Frame(outer, bg=BG_ROOT)
@@ -255,19 +320,28 @@ class DictionaryUpdaterDialog:
 
         self.open_folder_btn = make_secondary_button(
             btns,
-            text="Open dictionaries/ Folder",
-            command=self._open_dict_folder,
-            padx=12,
+            text="Open dictionaries/",
+            command=lambda: self._open_subdir("dictionaries"),
+            padx=10,
             pady=6,
         )
-        self.open_folder_btn.pack(side="left", padx=(0, 8))
+        self.open_folder_btn.pack(side="left", padx=(0, 6))
+
+        self.open_models_btn = make_secondary_button(
+            btns,
+            text="Open ocr_models/",
+            command=lambda: self._open_subdir("ocr_models"),
+            padx=10,
+            pady=6,
+        )
+        self.open_models_btn.pack(side="left", padx=(0, 8))
 
         self.cancel_btn = make_action_button(
             btns,
             text="Cancel",
             command=self._cancel_download,
             variant="danger",
-            padx=12,
+            padx=10,
             pady=6,
         )
         self.cancel_btn.configure(state="disabled")
@@ -284,7 +358,7 @@ class DictionaryUpdaterDialog:
         self.close_btn.pack(side="right")
 
     def _refresh_statuses(self) -> None:
-        for spec in dict_updater.OPEN_DICT_ASSETS:
+        for spec in dict_updater.ALL_ASSETS:
             st = dict_updater.get_asset_status(self.app_dir, spec.asset_id)
             lbl = self._status_labels[spec.asset_id]
             ver_lbl = self._version_labels[spec.asset_id]
@@ -295,17 +369,21 @@ class DictionaryUpdaterDialog:
                 )
                 ver_text = st["version"]
                 if st["updated_at"]:
-                    ver_text = f"{ver_text} • {st['updated_at'][:10]}" if ver_text else st["updated_at"][:10]
+                    ver_text = (
+                        f"{ver_text} • {st['updated_at'][:10]}"
+                        if ver_text
+                        else st["updated_at"][:10]
+                    )
                 ver_lbl.configure(text=ver_text)
             else:
                 lbl.configure(
-                    text="Missing (Recommended)" if spec.required_for_first_run else "Not Installed",
+                    text="Missing (Recommended)" if spec.required_for_first_run else "Optional",
                     fg=WARNING if spec.required_for_first_run else FG_MUTED,
                 )
                 ver_lbl.configure(text="")
 
-    def _open_dict_folder(self) -> None:
-        d = dict_updater.get_dictionaries_dir(self.app_dir)
+    def _open_subdir(self, subdir: str) -> None:
+        d = os.path.join(self.app_dir, subdir)
         os.makedirs(d, exist_ok=True)
         try:
             if sys.platform == "win32":
@@ -322,18 +400,18 @@ class DictionaryUpdaterDialog:
             return
         selected: List[str] = [
             spec.asset_id
-            for spec in dict_updater.OPEN_DICT_ASSETS
+            for spec in dict_updater.ALL_ASSETS
             if self._check_vars[spec.asset_id].get()
         ]
         if not selected:
             messagebox.showinfo(
                 "No Selection",
-                "Check at least one dictionary to download or update.",
+                "Check at least one dictionary or OCR model to download or update.",
                 parent=self.win,
             )
             return
 
-        # Stop running server before writing so jamdict.db isn't locked on Windows
+        # Stop running server before writing so jamdict.db / model files aren't locked on Windows
         if self.on_before_write is not None:
             try:
                 self.on_before_write()
@@ -352,7 +430,7 @@ class DictionaryUpdaterDialog:
             target=self._download_worker,
             args=(selected,),
             daemon=True,
-            name="DictUpdaterWorker",
+            name="AssetUpdaterWorker",
         ).start()
 
     def _cancel_download(self) -> None:
@@ -431,15 +509,15 @@ class DictionaryUpdaterDialog:
                 f"Completed {completed_count} item(s) with {len(errors)} error(s)."
             )
             messagebox.showerror(
-                "Dictionary Update Errors",
-                "Some dictionaries failed to update:\n\n" + "\n".join(errors),
+                "Update Errors",
+                "Some items failed to update:\n\n" + "\n".join(errors),
                 parent=self.win,
             )
             return
 
         self.progress_var.set(100.0)
         self.progress_text_var.set(
-            f"Successfully updated {completed_count} open-licensed dictionary asset(s)!"
+            f"Successfully updated {completed_count} asset(s)!"
         )
         self.close_btn.configure(text="Done")
         if self.first_run:
@@ -449,7 +527,7 @@ class DictionaryUpdaterDialog:
         if self._working:
             if not messagebox.askyesno(
                 "Cancel Download?",
-                "A dictionary download is in progress. Cancel it and close?",
+                "A download is in progress. Cancel it and close?",
                 parent=self.win,
             ):
                 return
