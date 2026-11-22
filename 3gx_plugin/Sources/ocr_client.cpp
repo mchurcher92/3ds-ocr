@@ -7,6 +7,7 @@
 #include <3ds/services/ndm.h>
 #include <3ds/services/ac.h>
 #include <sys/socket.h>
+#include <sys/iosupport.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
@@ -25,9 +26,242 @@ namespace CTRPluginFramework
 {
     // Global static socket context using Luma3DS system memory allocation
     static bool s_socInitialized = false;
+    static bool s_socBorrowed = false;
     static u32  s_socBufferAddr = 0;
+    static u32  s_socAliasAddr = 0;
+    static u32  s_socBufferSize = 0;
     static bool s_socBufferIsHeap = false;
     static const u32 SOC_BUFFER_SIZE = 0x48000; // 288 KB (minimum required by 3DS soc:u service)
+
+    extern "C" {
+        extern Handle SOCU_handle;
+        int _net_convert_error(s32 sock_retval);
+        ssize_t soc_recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen);
+        ssize_t soc_sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dest_addr, socklen_t addrlen);
+    }
+
+    static int BorrowedSocOpen(struct _reent *r, void *fileStruct, const char *path, int flags, int mode)
+    {
+        (void)fileStruct; (void)path; (void)flags; (void)mode;
+        r->_errno = ENOSYS;
+        return -1;
+    }
+
+    static int BorrowedSocClose(struct _reent *r, void *fd)
+    {
+        u32 *cmdbuf = getThreadCommandBuffer();
+        cmdbuf[0] = 0x000B0042;
+        cmdbuf[1] = static_cast<u32>(*static_cast<int *>(fd));
+        cmdbuf[2] = 0x20;
+        Result ret = svcSendSyncRequest(SOCU_handle);
+        if (R_FAILED(ret)) {
+            r->_errno = ENODEV;
+            return ret;
+        }
+        s32 res = static_cast<s32>(cmdbuf[1]);
+        if (res == 0)
+            res = _net_convert_error(static_cast<s32>(cmdbuf[2]));
+        if (res < 0) {
+            r->_errno = -res;
+            return -1;
+        }
+        return 0;
+    }
+
+    static ssize_t BorrowedSocWrite(struct _reent *r, void *fd, const char *ptr, size_t len)
+    {
+        (void)r;
+        return soc_sendto(*static_cast<int *>(fd), ptr, len, 0, nullptr, 0);
+    }
+
+    static ssize_t BorrowedSocRead(struct _reent *r, void *fd, char *ptr, size_t len)
+    {
+        (void)r;
+        return soc_recvfrom(*static_cast<int *>(fd), ptr, len, 0, nullptr, nullptr);
+    }
+
+    static const devoptab_t s_borrowedSocDevoptab = {
+        "soc",
+        sizeof(int),
+        BorrowedSocOpen,
+        BorrowedSocClose,
+        BorrowedSocWrite,
+        BorrowedSocRead,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        0,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr
+    };
+
+    struct HostSocSearchDiag {
+        u32 hits00010044 = 0;
+        u32 candAddr = 0;
+        u32 candVal = 0;
+        int roHits = 0;
+        Handle handle = 0;
+    };
+
+    static bool OCR_IsReadableAddress(u32 addr)
+    {
+        if ((addr & 3) != 0 || addr < 0x00100000 || addr >= 0x08000000)
+            return false;
+        MemInfo mi{};
+        PageInfo pi{};
+        if (R_FAILED(svcQueryMemory(&mi, &pi, addr)))
+            return false;
+        return mi.state != MEMSTATE_FREE && (mi.perm & MEMPERM_READ) != 0;
+    }
+
+    static u32 OCR_FindFreeVa(u32 size)
+    {
+        const u32 ranges[2][2] = {
+            { 0x07500000, 0x07F80000 },
+            { 0x06000000, 0x06F80000 }
+        };
+        for (int r = 0; r < 2; ++r) {
+            u32 addr = ranges[r][0];
+            while (addr < ranges[r][1]) {
+                MemInfo mi{};
+                PageInfo pi{};
+                if (R_FAILED(svcQueryMemory(&mi, &pi, addr))) {
+                    addr += 0x10000;
+                    continue;
+                }
+                u64 regionEnd = (u64)mi.base_addr + (u64)mi.size;
+                if (mi.state == MEMSTATE_FREE && regionEnd >= (u64)addr + (u64)size) {
+                    return addr;
+                }
+                u64 next = (regionEnd + 0xFFFULL) & ~0xFFFULL;
+                if (next <= (u64)addr) next = (u64)addr + 0x1000ULL;
+                if (next >= (u64)ranges[r][1]) break;
+                addr = (u32)next;
+            }
+        }
+        return 0;
+    }
+
+    static Handle OCR_FindHostSocuHandle(HostSocSearchDiag *outDiag = nullptr)
+    {
+        HostSocSearchDiag diag;
+        const u32 textStart = 0x00100000;
+        const u32 textSize = Process::GetTextSize();
+        const u32 textEnd = textStart + textSize;
+
+        // Pass 1: Scan for SOCU_Initialize command header 0x00010044 in literal pools
+        for (u32 litAddr = textStart; litAddr + sizeof(u32) <= textEnd; litAddr += sizeof(u32)) {
+            if (*reinterpret_cast<const u32 *>(litAddr) != 0x00010044)
+                continue;
+
+            diag.hits00010044++;
+            const u32 offHi = std::min<u32>(0xFF0, litAddr - textStart);
+            for (u32 off = 4; off <= offHi; off += 4) {
+                const u32 ldrCmdAddr = litAddr - off;
+                const u32 ldrCmdInsn = *reinterpret_cast<const u32 *>(ldrCmdAddr);
+                // Match ldr r*, [pc, #off] or [pc, #-off]
+                if ((ldrCmdInsn & 0x0F7F0000) != 0x051F0000)
+                    continue;
+                const bool uBit = (ldrCmdInsn & 0x00800000) != 0;
+                const u32 target = uBit ? (ldrCmdAddr + 8 + (ldrCmdInsn & 0xFFF))
+                                        : (ldrCmdAddr + 8 - (ldrCmdInsn & 0xFFF));
+                if (target != litAddr)
+                    continue;
+
+                const u32 searchLo = (ldrCmdAddr >= textStart + 64) ? (ldrCmdAddr - 64) : textStart;
+                const u32 searchHi = std::min(textEnd, ldrCmdAddr + 64);
+                for (u32 insnAddr = searchLo; insnAddr < searchHi; insnAddr += 4) {
+                    const u32 insn = *reinterpret_cast<const u32 *>(insnAddr);
+                    if ((insn & 0x0F7F0000) != 0x051F0000)
+                        continue;
+
+                    const u32 reg = (insn >> 12) & 0xF;
+                    const bool ptrUp = (insn & 0x00800000) != 0;
+                    const u32 ptrLitAddr = ptrUp ? (insnAddr + 8 + (insn & 0xFFF))
+                                                 : (insnAddr + 8 - (insn & 0xFFF));
+                    if (ptrLitAddr < textStart || ptrLitAddr + sizeof(u32) > textEnd)
+                        continue;
+
+                    const u32 baseAddr = *reinterpret_cast<const u32 *>(ptrLitAddr);
+                    if (baseAddr < textEnd || baseAddr >= 0x08000000)
+                        continue;
+
+                    for (u32 k = insnAddr + 4; k < std::min(textEnd, insnAddr + 64); k += 4) {
+                        const u32 kInsn = *reinterpret_cast<const u32 *>(k);
+                        // Match `ldr r0, [r<reg>, #imm]` (including #0)
+                        if ((kInsn & 0x0F7FF000) == (0x05100000 | (reg << 16))) {
+                            const bool kUp = (kInsn & 0x00800000) != 0;
+                            const u32 disp = kInsn & 0xFFF;
+                            const u32 handleVarAddr = kUp ? (baseAddr + disp) : (baseAddr - disp);
+                            if (OCR_IsReadableAddress(handleVarAddr)) {
+                                const Handle h = *reinterpret_cast<const Handle *>(handleVarAddr);
+                                diag.candAddr = handleVarAddr;
+                                diag.candVal = h;
+                                if (h != 0) {
+                                    diag.handle = h;
+                                    if (outDiag) *outDiag = diag;
+                                    return h;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass 2: Scan .rodata for "soc:U" / "soc:u" used in srvGetServiceHandle(&SOCU_handle, "soc:U")
+        const u32 roStart = textEnd;
+        const u32 roEnd = roStart + Process::GetRoDataSize();
+        for (u32 sAddr = roStart; sAddr + 6 <= roEnd; ++sAddr) {
+            const char *s = reinterpret_cast<const char *>(sAddr);
+            if (!(s[0] == 's' && s[1] == 'o' && s[2] == 'c' && s[3] == ':' && (s[4] == 'U' || s[4] == 'u') && s[5] == '\0'))
+                continue;
+
+            for (u32 litAddr = textStart; litAddr + sizeof(u32) <= textEnd; litAddr += sizeof(u32)) {
+                if (*reinterpret_cast<const u32 *>(litAddr) != sAddr)
+                    continue;
+                diag.roHits++;
+
+                const u32 offHi = std::min<u32>(0xFF0, litAddr - textStart);
+                for (u32 off = 4; off <= offHi; off += 4) {
+                    const u32 ldrStrAddr = litAddr - off;
+                    const u32 ldrStrInsn = *reinterpret_cast<const u32 *>(ldrStrAddr);
+                    if ((ldrStrInsn & 0x0F7FF000) != 0x051F1000) // ldr r1, [pc, #off]
+                        continue;
+                    const bool uBit = (ldrStrInsn & 0x00800000) != 0;
+                    const u32 target = uBit ? (ldrStrAddr + 8 + (ldrStrInsn & 0xFFF))
+                                            : (ldrStrAddr + 8 - (ldrStrInsn & 0xFFF));
+                    if (target != litAddr)
+                        continue;
+
+                    const u32 searchLo = (ldrStrAddr >= textStart + 32) ? (ldrStrAddr - 32) : textStart;
+                    const u32 searchHi = std::min(textEnd, ldrStrAddr + 32);
+                    for (u32 insnAddr = searchLo; insnAddr < searchHi; insnAddr += 4) {
+                        const u32 insn = *reinterpret_cast<const u32 *>(insnAddr);
+                        if ((insn & 0x0F7FF000) != 0x051F0000) // ldr r0, [pc, #off]
+                            continue;
+                        const bool ptrUp = (insn & 0x00800000) != 0;
+                        const u32 ptrLitAddr = ptrUp ? (insnAddr + 8 + (insn & 0xFFF))
+                                                     : (insnAddr + 8 - (insn & 0xFFF));
+                        if (ptrLitAddr < textStart || ptrLitAddr + sizeof(u32) > textEnd)
+                            continue;
+                        const u32 handleVarAddr = *reinterpret_cast<const u32 *>(ptrLitAddr);
+                        if (OCR_IsReadableAddress(handleVarAddr)) {
+                            const Handle h = *reinterpret_cast<const Handle *>(handleVarAddr);
+                            diag.candAddr = handleVarAddr;
+                            diag.candVal = h;
+                            if (h != 0) {
+                                diag.handle = h;
+                                if (outDiag) *outDiag = diag;
+                                return h;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (outDiag) *outDiag = diag;
+        return 0;
+    }
 
     // Configurable server endpoints (loaded from /luma/ocr_config.txt or updated via QR code)
     static std::string s_serverLanHost = "";
@@ -41,7 +275,7 @@ namespace CTRPluginFramework
         u32 size = 0;
         bool isSvc = false;
 
-        bool Alloc(u32 vaddr, u32 reqSize, u32 fallbackVaddr = 0) {
+        bool Alloc(u32 vaddr, u32 reqSize, u32 fallbackVaddr = 0, bool allowBase = false) {
             if (ptr) return true;
             u32 aligned = (reqSize + 0xFFF) & ~0xFFF;
             u32 out = 0;
@@ -91,6 +325,22 @@ namespace CTRPluginFramework
                 return true;
             }
 
+            // Strategy 5: optional MEMOP_REGION_BASE fallback
+            if (allowBase) {
+                u32 baseVa = OCR_FindFreeVa(aligned);
+                if (baseVa != 0) {
+                    out = baseVa;
+                    Result br = svcControlMemoryUnsafe(&out, baseVa, aligned,
+                        (MemOp)(MEMOP_REGION_BASE | MEMOP_ALLOC), (MemPerm)(MEMPERM_READ | MEMPERM_WRITE));
+                    if (R_SUCCEEDED(br) && out != 0) {
+                        ptr = (u8 *)out;
+                        size = aligned;
+                        isSvc = true;
+                        return true;
+                    }
+                }
+            }
+
             return false;
         }
 
@@ -115,11 +365,27 @@ namespace CTRPluginFramework
     static int s_kanjiScrollY;
     static int s_kanjiMaxScrollY;           // actual max scroll = max(0, content_height - viewport)
 
-    #define s_top_rgb   (s_topBuffer.ptr)
-    #define s_bot_rgb   (s_botBuffer.ptr)
+    static const u32 TOP_FB_565_SIZE = TOP_WIDTH * TOP_HEIGHT * 2;
+    static const u32 BOT_FB_565_SIZE = BOT_WIDTH * BOT_HEIGHT * 2;
+    static const u32 KANJI_TALL_565_SIZE = POPUP_WIDTH * KANJI_TALL_HEIGHT * 2;
+
+    #define s_top_565   ((u16 *)s_topBuffer.ptr)
+    #define s_bot_565   ((u16 *)s_botBuffer.ptr)
     #define s_popup_rgb (s_popupBuffer.ptr)
 
-    #define s_kanji_tall (s_kanjiTallBuffer.ptr)
+    #define s_kanji_tall_565 ((u16 *)s_kanjiTallBuffer.ptr)
+
+    static inline u16 PackRGB565(const Color &c)
+    {
+        return (u16)(((u16)(c.r & 0xF8) << 8) | ((u16)(c.g & 0xFC) << 3) | ((u16)(c.b & 0xF8) >> 3));
+    }
+
+    static inline void UnpackRGB565(u16 p, u8 &r, u8 &g, u8 &b)
+    {
+        r = (u8)((p >> 8) & 0xF8); r |= (u8)(r >> 5);
+        g = (u8)((p >> 3) & 0xFC); g |= (u8)(g >> 6);
+        b = (u8)((p << 3) & 0xF8); b |= (u8)(b >> 5);
+    }
 
     static void OCR_FreePopupBuffer(void)
     {
@@ -139,6 +405,21 @@ namespace CTRPluginFramework
         s_botBuffer.Free();
         s_popupBuffer.Free();
         s_kanjiTallBuffer.Free();
+    }
+
+    struct AutoFreeSessionBuffer {
+        SessionBuffer &sb;
+        ~AutoFreeSessionBuffer() { sb.Free(); }
+    };
+
+    static __attribute__((noinline)) bool HeapCanFit(size_t bytes)
+    {
+        if (bytes == 0) return true;
+        void * volatile p = malloc(bytes);
+        if (!p) return false;
+        *(volatile uint8_t *)p = 0;
+        free((void *)p);
+        return true;
     }
 
     // Parse host and port from "ip:port" or "ip" string
@@ -230,8 +511,227 @@ namespace CTRPluginFramework
         return false;
     }
 
+    static std::string s_ankiUser;
+    static std::string s_ankiPass;
+    static int s_activeSessionSock = -1;
+    static sha256_stream_t *s_activeSessionTx = nullptr;
+
+    // Forward declaration (send_encrypted_frame is defined later in this file)
+    static int send_encrypted_frame(int sock, sha256_stream_t *tx, const void *buf, size_t len);
+
+    static std::string TrimWhitespace(const std::string &s)
+    {
+        size_t first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return "";
+        size_t last = s.find_last_not_of(" \t\r\n");
+        return s.substr(first, last - first + 1);
+    }
+
+    static void WipeStringBuffer(std::string &s)
+    {
+        if (!s.empty()) {
+            crypto_wipe(&s[0], s.size());
+            s.clear();
+        }
+    }
+
+    static void OCR_LoadAnkiCredentials(void)
+    {
+        WipeStringBuffer(s_ankiPass);
+        s_ankiUser.clear();
+
+        char buf[640];
+        memset(buf, 0, sizeof(buf));
+        File file;
+        if (File::Open(file, OCR_ANKI_SD_PATH, File::READ) == File::SUCCESS) {
+            u64 size = file.GetSize();
+            if (size > 0 && size < sizeof(buf)) {
+                file.Read(buf, (u32)size);
+            }
+            file.Close();
+        } else {
+            FILE *fp = fopen(OCR_ANKI_SD_PATH, "r");
+            if (fp) {
+                fread(buf, 1, sizeof(buf) - 1, fp);
+                fclose(fp);
+            }
+        }
+
+        if (buf[0] != '\0') {
+            std::string content(buf);
+            size_t start = 0;
+            while (start < content.length()) {
+                size_t end = content.find_first_of("\r\n", start);
+                if (end == std::string::npos) end = content.length();
+                std::string line = content.substr(start, end - start);
+                start = end + 1;
+
+                if (line.compare(0, 5, "user=") == 0) {
+                    s_ankiUser = TrimWhitespace(line.substr(5));
+                    if (s_ankiUser.size() > OCR_ANKI_MAX_LEN) {
+                        s_ankiUser.resize(OCR_ANKI_MAX_LEN);
+                    }
+                } else if (line.compare(0, 5, "pass=") == 0) {
+                    std::string p = line.substr(5);
+                    while (!p.empty() && (p.back() == '\r' || p.back() == '\n')) {
+                        p.pop_back();
+                    }
+                    if (p.size() > OCR_ANKI_MAX_LEN) {
+                        p.resize(OCR_ANKI_MAX_LEN);
+                    }
+                    s_ankiPass = p;
+                    WipeStringBuffer(p);
+                }
+            }
+            WipeStringBuffer(content);
+        }
+        crypto_wipe(buf, sizeof(buf));
+        if (s_ankiUser.empty() || s_ankiPass.empty()) {
+            WipeStringBuffer(s_ankiPass);
+            s_ankiUser.clear();
+        }
+    }
+
+    static bool OCR_SendAnkiCredentials(int sock, sha256_stream_t *tx)
+    {
+        if (sock < 0 || tx == nullptr) return false;
+        if (!s_ankiUser.empty() && !s_ankiPass.empty()) {
+            size_t uLen = std::min<size_t>(s_ankiUser.size(), OCR_ANKI_MAX_LEN);
+            size_t pLen = std::min<size_t>(s_ankiPass.size(), OCR_ANKI_MAX_LEN);
+            uint8_t hdr[5] = {
+                CMD_SET_ANKI_CREDS,
+                (uint8_t)((uLen >> 8) & 0xFF),
+                (uint8_t)(uLen & 0xFF),
+                (uint8_t)((pLen >> 8) & 0xFF),
+                (uint8_t)(pLen & 0xFF)
+            };
+            if (send_encrypted_frame(sock, tx, hdr, sizeof(hdr)) < 0) {
+                return false;
+            }
+            uint8_t payload[OCR_ANKI_MAX_LEN * 2];
+            memcpy(payload, s_ankiUser.data(), uLen);
+            memcpy(payload + uLen, s_ankiPass.data(), pLen);
+            int res = send_encrypted_frame(sock, tx, payload, uLen + pLen);
+            crypto_wipe(payload, sizeof(payload));
+            return res >= 0;
+        } else {
+            uint8_t hdr[5] = { CMD_SET_ANKI_CREDS, 0, 0, 0, 0 };
+            return send_encrypted_frame(sock, tx, hdr, sizeof(hdr)) >= 0;
+        }
+    }
+
+    static bool OCR_SaveAnkiCredentials(const std::string &user, const std::string &pass)
+    {
+        WipeStringBuffer(s_ankiPass);
+        s_ankiUser = user;
+        s_ankiPass = pass;
+
+        bool ok = false;
+        if (s_ankiUser.empty() || s_ankiPass.empty()) {
+            WipeStringBuffer(s_ankiPass);
+            s_ankiUser.clear();
+            if (File::Remove(OCR_ANKI_SD_PATH) == File::SUCCESS) {
+                ok = true;
+            } else {
+                FILE *fp = fopen(OCR_ANKI_SD_PATH, "w");
+                if (fp) {
+                    fclose(fp);
+                    ok = true;
+                }
+            }
+        } else {
+            std::string cfg = "user=" + s_ankiUser + "\npass=" + s_ankiPass + "\n";
+            File file;
+            if (File::Open(file, OCR_ANKI_SD_PATH, File::WRITE | File::CREATE | File::TRUNCATE) == File::SUCCESS) {
+                file.Write(cfg.c_str(), cfg.length());
+                file.Close();
+                ok = true;
+            } else {
+                FILE *fp = fopen(OCR_ANKI_SD_PATH, "w");
+                if (fp) {
+                    fputs(cfg.c_str(), fp);
+                    fclose(fp);
+                    ok = true;
+                }
+            }
+            WipeStringBuffer(cfg);
+        }
+
+        if (s_activeSessionSock >= 0 && s_activeSessionTx != nullptr) {
+            OCR_SendAnkiCredentials(s_activeSessionSock, s_activeSessionTx);
+        }
+        return ok;
+    }
+
+    std::string OCR_GetAnkiCredentialsLabel(void)
+    {
+        if (s_ankiUser.empty() || s_ankiPass.empty()) {
+            return "Server Default";
+        }
+        if (s_ankiUser.size() > 24) {
+            return s_ankiUser.substr(0, 21) + "...";
+        }
+        return s_ankiUser;
+    }
+
+    bool OCR_OpenAnkiCredentialsDialog(void)
+    {
+        std::string statusLine = (!s_ankiUser.empty() && !s_ankiPass.empty())
+            ? ("Current: " + s_ankiUser)
+            : "Current: Server Default";
+        std::vector<std::string> opts = {
+            "Set AnkiWeb Login",
+            "Clear (Use Server Default)",
+            "Cancel"
+        };
+        Keyboard menuKbd("AnkiWeb Account Settings\n" + statusLine, opts);
+        menuKbd.CanAbort(true);
+        int choice = menuKbd.Open();
+        if (choice == 0) {
+            std::string newUser = s_ankiUser;
+            Keyboard userKbd("Enter AnkiWeb Email / Username:");
+            userKbd.CanAbort(true);
+            userKbd.SetMaxLength(OCR_ANKI_MAX_LEN);
+            if (userKbd.Open(newUser, s_ankiUser) < 0) {
+                return false;
+            }
+            newUser = TrimWhitespace(newUser);
+            if (newUser.empty()) {
+                OSD::Notify("AnkiWeb username cannot be empty!", Color::Red);
+                return false;
+            }
+
+            std::string newPass;
+            Keyboard passKbd("Enter AnkiWeb Password for:\n" + newUser);
+            passKbd.CanAbort(true);
+            passKbd.SetMaxLength(OCR_ANKI_MAX_LEN);
+            if (passKbd.Open(newPass, "") < 0) {
+                WipeStringBuffer(newPass);
+                return false;
+            }
+            if (newPass.empty()) {
+                WipeStringBuffer(newPass);
+                OSD::Notify("AnkiWeb password cannot be empty!", Color::Red);
+                return false;
+            }
+
+            bool live = (s_activeSessionSock >= 0 && s_activeSessionTx != nullptr);
+            OCR_SaveAnkiCredentials(newUser, newPass);
+            WipeStringBuffer(newPass);
+            OSD::Notify(live ? "AnkiWeb login updated for session!" : "AnkiWeb login saved!", Color::Green);
+            return true;
+        } else if (choice == 1) {
+            bool live = (s_activeSessionSock >= 0 && s_activeSessionTx != nullptr);
+            OCR_SaveAnkiCredentials("", "");
+            OSD::Notify(live ? "Session reset to server default Anki!" : "AnkiWeb login cleared (server default)", Color::Yellow);
+            return true;
+        }
+        return false;
+    }
+
     OcrKeyBindings g_ocrKeys = {
         Key::R | Key::Start | Key::Select, // activation
+        Key::Start | Key::Select | Key::L, // slimMenu
         Key::A,                            // lookup
         Key::Select,                       // modeToggle
         Key::Y,                            // switchScreen
@@ -290,6 +790,7 @@ namespace CTRPluginFramework
                     }
                 };
                 parseVal("activation=", g_ocrKeys.activation);
+                parseVal("slimMenu=", g_ocrKeys.slimMenu);
                 parseVal("lookup=", g_ocrKeys.lookup);
                 parseVal("modeToggle=", g_ocrKeys.modeToggle);
                 parseVal("switchScreen=", g_ocrKeys.switchScreen);
@@ -308,6 +809,7 @@ namespace CTRPluginFramework
         char buf[512];
         snprintf(buf, sizeof(buf),
             "activation=0x%08lX\n"
+            "slimMenu=0x%08lX\n"
             "lookup=0x%08lX\n"
             "modeToggle=0x%08lX\n"
             "switchScreen=0x%08lX\n"
@@ -318,6 +820,7 @@ namespace CTRPluginFramework
             "prevOcr=0x%08lX\n"
             "nextOcr=0x%08lX\n",
             (unsigned long)g_ocrKeys.activation,
+            (unsigned long)g_ocrKeys.slimMenu,
             (unsigned long)g_ocrKeys.lookup,
             (unsigned long)g_ocrKeys.modeToggle,
             (unsigned long)g_ocrKeys.switchScreen,
@@ -344,6 +847,7 @@ namespace CTRPluginFramework
     void OCR_ResetKeyBindings(void)
     {
         g_ocrKeys.activation   = Key::R | Key::Start | Key::Select;
+        g_ocrKeys.slimMenu     = Key::Start | Key::Select | Key::L;
         g_ocrKeys.lookup       = Key::A;
         g_ocrKeys.modeToggle   = Key::Select;
         g_ocrKeys.switchScreen = Key::Y;
@@ -494,24 +998,49 @@ namespace CTRPluginFramework
 
         // Defer NDMU/AC locking until the game finishes nnMain boot and begins rendering frames
         OCR_LoadConfig();
+        OCR_LoadAnkiCredentials();
         OCR_InitKeyBindings();
+    }
+
+    static bool OCR_CloseSocLocked(bool allowBorrowed)
+    {
+        if (!s_socInitialized)
+            return false;
+
+        if (s_socBorrowed) {
+            if (!allowBorrowed)
+                return false;
+            if (FindDevice("soc:") >= 0) {
+                RemoveDevice("soc:");
+            }
+            SOCU_handle = 0;
+            s_socBorrowed = false;
+            s_socInitialized = false;
+            return true;
+        }
+
+        socExit();
+        if (s_socAliasAddr) {
+            svcUnmapProcessMemoryEx(CUR_PROCESS_HANDLE, s_socAliasAddr, s_socBufferSize);
+            s_socAliasAddr = 0;
+        }
+        if (s_socBufferAddr) {
+            if (s_socBufferIsHeap) {
+                free((void *)s_socBufferAddr);
+            } else {
+                svcControlMemoryUnsafe(nullptr, s_socBufferAddr, s_socBufferSize, MEMOP_FREE, (MemPerm)0);
+            }
+            s_socBufferAddr = 0;
+            s_socBufferSize = 0;
+            s_socBufferIsHeap = false;
+        }
+        s_socInitialized = false;
+        return true;
     }
 
     void OCR_Cleanup(void)
     {
-        if (s_socInitialized) {
-            socExit();
-            if (s_socBufferAddr) {
-                if (s_socBufferIsHeap) {
-                    free((void *)s_socBufferAddr);
-                } else {
-                    svcControlMemoryUnsafe(nullptr, s_socBufferAddr, SOC_BUFFER_SIZE, MEMOP_FREE, (MemPerm)0);
-                }
-                s_socBufferAddr = 0;
-                s_socBufferIsHeap = false;
-            }
-            s_socInitialized = false;
-        }
+        OCR_CloseSocLocked(true);
         if (s_ndmuInitialized) {
             NDMU_UnlockState();
             NDMU_LeaveExclusiveState();
@@ -523,6 +1052,8 @@ namespace CTRPluginFramework
             s_acInitialized = false;
         }
         s_networkLocked = false;
+        WipeStringBuffer(s_ankiPass);
+        s_ankiUser.clear();
         OCR_FreeSessionBuffers();
         OCR_ExitCStick();
     }
@@ -623,6 +1154,47 @@ namespace CTRPluginFramework
         return res;
     }
 
+    static int send_encrypted_rgb565_as_rgb24(int sock, sha256_stream_t *tx, const u16 *rgb565, size_t numPixels)
+    {
+        uint8_t chunk[170 * 3]; // 510 bytes per chunk (170 RGB24 pixels)
+        uint8_t aad[9];
+        uint8_t full_mac[32];
+        hmac_sha256_ctx_t hctx;
+
+        aad[0] = tx->dir;
+        store_be64(&aad[1], tx->seq++);
+
+        hmac_sha256_init(&hctx, tx->mac_key, 32);
+        hmac_sha256_update(&hctx, aad, sizeof(aad));
+
+        size_t offset = 0;
+        while (offset < numPixels) {
+            size_t count = (numPixels - offset > 170) ? 170 : (numPixels - offset);
+            for (size_t i = 0; i < count; ++i) {
+                u8 r, g, b;
+                UnpackRGB565(rgb565[offset + i], r, g, b);
+                chunk[i * 3 + 0] = r;
+                chunk[i * 3 + 1] = g;
+                chunk[i * 3 + 2] = b;
+            }
+            size_t n = count * 3;
+            sha256_stream_xor(tx, chunk, n);
+            hmac_sha256_update(&hctx, chunk, n);
+            if (send_all(sock, chunk, n) < 0) {
+                crypto_wipe(chunk, sizeof(chunk));
+                crypto_wipe(&hctx, sizeof(hctx));
+                return -1;
+            }
+            offset += count;
+        }
+
+        hmac_sha256_final(&hctx, full_mac);
+        int res = send_all(sock, full_mac, STREAM_MAC_SIZE);
+        crypto_wipe(chunk, sizeof(chunk));
+        crypto_wipe(full_mac, sizeof(full_mac));
+        return res;
+    }
+
     static int recv_encrypted_frame(int sock, sha256_stream_t *rx, uint8_t *buf, size_t len)
     {
         uint8_t recv_mac[STREAM_MAC_SIZE];
@@ -650,6 +1222,84 @@ namespace CTRPluginFramework
         sha256_stream_xor(rx, buf, len);
         crypto_wipe(calc_mac, sizeof(calc_mac));
         return 0;
+    }
+
+    static bool DrainEncryptedPayload(int sock, sha256_stream_t *rx, uint32_t payloadSize)
+    {
+        uint8_t recv_mac[STREAM_MAC_SIZE];
+        uint8_t calc_mac[32];
+        uint8_t aad[9];
+        uint8_t drainBuf[4096];
+        hmac_sha256_ctx_t hctx;
+
+        aad[0] = rx->dir;
+        store_be64(&aad[1], rx->seq++);
+
+        hmac_sha256_init(&hctx, rx->mac_key, 32);
+        hmac_sha256_update(&hctx, aad, sizeof(aad));
+
+        uint32_t rem = payloadSize;
+        while (rem > 0) {
+            uint32_t chunk = (rem < (uint32_t)sizeof(drainBuf)) ? rem : (uint32_t)sizeof(drainBuf);
+            if (recv_all(sock, drainBuf, chunk) < 0) return false;
+            hmac_sha256_update(&hctx, drainBuf, chunk);
+            sha256_stream_xor(rx, drainBuf, chunk);
+            rem -= chunk;
+        }
+        if (recv_all(sock, recv_mac, STREAM_MAC_SIZE) < 0) return false;
+        hmac_sha256_final(&hctx, calc_mac);
+
+        bool ok = (crypto_verify_16(recv_mac, calc_mac) == 0);
+        crypto_wipe(calc_mac, sizeof(calc_mac));
+        return ok;
+    }
+
+    static bool recv_encrypted_kanji_as_rgb565(int sock, sha256_stream_t *rx, u16 *out565, size_t numPixels, u16 &outContentH)
+    {
+        uint8_t recv_mac[STREAM_MAC_SIZE];
+        uint8_t calc_mac[32];
+        uint8_t aad[9];
+        uint8_t chunk[170 * 3]; // 510 bytes per chunk (170 RGB24 pixels)
+        uint8_t tail[2];
+        hmac_sha256_ctx_t hctx;
+
+        aad[0] = rx->dir;
+        store_be64(&aad[1], rx->seq++);
+
+        hmac_sha256_init(&hctx, rx->mac_key, 32);
+        hmac_sha256_update(&hctx, aad, sizeof(aad));
+
+        size_t offset = 0;
+        while (offset < numPixels) {
+            size_t count = (numPixels - offset > 170) ? 170 : (numPixels - offset);
+            size_t n = count * 3;
+            if (recv_all(sock, chunk, n) < 0) {
+                crypto_wipe(chunk, sizeof(chunk));
+                crypto_wipe(&hctx, sizeof(hctx));
+                return false;
+            }
+            hmac_sha256_update(&hctx, chunk, n);
+            sha256_stream_xor(rx, chunk, n);
+            for (size_t i = 0; i < count; ++i) {
+                out565[offset + i] = PackRGB565(Color(chunk[i * 3 + 0], chunk[i * 3 + 1], chunk[i * 3 + 2]));
+            }
+            offset += count;
+        }
+
+        if (recv_all(sock, tail, 2) < 0 || recv_all(sock, recv_mac, STREAM_MAC_SIZE) < 0) {
+            crypto_wipe(chunk, sizeof(chunk));
+            crypto_wipe(&hctx, sizeof(hctx));
+            return false;
+        }
+        hmac_sha256_update(&hctx, tail, 2);
+        sha256_stream_xor(rx, tail, 2);
+        outContentH = ((u16)tail[0] << 8) | (u16)tail[1];
+
+        hmac_sha256_final(&hctx, calc_mac);
+        bool ok = (crypto_verify_16(recv_mac, calc_mac) == 0);
+        crypto_wipe(chunk, sizeof(chunk));
+        crypto_wipe(calc_mac, sizeof(calc_mac));
+        return ok;
     }
 
     static bool OCR_GenerateEphemeralSecret(uint8_t out_secret[32])
@@ -723,7 +1373,10 @@ namespace CTRPluginFramework
                         socklen_t len = sizeof(sockErr);
                         getsockopt(sock, SOL_SOCKET, SO_ERROR, &sockErr, &len);
                         out_err = (sockErr != 0) ? (sockErr < 0 ? -sockErr : sockErr) : ECONNREFUSED;
-                        closesocket(sock);
+                        s_activeSessionSock = -1;
+        s_activeSessionTx = nullptr;
+
+        closesocket(sock);
                         return -1;
                     }
                     if (pfd.revents & POLLOUT) {
@@ -733,28 +1386,43 @@ namespace CTRPluginFramework
                             // On Nintendo 3DS, sockErr retains raw -26 (SOC EINPROGRESS) upon connect completion
                             if (sockErr != 0 && sockErr != -26 && sockErr != EINPROGRESS) {
                                 out_err = (sockErr < 0) ? -sockErr : sockErr;
-                                closesocket(sock);
+                                s_activeSessionSock = -1;
+        s_activeSessionTx = nullptr;
+
+        closesocket(sock);
                                 return -1;
                             }
                         }
                         // Connection established!
                     } else {
                         out_err = ETIMEDOUT;
-                        closesocket(sock);
+                        s_activeSessionSock = -1;
+        s_activeSessionTx = nullptr;
+
+        closesocket(sock);
                         return -1;
                     }
                 } else if (pollRes == 0) {
                     out_err = ETIMEDOUT;
-                    closesocket(sock);
+                    s_activeSessionSock = -1;
+        s_activeSessionTx = nullptr;
+
+        closesocket(sock);
                     return -1;
                 } else {
                     out_err = errno;
-                    closesocket(sock);
+                    s_activeSessionSock = -1;
+        s_activeSessionTx = nullptr;
+
+        closesocket(sock);
                     return -1;
                 }
             } else {
                 out_err = errno;
-                closesocket(sock);
+                s_activeSessionSock = -1;
+        s_activeSessionTx = nullptr;
+
+        closesocket(sock);
                 return -1;
             }
         }
@@ -816,80 +1484,143 @@ namespace CTRPluginFramework
         }
 
         // 3. If soc was initialized but interface dropped, reinitialize
-        if (s_socInitialized && (u32)gethostid() == 0) {
-            socExit();
-            if (s_socBufferAddr) {
-                if (s_socBufferIsHeap) {
-                    free((void *)s_socBufferAddr);
-                } else {
-                    svcControlMemoryUnsafe(nullptr, s_socBufferAddr, SOC_BUFFER_SIZE, MEMOP_FREE, (MemPerm)0);
-                }
-                s_socBufferAddr = 0;
-                s_socBufferIsHeap = false;
-            }
-            s_socInitialized = false;
+        if (s_socInitialized && !s_socBorrowed && (u32)gethostid() == 0) {
+            OCR_CloseSocLocked(false);
         }
 
         if (!s_socInitialized) {
             u32 outAddr = 0;
             Result memRes = 0;
             Result socRes = 0;
+            Result mapRes = 0;
+            Result baseRes = 0;
+            HostSocSearchDiag socDiag;
+            int addDevRes = -99;
 
-            // Strategy 1: Allocate in APP memory at 0x07200000 (directly above the 2MiB Mode 3 plugin space)
-            outAddr = 0x07200000;
-            memRes = svcControlMemoryUnsafe(&outAddr, 0x07200000, SOC_BUFFER_SIZE,
-                (MemOp)(MEMOP_REGION_APP | MEMOP_ALLOC), (MemPerm)(MEMPERM_READ | MEMPERM_WRITE));
-            if (R_SUCCEEDED(memRes)) {
-                socRes = socInit((u32 *)0x07200000, SOC_BUFFER_SIZE);
-                if (R_SUCCEEDED(socRes)) {
-                    s_socBufferAddr = 0x07200000;
-                    s_socBufferIsHeap = false;
-                    s_socInitialized = true;
-                } else {
-                    svcControlMemoryUnsafe(nullptr, 0x07200000, SOC_BUFFER_SIZE, MEMOP_FREE, (MemPerm)0);
-                    outAddr = 0;
-                }
-            }
-
-            // Strategy 2: Try 0x074C0000 in SYSTEM memory (for non-extended games on New 3DS)
-            if (!s_socInitialized) {
-                outAddr = 0x074C0000;
-                memRes = svcControlMemoryUnsafe(&outAddr, 0x074C0000, SOC_BUFFER_SIZE,
-                    (MemOp)(MEMOP_REGION_SYSTEM | MEMOP_ALLOC), (MemPerm)(MEMPERM_READ | MEMPERM_WRITE));
-                if (R_SUCCEEDED(memRes)) {
-                    socRes = socInit((u32 *)0x074C0000, SOC_BUFFER_SIZE);
-                    if (R_SUCCEEDED(socRes)) {
-                        s_socBufferAddr = 0x074C0000;
-                        s_socBufferIsHeap = false;
+            auto tryBorrowHostSoc = [&]() {
+                if (s_socInitialized) return;
+                Handle hostSoc = OCR_FindHostSocuHandle(&socDiag);
+                if (hostSoc != 0) {
+                    SOCU_handle = hostSoc;
+                    int existingDev = FindDevice("soc:");
+                    addDevRes = (existingDev >= 0) ? existingDev : AddDevice(&s_borrowedSocDevoptab);
+                    if (addDevRes >= 0) {
+                        s_socBorrowed = true;
                         s_socInitialized = true;
                     } else {
-                        svcControlMemoryUnsafe(nullptr, 0x074C0000, SOC_BUFFER_SIZE, MEMOP_FREE, (MemPerm)0);
+                        SOCU_handle = 0;
+                    }
+                }
+            };
+
+            auto trySocControlMem = [&](u32 addr, MemOp region, u32 bufSize) {
+                if (addr == 0 || s_socInitialized || socRes == static_cast<Result>(0xC8A0700B))
+                    return;
+                outAddr = addr;
+                memRes = svcControlMemoryUnsafe(&outAddr, addr, bufSize,
+                    (MemOp)(region | MEMOP_ALLOC), (MemPerm)(MEMPERM_READ | MEMPERM_WRITE));
+                if (R_SUCCEEDED(memRes)) {
+                    socRes = socInit((u32 *)addr, bufSize);
+                    if (R_SUCCEEDED(socRes)) {
+                        s_socBufferAddr = addr;
+                        s_socAliasAddr = 0;
+                        s_socBufferSize = bufSize;
+                        s_socBufferIsHeap = false;
+                        s_socBorrowed = false;
+                        s_socInitialized = true;
+                    } else {
+                        svcControlMemoryUnsafe(nullptr, addr, bufSize, MEMOP_FREE, (MemPerm)0);
                         outAddr = 0;
+                        if (socRes == static_cast<Result>(0xC8A0700B))
+                            tryBorrowHostSoc();
+                    }
+                }
+            };
+
+            // Strategies 1-3: Outside plugin heap with standard 288 KB buffer
+            trySocControlMem(0x07200000, MEMOP_REGION_APP, SOC_BUFFER_SIZE);
+            trySocControlMem(0x074C0000, MEMOP_REGION_SYSTEM, SOC_BUFFER_SIZE);
+            trySocControlMem(0x074C0000, MEMOP_REGION_APP, SOC_BUFFER_SIZE);
+
+            // Smaller APP/SYSTEM buffer fallbacks (using free VA scan) for Mode 3 games
+            if (!s_socInitialized && socRes != static_cast<Result>(0xC8A0700B)) {
+                trySocControlMem(OCR_FindFreeVa(0x20000), MEMOP_REGION_APP, 0x20000);
+                trySocControlMem(OCR_FindFreeVa(0x20000), MEMOP_REGION_SYSTEM, 0x20000);
+                trySocControlMem(OCR_FindFreeVa(0x10000), MEMOP_REGION_APP, 0x10000);
+                trySocControlMem(OCR_FindFreeVa(0x10000), MEMOP_REGION_SYSTEM, 0x10000);
+            }
+
+            // Strategy 4: CTRPF plugin heap fallback via memalign + MAPEXFLAGS_PRIVATE alias
+            // (Plugin heap is MEMSTATE_SHARED, which svcCreateMemoryBlock rejects with 0xE0A01BF5;
+            // aliasing as MEMSTATE_PRIVATE via svcMapProcessMemoryEx satisfies socInit.)
+            if (!s_socInitialized && socRes != static_cast<Result>(0xC8A0700B)) {
+                const u32 heapCandidates[3] = { SOC_BUFFER_SIZE, 0x20000, 0x10000 };
+                for (int ci = 0; ci < 3 && !s_socInitialized && socRes != static_cast<Result>(0xC8A0700B); ++ci) {
+                    u32 sz = heapCandidates[ci];
+                    if (ci == 0 && !HeapCanFit(sz + 0x28000)) continue;
+                    if (ci == 1 && !HeapCanFit(sz + 0x18000)) continue;
+                    void *heapSocBuf = memalign(0x1000, sz);
+                    if (heapSocBuf) {
+                        u32 aliasVa = OCR_FindFreeVa(sz);
+                        if (aliasVa != 0) {
+                            mapRes = svcMapProcessMemoryEx(CUR_PROCESS_HANDLE, aliasVa, CUR_PROCESS_HANDLE, (u32)heapSocBuf, sz, MAPEXFLAGS_PRIVATE);
+                        }
+                        if (aliasVa != 0 && R_SUCCEEDED(mapRes)) {
+                            socRes = socInit((u32 *)aliasVa, sz);
+                            if (R_SUCCEEDED(socRes)) {
+                                s_socBufferAddr = (u32)heapSocBuf;
+                                s_socAliasAddr = aliasVa;
+                                s_socBufferSize = sz;
+                                s_socBufferIsHeap = true;
+                                s_socBorrowed = false;
+                                s_socInitialized = true;
+                            } else {
+                                svcUnmapProcessMemoryEx(CUR_PROCESS_HANDLE, aliasVa, sz);
+                                free(heapSocBuf);
+                                if (socRes == static_cast<Result>(0xC8A0700B))
+                                    tryBorrowHostSoc();
+                            }
+                        } else {
+                            socRes = socInit((u32 *)heapSocBuf, sz);
+                            if (R_SUCCEEDED(socRes)) {
+                                s_socBufferAddr = (u32)heapSocBuf;
+                                s_socAliasAddr = 0;
+                                s_socBufferSize = sz;
+                                s_socBufferIsHeap = true;
+                                s_socBorrowed = false;
+                                s_socInitialized = true;
+                            } else {
+                                free(heapSocBuf);
+                                if (socRes == static_cast<Result>(0xC8A0700B))
+                                    tryBorrowHostSoc();
+                            }
+                        }
                     }
                 }
             }
 
-            // Strategy 3: Try 0x074C0000 in APP memory
-            if (!s_socInitialized) {
-                outAddr = 0x074C0000;
-                memRes = svcControlMemoryUnsafe(&outAddr, 0x074C0000, SOC_BUFFER_SIZE,
-                    (MemOp)(MEMOP_REGION_APP | MEMOP_ALLOC), (MemPerm)(MEMPERM_READ | MEMPERM_WRITE));
-                if (R_SUCCEEDED(memRes)) {
-                    socRes = socInit((u32 *)0x074C0000, SOC_BUFFER_SIZE);
-                    if (R_SUCCEEDED(socRes)) {
-                        s_socBufferAddr = 0x074C0000;
-                        s_socBufferIsHeap = false;
-                        s_socInitialized = true;
-                    } else {
-                        svcControlMemoryUnsafe(nullptr, 0x074C0000, SOC_BUFFER_SIZE, MEMOP_FREE, (MemPerm)0);
-                        outAddr = 0;
-                    }
+            // Strategy 5: MEMOP_REGION_BASE fallback
+            if (!s_socInitialized && socRes != static_cast<Result>(0xC8A0700B)) {
+                const u32 baseCandidates[3] = { SOC_BUFFER_SIZE, 0x20000, 0x10000 };
+                for (int bi = 0; bi < 3 && !s_socInitialized && socRes != static_cast<Result>(0xC8A0700B); ++bi) {
+                    u32 sz = baseCandidates[bi];
+                    trySocControlMem(OCR_FindFreeVa(sz), MEMOP_REGION_BASE, sz);
+                    baseRes = memRes;
                 }
             }
 
+            // Strategy 6: Last-resort fallback: borrow host game's soc:u handle if it already owns soc:u
             if (!s_socInitialized) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "socInit failed: 0x%08lX (mem: 0x%08lX)\n", (unsigned long)socRes, (unsigned long)memRes);
+                tryBorrowHostSoc();
+            }
+
+            if (!s_socInitialized) {
+                char buf[160];
+                snprintf(buf, sizeof(buf),
+                    "socInit failed: 0x%08lX (mem: 0x%08lX)\nmap=0x%08lX base=0x%08lX\nhost=0x%lX h=%lu r=%d dev=%d\n",
+                    (unsigned long)socRes, (unsigned long)memRes,
+                    (unsigned long)mapRes, (unsigned long)baseRes,
+                    (unsigned long)socDiag.handle, (unsigned long)socDiag.hits00010044, socDiag.roHits, addDevRes);
                 diag += buf;
                 return false;
             }
@@ -1079,6 +1810,9 @@ namespace CTRPluginFramework
         bool ok = OCR_PerformHandshake(sock, &tx, &rx);
         u64 elapsedMs = (svcGetSystemTick() - handshakeStart) / 268123ULL;
 
+        s_activeSessionSock = -1;
+        s_activeSessionTx = nullptr;
+
         closesocket(sock);
         crypto_wipe(&tx, sizeof(tx));
         crypto_wipe(&rx, sizeof(rx));
@@ -1093,23 +1827,20 @@ namespace CTRPluginFramework
         return true;
     }
 
-    // Capture screen pixels safely via Screen::ReadPixel
-    static void CaptureScreen(const Screen &screen, u32 width, u32 height, u8 *out_rgb)
+    // Capture screen pixels safely via Screen::ReadPixel (stored as RGB565)
+    static void CaptureScreen(const Screen &screen, u32 width, u32 height, u16 *out_565)
     {
         for (u32 y = 0; y < height; ++y) {
             for (u32 x = 0; x < width; ++x) {
                 Color c;
                 screen.ReadPixel(x, y, c);
-                size_t idx = (y * width + x) * 3;
-                out_rgb[idx + 0] = c.r;
-                out_rgb[idx + 1] = c.g;
-                out_rgb[idx + 2] = c.b;
+                out_565[y * width + x] = PackRGB565(c);
             }
         }
     }
 
-    // Restore a rectangular region from saved pristine game framebuffer
-    static void RestoreRect(const Screen &screen, int rx, int ry, int rw, int rh, const u8 *screen_rgb, int screenW, int screenH)
+    // Restore a rectangular region from saved pristine game framebuffer (RGB565)
+    static void RestoreRect(const Screen &screen, int rx, int ry, int rw, int rh, const u16 *screen_565, int screenW, int screenH)
     {
         for (int dy = 0; dy < rh; ++dy) {
             int y = ry + dy;
@@ -1117,8 +1848,9 @@ namespace CTRPluginFramework
             for (int dx = 0; dx < rw; ++dx) {
                 int x = rx + dx;
                 if (x < 0 || x >= screenW) continue;
-                size_t idx = (y * screenW + x) * 3;
-                screen.DrawPixel(x, y, Color(screen_rgb[idx], screen_rgb[idx+1], screen_rgb[idx+2]));
+                u8 r, g, b;
+                UnpackRGB565(screen_565[y * screenW + x], r, g, b);
+                screen.DrawPixel(x, y, Color(r, g, b));
             }
         }
     }
@@ -1128,7 +1860,7 @@ namespace CTRPluginFramework
         int screenW = (screenId == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
         if (x < 0 || x >= screenW || y < 0 || y >= 240) return Color::Black;
 
-        if (hasKanji && kanjiTargetScreen == screenId && s_kanji_tall) {
+        if (hasKanji && kanjiTargetScreen == screenId && s_kanji_tall_565) {
             int xOffset = (screenId == SCREEN_ID_TOP) ? ((TOP_WIDTH - POPUP_WIDTH) / 2) : 0;
             if (x >= xOffset && x < xOffset + POPUP_WIDTH && y >= 0 && y < POPUP_HEIGHT) {
                 int px = x - xOffset;
@@ -1140,8 +1872,9 @@ namespace CTRPluginFramework
                 } else {
                     py = y + std::max(0, std::min(s_kanjiScrollY, s_kanjiMaxScrollY));
                 }
-                size_t idx = (py * POPUP_WIDTH + px) * 3;
-                return Color(s_kanji_tall[idx], s_kanji_tall[idx + 1], s_kanji_tall[idx + 2]);
+                u8 r, g, b;
+                UnpackRGB565(s_kanji_tall_565[py * POPUP_WIDTH + px], r, g, b);
+                return Color(r, g, b);
             }
         }
 
@@ -1155,10 +1888,11 @@ namespace CTRPluginFramework
             }
         }
 
-        const u8 *bg = (screenId == SCREEN_ID_TOP) ? s_top_rgb : s_bot_rgb;
+        const u16 *bg = (screenId == SCREEN_ID_TOP) ? s_top_565 : s_bot_565;
         if (!bg) return Color::Black;
-        size_t idx = (y * screenW + x) * 3;
-        return Color(bg[idx], bg[idx + 1], bg[idx + 2]);
+        u8 r, g, b;
+        UnpackRGB565(bg[y * screenW + x], r, g, b);
+        return Color(r, g, b);
     }
 
     static void RestorePixelUnder(int screenId, int x, int y, bool hasPopup, int popupTargetScreen, bool hasKanji = false, int kanjiTargetScreen = 0)
@@ -1289,7 +2023,7 @@ namespace CTRPluginFramework
     //   - Screen y=32..215: scrollable content (from tall canvas y = y + scrollY)
     //   - Screen y=216..239: pinned footer (from tall canvas y=376..399)
     //   - Outer border (2px light-blue) + header/footer divider lines overlaid
-    static void DrawKanjiCrop(int targetScreenId, const u8 *tallRgb, int scrollY)
+    static void DrawKanjiCrop(int targetScreenId, const u16 *tall565, int scrollY)
     {
         static const int HEADER_HEIGHT   = 32;                     // pinned header rows
         static const int FOOTER_SCREEN_Y = 216;                    // screen y where footer starts
@@ -1302,8 +2036,9 @@ namespace CTRPluginFramework
         // 1. Pinned header (screen y = 0..31, source: tall y = 0..31)
         for (int y = 0; y < HEADER_HEIGHT; ++y) {
             for (int x = 0; x < POPUP_WIDTH; ++x) {
-                size_t idx = (y * POPUP_WIDTH + x) * 3;
-                screen.DrawPixel(x + xOffset, y, Color(tallRgb[idx], tallRgb[idx+1], tallRgb[idx+2]));
+                u8 r, g, b;
+                UnpackRGB565(tall565[y * POPUP_WIDTH + x], r, g, b);
+                screen.DrawPixel(x + xOffset, y, Color(r, g, b));
             }
         }
 
@@ -1311,8 +2046,9 @@ namespace CTRPluginFramework
         for (int y = HEADER_HEIGHT; y < FOOTER_SCREEN_Y; ++y) {
             int tallY = y + scrollY;
             for (int x = 0; x < POPUP_WIDTH; ++x) {
-                size_t idx = (tallY * POPUP_WIDTH + x) * 3;
-                screen.DrawPixel(x + xOffset, y, Color(tallRgb[idx], tallRgb[idx+1], tallRgb[idx+2]));
+                u8 r, g, b;
+                UnpackRGB565(tall565[tallY * POPUP_WIDTH + x], r, g, b);
+                screen.DrawPixel(x + xOffset, y, Color(r, g, b));
             }
         }
 
@@ -1320,8 +2056,9 @@ namespace CTRPluginFramework
         for (int y = FOOTER_SCREEN_Y; y < POPUP_HEIGHT; ++y) {
             int tallY = FOOTER_TALL_Y + (y - FOOTER_SCREEN_Y);
             for (int x = 0; x < POPUP_WIDTH; ++x) {
-                size_t idx = (tallY * POPUP_WIDTH + x) * 3;
-                screen.DrawPixel(x + xOffset, y, Color(tallRgb[idx], tallRgb[idx+1], tallRgb[idx+2]));
+                u8 r, g, b;
+                UnpackRGB565(tall565[tallY * POPUP_WIDTH + x], r, g, b);
+                screen.DrawPixel(x + xOffset, y, Color(r, g, b));
             }
         }
 
@@ -1378,10 +2115,10 @@ namespace CTRPluginFramework
         std::string pos;
         bool found{false};
         bool ocrDisagreement{false};
+        int16_t contextIdx{-1};
         std::string ocrBadge;
         std::string rankJlpt;
         std::vector<std::string> wrappedLines;
-        std::vector<uint32_t> posCodepoints;
     };
 
     struct PopupVariant {
@@ -1549,6 +2286,7 @@ namespace CTRPluginFramework
     {
         uint16_t count = 0;
         if (!ReadU16(buf, len, off, count)) return false;
+        if (count > 4096 || !HeapCanFit((size_t)count * 48 + 49152)) return false;
         for (uint16_t i = 0; i < count; ++i) {
             uint32_t cp = 0;
             uint8_t fid = 0, gw = 0, gh = 0, adv = 0;
@@ -1591,7 +2329,7 @@ namespace CTRPluginFramework
         if (hasCtxIdx) {
             uint16_t cIdx = 0;
             if (!ReadU16(buf, len, off, cIdx)) return false;
-            if (contexts && cIdx < contexts->size()) e.contextText = (*contexts)[cIdx];
+            e.contextIdx = (contexts && cIdx < contexts->size()) ? (int16_t)cIdx : -1;
         } else {
             if (!ReadStrU16(buf, len, off, e.contextText)) return false;
         }
@@ -1607,7 +2345,6 @@ namespace CTRPluginFramework
         }
         e.found = (fFlag != 0);
         e.ocrDisagreement = (dFlag != 0);
-        e.posCodepoints = Utf8ToCodepoints(e.pos);
         e.wrappedLines.reserve(numLines);
         for (uint16_t li = 0; li < numLines; ++li) {
             std::string ln;
@@ -1660,26 +2397,36 @@ namespace CTRPluginFramework
         return true;
     }
 
-    static bool ParseScreenBundle(const uint8_t *buf, size_t len, ScreenBundle &out)
+    static bool ParseScreenBundle(SessionBuffer &rawSb, size_t len, ScreenBundle &out)
     {
+        if (!rawSb.ptr) return false;
+        const uint8_t *buf = rawSb.ptr;
         size_t off = 0;
         uint8_t compFlag = 0;
         uint32_t rawLen = 0;
         if (!ReadU8(buf, len, off, compFlag) || !ReadU32(buf, len, off, rawLen)) return false;
         if (rawLen == 0 || rawLen > 2 * 1024 * 1024) return false;
 
-        std::vector<uint8_t> decompressed;
+        SessionBuffer decompSb;
+        AutoFreeSessionBuffer decompGuard{decompSb};
         const uint8_t *raw = buf + off;
         size_t rLen = len - off;
         if (compFlag & 1) {
-            decompressed.resize(rawLen);
-            uLongf destLen = (uLongf)rawLen;
-            if (uncompress(decompressed.data(), &destLen, buf + off, (uLong)(len - off)) != Z_OK || destLen == 0) {
+            if (!decompSb.Alloc(0x07420000, rawLen, 0x073E0000)) {
                 return false;
             }
-            raw = decompressed.data();
+            uLongf destLen = (uLongf)rawLen;
+            if (uncompress(decompSb.ptr, &destLen, buf + off, (uLong)(len - off)) != Z_OK || destLen == 0) {
+                return false;
+            }
+            rawSb.Free();
+            raw = decompSb.ptr;
             rLen = (size_t)destLen;
         } else if (rLen < rawLen) {
+            return false;
+        }
+
+        if (!HeapCanFit(rLen + 98304)) {
             return false;
         }
 
@@ -1702,6 +2449,10 @@ namespace CTRPluginFramework
 
         uint16_t numEntries = 0;
         if (!ReadU16(raw, rLen, pOff, numEntries)) return false;
+        size_t remBytes = (pOff < rLen) ? (rLen - pOff) : 0;
+        if (numEntries > 4096 || !HeapCanFit((size_t)numEntries * sizeof(PopupEntry) + remBytes + 65536)) {
+            return false;
+        }
         b.entries.resize(numEntries);
         for (uint16_t i = 0; i < numEntries; ++i) {
             if (!ParseEntryFields(raw, rLen, pOff, b.entries[i], true, &b.contexts)) return false;
@@ -1848,6 +2599,64 @@ namespace CTRPluginFramework
         return CodepointsToUtf8(cps, 0, keep) + "…";
     }
 
+    struct PopupTitleLayout {
+        std::vector<std::string> lines;
+        int posY;
+        int divY;
+        int glossStartY;
+        int visibleGlossLines;
+    };
+
+    static void AppendWrappedGlyphSegment(const GlyphMap &glyphs, uint8_t fontId, const std::string &seg,
+                                          int maxPx, int maxLines, std::vector<std::string> &out)
+    {
+        if (seg.empty() || (int)out.size() >= maxLines) return;
+        std::vector<uint32_t> cps = Utf8ToCodepoints(seg);
+        size_t pos = 0;
+        while (pos < cps.size() && (int)out.size() < maxLines) {
+            if ((int)out.size() == maxLines - 1) {
+                std::string rem = CodepointsToUtf8(cps, pos, cps.size() - pos);
+                out.push_back(TruncateGlyphText(glyphs, fontId, rem, maxPx));
+                break;
+            }
+            int w = 0;
+            size_t end = pos;
+            while (end < cps.size()) {
+                auto it = glyphs.find(GlyphKey(fontId, cps[end]));
+                int adv = (it != glyphs.end()) ? (int)it->second.advanceX : ((cps[end] > 0x7E) ? ((fontId == 2) ? 18 : 12) : ((fontId == 2) ? 10 : 7));
+                if (w + adv > maxPx && end > pos) break;
+                w += adv;
+                end++;
+            }
+            if (end == pos) end = pos + 1;
+            out.push_back(CodepointsToUtf8(cps, pos, end - pos));
+            pos = end;
+        }
+    }
+
+    static PopupTitleLayout ComputePopupTitleLayout(const GlyphMap &glyphs, const PopupEntry &res,
+                                                    int maxPx = 295, int maxLines = 3)
+    {
+        PopupTitleLayout tl;
+        bool hasReading = (!res.reading.empty() && res.reading != res.headword);
+        std::string fullTitle = hasReading ? (res.headword + " 【" + res.reading + "】") : res.headword;
+        if (MeasureGlyphTextWidth(glyphs, 2, fullTitle) <= maxPx) {
+            tl.lines.push_back(fullTitle);
+        } else if (hasReading) {
+            AppendWrappedGlyphSegment(glyphs, 2, res.headword, maxPx, maxLines, tl.lines);
+            AppendWrappedGlyphSegment(glyphs, 2, "【" + res.reading + "】", maxPx, maxLines, tl.lines);
+        } else {
+            AppendWrappedGlyphSegment(glyphs, 2, res.headword, maxPx, maxLines, tl.lines);
+        }
+        if (tl.lines.empty()) tl.lines.push_back(res.headword);
+        int extraY = std::max(0, (int)tl.lines.size() - 1) * 22;
+        tl.posY = 64 + extraY;
+        tl.divY = 85 + extraY;
+        tl.glossStartY = 90 + extraY;
+        tl.visibleGlossLines = std::max(1, std::min(GLOSS_VISIBLE_LINES, (212 - tl.glossStartY + 3) / 17));
+        return tl;
+    }
+
     static void DrawGlyphText(const Screen &screen, int xOff, const GlyphMap &glyphs, uint8_t fontId,
                               const std::string &text, int startX, int startY, const Color &fg, const Color &bg, int maxRightX = 315)
     {
@@ -1907,7 +2716,7 @@ namespace CTRPluginFramework
                               const std::string &footerLookup, const std::string &footerMode, const std::string &footerAnki,
                               const std::string &statusBanner, uint8_t statusLevel,
                               size_t numVars, size_t eIdx, int totalEntries, const PopupEntry &res,
-                              int glossScrollY, int posScrollX)
+                              int glossScrollY, int posScrollX, const std::vector<std::string> *contexts = nullptr)
     {
         const Screen &screen = (targetScreenId == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
         int xOff = (targetScreenId == SCREEN_ID_TOP) ? ((TOP_WIDTH - POPUP_WIDTH) / 2) : 0;
@@ -1939,13 +2748,16 @@ namespace CTRPluginFramework
         }
 
         // Header label
+        const std::string &ctxStr = (res.contextIdx >= 0 && contexts && (size_t)res.contextIdx < contexts->size())
+                                    ? (*contexts)[(size_t)res.contextIdx]
+                                    : res.contextText;
         std::string surfInfo;
         if (res.headword == "Selection Translation") {
             surfInfo = "Selection: " + res.matchedSurface;
         } else if (!res.matchedSurface.empty() && res.matchedSurface != res.headword) {
             surfInfo = "Match: " + res.matchedSurface + " -> " + res.headword;
         } else {
-            surfInfo = "Text: " + res.contextText;
+            surfInfo = "Text: " + ctxStr;
         }
         std::string tagStr;
         if (res.headword == "Selection Translation") {
@@ -1958,36 +2770,36 @@ namespace CTRPluginFramework
         hdrText = TruncateGlyphText(glyphs, 0, hdrText, maxHdrW);
         DrawGlyphText(screen, xOff, glyphs, 0, hdrText, 8, 7, Color(185, 215, 255), bgHeader, badgeX - ocrBadgeW - 4);
 
-        // Title (headword + reading)
-        std::string titleStr = (!res.reading.empty() && res.reading != res.headword)
-                             ? (res.headword + " 【" + res.reading + "】")
-                             : res.headword;
-        titleStr = TruncateGlyphText(glyphs, 2, titleStr, 295);
-        DrawGlyphText(screen, xOff, glyphs, 2, titleStr, 12, 36, Color(255, 230, 115), bgBody, 312);
+        // Title (headword + reading) — wrap to lines below instead of truncating
+        PopupTitleLayout tl = ComputePopupTitleLayout(glyphs, res);
+        for (size_t i = 0; i < tl.lines.size(); ++i) {
+            DrawGlyphText(screen, xOff, glyphs, 2, tl.lines[i], 12, 36 + (int)i * 22, Color(255, 230, 115), bgBody, 312);
+        }
 
         // Grammar / POS horizontally scrollable line
-        int maxPosX = std::max(0, (int)res.posCodepoints.size() - POS_WINDOW_CHARS);
+        std::vector<uint32_t> posCps = Utf8ToCodepoints(res.pos);
+        int maxPosX = std::max(0, (int)posCps.size() - POS_WINDOW_CHARS);
         int posOff = std::max(0, std::min(posScrollX, maxPosX));
-        std::string posSlice = CodepointsToUtf8(res.posCodepoints, (size_t)posOff, POS_WINDOW_CHARS);
+        std::string posSlice = CodepointsToUtf8(posCps, (size_t)posOff, POS_WINDOW_CHARS);
         if (posOff > 0) {
-            DrawGlyphText(screen, xOff, glyphs, 1, "<", 4, 64, Color(255, 220, 110), bgBody, 16);
+            DrawGlyphText(screen, xOff, glyphs, 1, "<", 4, tl.posY, Color(255, 220, 110), bgBody, 16);
         }
         int posStartX = (posOff > 0) ? 14 : 12;
         int posMaxRight = (posOff < maxPosX) ? 300 : 312;
-        DrawGlyphText(screen, xOff, glyphs, 1, posSlice, posStartX, 64, Color(125, 210, 175), bgBody, posMaxRight);
+        DrawGlyphText(screen, xOff, glyphs, 1, posSlice, posStartX, tl.posY, Color(125, 210, 175), bgBody, posMaxRight);
         if (posOff < maxPosX) {
-            DrawGlyphText(screen, xOff, glyphs, 1, ">", 306, 64, Color(255, 220, 110), bgBody, 317);
+            DrawGlyphText(screen, xOff, glyphs, 1, ">", 306, tl.posY, Color(255, 220, 110), bgBody, 317);
         }
 
         // Divider line
-        screen.DrawRect(xOff + 12, 85, 296, 1, Color(55, 68, 95), true);
+        screen.DrawRect(xOff + 12, tl.divY, 296, 1, Color(55, 68, 95), true);
 
         // Vertically scrollable gloss lines
         int totalLines = (int)res.wrappedLines.size();
-        int maxGlossY = std::max(0, totalLines - GLOSS_VISIBLE_LINES);
+        int maxGlossY = std::max(0, totalLines - tl.visibleGlossLines);
         int gOff = std::max(0, std::min(glossScrollY, maxGlossY));
-        int visCount = std::min(GLOSS_VISIBLE_LINES, totalLines - gOff);
-        int yCur = 90;
+        int visCount = std::min(tl.visibleGlossLines, totalLines - gOff);
+        int yCur = tl.glossStartY;
         for (int i = 0; i < visCount; ++i) {
             const std::string &ln = res.wrappedLines[(size_t)(gOff + i)];
             Color lc(235, 240, 248);
@@ -2004,10 +2816,10 @@ namespace CTRPluginFramework
 
         // Scrollbar
         if (maxGlossY > 0) {
-            int trackTop = 90;
-            int trackH = 116;
+            int trackTop = tl.glossStartY;
+            int trackH = std::max(24, 206 - tl.glossStartY);
             screen.DrawRect(xOff + 311, trackTop, 4, trackH, Color(38, 46, 68), true);
-            int thumbH = std::max(14, (trackH * GLOSS_VISIBLE_LINES) / std::max(1, totalLines));
+            int thumbH = std::max(14, (trackH * tl.visibleGlossLines) / std::max(1, totalLines));
             int thumbY = trackTop + ((trackH - thumbH) * gOff) / maxGlossY;
             screen.DrawRect(xOff + 311, thumbY, 4, thumbH, Color(88, 166, 255), true);
         }
@@ -2052,7 +2864,7 @@ namespace CTRPluginFramework
                           sb.footerLookup, sb.footerMode, sb.footerAnki,
                           cached.statusBanner, cached.statusLevel,
                           sp.variants.size(), eIdx, (int)sv.entryIndices.size(), sb.entries[poolIdx],
-                          cached.glossScrollY, cached.posScrollX);
+                          cached.glossScrollY, cached.posScrollX, &sb.contexts);
         } else if (popupBundle.active && !popupBundle.variants.empty()) {
             size_t vIdx = std::min(popupBundle.curVariantIdx, popupBundle.variants.size() - 1);
             const PopupVariant &var = popupBundle.variants[vIdx];
@@ -2098,25 +2910,27 @@ namespace CTRPluginFramework
 
     static bool TryGetKanjiAtPopupCoord(int popX, int popY, const GlyphMap &glyphs,
                                         const PopupEntry &res, int glossScrollY, int posScrollX,
-                                        uint32_t &outKanji)
+                                        uint32_t &outKanji, const std::vector<std::string> *contexts = nullptr)
     {
-        // 1. Title (headword + reading) at y=36, fontId=2
-        std::string titleStr = (!res.reading.empty() && res.reading != res.headword)
-                             ? (res.headword + " 【" + res.reading + "】")
-                             : res.headword;
-        titleStr = TruncateGlyphText(glyphs, 2, titleStr, 295);
-        if (TryGetKanjiInText(glyphs, 2, titleStr, 12, 30, 28, popX, popY, outKanji, 312)) {
-            return true;
+        // 1. Title (headword + reading) starting at y=36, fontId=2
+        PopupTitleLayout tl = ComputePopupTitleLayout(glyphs, res);
+        for (size_t i = 0; i < tl.lines.size(); ++i) {
+            if (TryGetKanjiInText(glyphs, 2, tl.lines[i], 12, 34 + (int)i * 22, 22, popX, popY, outKanji, 312)) {
+                return true;
+            }
         }
 
         // 2. Header label at y=7, fontId=0
+        const std::string &ctxStr = (res.contextIdx >= 0 && contexts && (size_t)res.contextIdx < contexts->size())
+                                    ? (*contexts)[(size_t)res.contextIdx]
+                                    : res.contextText;
         std::string surfInfo;
         if (res.headword == "Selection Translation") {
             surfInfo = "Selection: " + res.matchedSurface;
         } else if (!res.matchedSurface.empty() && res.matchedSurface != res.headword) {
             surfInfo = "Match: " + res.matchedSurface + " -> " + res.headword;
         } else {
-            surfInfo = "Text: " + res.contextText;
+            surfInfo = "Text: " + ctxStr;
         }
         std::string tagStr;
         if (res.headword == "Selection Translation") {
@@ -2130,22 +2944,23 @@ namespace CTRPluginFramework
             return true;
         }
 
-        // 3. POS line at y=64, fontId=1
-        int maxPosX = std::max(0, (int)res.posCodepoints.size() - POS_WINDOW_CHARS);
+        // 3. POS line at tl.posY, fontId=1
+        std::vector<uint32_t> posCps = Utf8ToCodepoints(res.pos);
+        int maxPosX = std::max(0, (int)posCps.size() - POS_WINDOW_CHARS);
         int posOff = std::max(0, std::min(posScrollX, maxPosX));
-        std::string posSlice = CodepointsToUtf8(res.posCodepoints, (size_t)posOff, POS_WINDOW_CHARS);
+        std::string posSlice = CodepointsToUtf8(posCps, (size_t)posOff, POS_WINDOW_CHARS);
         int posStartX = (posOff > 0) ? 14 : 12;
         int posMaxRight = (posOff < maxPosX) ? 300 : 312;
-        if (TryGetKanjiInText(glyphs, 1, posSlice, posStartX, 60, 24, popX, popY, outKanji, posMaxRight)) {
+        if (TryGetKanjiInText(glyphs, 1, posSlice, posStartX, tl.posY - 4, 24, popX, popY, outKanji, posMaxRight)) {
             return true;
         }
 
-        // 4. Vertically scrollable gloss lines starting at y=90, fontId=1
+        // 4. Vertically scrollable gloss lines starting at tl.glossStartY, fontId=1
         int totalLines = (int)res.wrappedLines.size();
-        int maxGlossY = std::max(0, totalLines - GLOSS_VISIBLE_LINES);
+        int maxGlossY = std::max(0, totalLines - tl.visibleGlossLines);
         int gOff = std::max(0, std::min(glossScrollY, maxGlossY));
-        int visCount = std::min(GLOSS_VISIBLE_LINES, totalLines - gOff);
-        int yCur = 90;
+        int visCount = std::min(tl.visibleGlossLines, totalLines - gOff);
+        int yCur = tl.glossStartY;
         for (int i = 0; i < visCount; ++i) {
             const std::string &ln = res.wrappedLines[(size_t)(gOff + i)];
             if (TryGetKanjiInText(glyphs, 1, ln, 12, yCur - 2, 19, popX, popY, outKanji, 309)) {
@@ -2265,6 +3080,159 @@ namespace CTRPluginFramework
         }
     }
 
+    static int recv_encrypted_frame(int sock, sha256_stream_t *rx, void *buf, size_t len);
+    static int OCR_ConnectServer(std::string *out_diag);
+    static bool OCR_PerformHandshake(int sock, sha256_stream_t *tx, sha256_stream_t *rx);
+
+    static void OCR_GetDeviceIdentity(std::string &outId, std::string &outName, std::string &outModel)
+    {
+        outId.clear();
+        outName.clear();
+        outModel.clear();
+
+        if (R_SUCCEEDED(cfguInit())) {
+            u64 consoleHash = 0;
+            if (R_SUCCEEDED(CFGU_GenHashConsoleUnique(0x3D50C801, &consoleHash))) {
+                char idBuf[20];
+                snprintf(idBuf, sizeof(idBuf), "%016llX", (unsigned long long)consoleHash);
+                outId = idBuf;
+            }
+
+            u16 rawName[14];
+            memset(rawName, 0, sizeof(rawName));
+            if (R_SUCCEEDED(CFGU_GetConfigInfoBlk2(0x1C, 0x000A0000, rawName))) {
+                for (int i = 0; i < 10; ++i) {
+                    u16 ch = rawName[i];
+                    if (ch == 0) break;
+                    if (ch == '\r' || ch == '\n') continue;
+                    if (ch < 0x80) {
+                        outName.push_back((char)ch);
+                    } else if (ch < 0x800) {
+                        outName.push_back((char)(0xC0 | (ch >> 6)));
+                        outName.push_back((char)(0x80 | (ch & 0x3F)));
+                    } else {
+                        outName.push_back((char)(0xE0 | (ch >> 12)));
+                        outName.push_back((char)(0x80 | ((ch >> 6) & 0x3F)));
+                        outName.push_back((char)(0x80 | (ch & 0x3F)));
+                    }
+                }
+            }
+
+            u8 model = 0xFF;
+            if (R_SUCCEEDED(CFGU_GetSystemModel(&model))) {
+                switch (model) {
+                    case 0: outModel = "Old 3DS"; break;
+                    case 1: outModel = "Old 3DS XL"; break;
+                    case 2: outModel = "New 3DS"; break;
+                    case 3: outModel = "2DS"; break;
+                    case 4: outModel = "New 3DS XL"; break;
+                    case 5: outModel = "New 2DS XL"; break;
+                    default: outModel = "3DS"; break;
+                }
+            }
+            cfguExit();
+        }
+
+        if (outId.empty()) {
+            char idBuf[64];
+            memset(idBuf, 0, sizeof(idBuf));
+            File file;
+            if (File::Open(file, OCR_DEVICE_ID_SD_PATH, File::READ) == File::SUCCESS) {
+                u64 sz = file.GetSize();
+                if (sz > 0 && sz < sizeof(idBuf)) {
+                    file.Read(idBuf, (u32)sz);
+                }
+                file.Close();
+            } else {
+                FILE *fp = fopen(OCR_DEVICE_ID_SD_PATH, "r");
+                if (fp) {
+                    fread(idBuf, 1, sizeof(idBuf) - 1, fp);
+                    fclose(fp);
+                }
+            }
+            outId = TrimWhitespace(std::string(idBuf));
+            if (outId.empty()) {
+                u8 rnd[8];
+                if (R_SUCCEEDED(psInit())) {
+                    PS_GenerateRandomBytes(rnd, sizeof(rnd));
+                    psExit();
+                } else {
+                    u64 tk = svcGetSystemTick();
+                    memcpy(rnd, &tk, sizeof(rnd));
+                }
+                char genBuf[20];
+                snprintf(genBuf, sizeof(genBuf), "%02X%02X%02X%02X%02X%02X%02X%02X",
+                         rnd[0], rnd[1], rnd[2], rnd[3], rnd[4], rnd[5], rnd[6], rnd[7]);
+                outId = genBuf;
+                File wf;
+                if (File::Open(wf, OCR_DEVICE_ID_SD_PATH, File::WRITE | File::CREATE | File::TRUNCATE) == File::SUCCESS) {
+                    wf.Write(outId.c_str(), outId.size());
+                    wf.Close();
+                } else {
+                    FILE *fp = fopen(OCR_DEVICE_ID_SD_PATH, "w");
+                    if (fp) {
+                        fputs(outId.c_str(), fp);
+                        fclose(fp);
+                    }
+                }
+            }
+        }
+
+        outName = TrimWhitespace(outName);
+        if (outName.empty()) outName = "3DS";
+        if (outModel.empty()) outModel = "3DS";
+    }
+
+    static std::string OCR_BuildDeviceInfoPayload(std::string *outName = nullptr)
+    {
+        std::string devId, devName, devModel;
+        OCR_GetDeviceIdentity(devId, devName, devModel);
+        if (outName) *outName = devName;
+        std::string payload = devId + "\n" + devName + "\n" + devModel;
+        if (payload.size() > 256) payload.resize(256);
+        return payload;
+    }
+
+    static bool OCR_SendDeviceInfo(int sock, sha256_stream_t *tx)
+    {
+        if (sock < 0 || tx == nullptr) return false;
+        std::string payload = OCR_BuildDeviceInfoPayload();
+        uint16_t len = (uint16_t)payload.size();
+        uint8_t hdr[5] = {
+            CMD_SET_DEVICE_INFO,
+            (uint8_t)((len >> 8) & 0xFF),
+            (uint8_t)(len & 0xFF),
+            0,
+            0
+        };
+        if (send_encrypted_frame(sock, tx, hdr, sizeof(hdr)) < 0) return false;
+        return send_encrypted_frame(sock, tx, payload.data(), len) >= 0;
+    }
+
+    static bool OCR_PingServerPairing(std::string &outName)
+    {
+        std::string payload = OCR_BuildDeviceInfoPayload(&outName);
+        int sock = OCR_ConnectServer(nullptr);
+        if (sock < 0) return false;
+
+        sha256_stream_t tx, rx;
+        bool ok = OCR_PerformHandshake(sock, &tx, &rx);
+        if (ok) {
+            const uint8_t magic[8] = { 'P', 'A', 'I', 'R', 'P', 'I', 'N', 'G' };
+            uint16_t netLen = htons((uint16_t)payload.size());
+            uint8_t ack = 0;
+            ok = (send_encrypted_frame(sock, &tx, magic, sizeof(magic)) >= 0) &&
+                 (send_encrypted_frame(sock, &tx, &netLen, sizeof(netLen)) >= 0) &&
+                 (send_encrypted_frame(sock, &tx, payload.data(), payload.size()) >= 0) &&
+                 (recv_encrypted_frame(sock, &rx, &ack, 1) >= 0) &&
+                 (ack == 1);
+        }
+        closesocket(sock);
+        crypto_wipe(&tx, sizeof(tx));
+        crypto_wipe(&rx, sizeof(rx));
+        return ok;
+    }
+
     static void OCR_ApplyScannedPayload(std::string &payload)
     {
         std::string psk, lan, wan;
@@ -2310,6 +3278,13 @@ namespace CTRPluginFramework
 
         OSD::Notify("QR Code Scanned! Config Saved.", Color::Green);
         OSD::Notify("LAN: " + s_serverLanHost + ":" + std::to_string(s_serverLanPort), Color::Cyan);
+
+        std::string devName;
+        if (OCR_PingServerPairing(devName)) {
+            OSD::Notify("Paired with server as " + devName + "!", Color::Green);
+        } else {
+            OSD::Notify("QR saved (server offline - will register on connect)", Color::Yellow);
+        }
     }
 
     bool OCR_ScanQrCode(void)
@@ -2523,8 +3498,8 @@ namespace CTRPluginFramework
     void OCR_LaunchSession(void)
     {
         // Allocate screen buffers dynamically for the session (popup buffer is allocated on-demand)
-        if (!s_topBuffer.Alloc(0x07250000, TOP_FB_RGB_SIZE) ||
-            !s_botBuffer.Alloc(0x072A0000, BOT_FB_RGB_SIZE)) {
+        if (!s_topBuffer.Alloc(0x07250000, TOP_FB_565_SIZE) ||
+            !s_botBuffer.Alloc(0x072A0000, BOT_FB_565_SIZE)) {
             OSD::Notify("OCR Error: Failed to allocate memory", Color::Red);
             OCR_FreeSessionBuffers();
             return;
@@ -2543,11 +3518,12 @@ namespace CTRPluginFramework
         // 2. Snapshot game screens
         const Screen &topScreen = OSD::GetTopScreen();
         const Screen &botScreen = OSD::GetBottomScreen();
-        CaptureScreen(topScreen, TOP_WIDTH, TOP_HEIGHT, s_top_rgb);
-        CaptureScreen(botScreen, BOT_WIDTH, BOT_HEIGHT, s_bot_rgb);
+        CaptureScreen(topScreen, TOP_WIDTH, TOP_HEIGHT, s_top_565);
+        CaptureScreen(botScreen, BOT_WIDTH, BOT_HEIGHT, s_bot_565);
 
         // Ensure server endpoints and PSK are configured on SD card
         OCR_LoadConfig();
+        OCR_LoadAnkiCredentials();
         char testPsk[OCR_PSK_MAX_LEN];
         size_t pskLen = OCR_LoadPskFromSd(testPsk, sizeof(testPsk));
         crypto_wipe(testPsk, sizeof(testPsk));
@@ -2556,8 +3532,8 @@ namespace CTRPluginFramework
             OSD::Notify("OCR Not Paired! Opening QR Scanner...", Color::Yellow);
             if (OCR_ScanQrCode()) {
                 for (int b = 0; b < 2; ++b) {
-                    RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
-                    RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
+                    RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_565, TOP_WIDTH, 240);
+                    RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_565, BOT_WIDTH, 240);
                     OSD::SwapBuffers();
                 }
             } else {
@@ -2576,8 +3552,8 @@ namespace CTRPluginFramework
             for (int b = 0; b < 2; ++b) {
                 const Screen &top = OSD::GetTopScreen();
                 const Screen &bot = OSD::GetBottomScreen();
-                RestoreRect(top, 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
-                RestoreRect(bot, 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
+                RestoreRect(top, 0, 0, TOP_WIDTH, 240, s_top_565, TOP_WIDTH, 240);
+                RestoreRect(bot, 0, 0, BOT_WIDTH, 240, s_bot_565, BOT_WIDTH, 240);
                 bot.DrawRect(0, 224, 320, 16, Color(20, 20, 30));
                 bot.Draw("Connecting to OCR Server...", 10, 227, Color(255, 230, 0), Color::Black);
                 OSD::SwapBuffers();
@@ -2590,7 +3566,10 @@ namespace CTRPluginFramework
             if (sock >= 0) {
                 handshakeOk = OCR_PerformHandshake(sock, &tx_stream, &rx_stream);
                 if (!handshakeOk) {
-                    closesocket(sock);
+                    s_activeSessionSock = -1;
+        s_activeSessionTx = nullptr;
+
+        closesocket(sock);
                     sock = -1;
                     diag += "Handshake Failed: Invalid PSK or mismatch.\n";
                 }
@@ -2619,7 +3598,7 @@ namespace CTRPluginFramework
                     break;
                 } else if (kDown & Key::B) {
                     for (int b = 0; b < 2; ++b) {
-                        RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
+                        RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_565, BOT_WIDTH, 240);
                         OSD::SwapBuffers();
                     }
                     OCR_FreeSessionBuffers();
@@ -2629,7 +3608,7 @@ namespace CTRPluginFramework
 
                 // Render failure screen on bottom screen
                 const Screen &top = OSD::GetTopScreen();
-                RestoreRect(top, 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
+                RestoreRect(top, 0, 0, TOP_WIDTH, 240, s_top_565, TOP_WIDTH, 240);
                 DrawConnectionDialog("OCR Server Connection Failed", diag);
                 OSD::SwapBuffers();
                 Sleep(Milliseconds(16));
@@ -2655,12 +3634,15 @@ namespace CTRPluginFramework
         uint8_t titleIdBuf[8];
         store_be64(titleIdBuf, titleId);
         if (send_encrypted_frame(sock, &tx_stream, titleIdBuf, sizeof(titleIdBuf)) < 0 ||
-            send_encrypted_frame(sock, &tx_stream, s_top_rgb, TOP_FB_RGB_SIZE) < 0 ||
-            send_encrypted_frame(sock, &tx_stream, s_bot_rgb, BOT_FB_RGB_SIZE) < 0) {
+            send_encrypted_rgb565_as_rgb24(sock, &tx_stream, s_top_565, TOP_WIDTH * TOP_HEIGHT) < 0 ||
+            send_encrypted_rgb565_as_rgb24(sock, &tx_stream, s_bot_565, BOT_WIDTH * BOT_HEIGHT) < 0) {
             OSD::Notify("OCR Error: Screen upload failed", Color::Red);
-            closesocket(sock);
+            s_activeSessionSock = -1;
+        s_activeSessionTx = nullptr;
+
+        closesocket(sock);
             for (int b = 0; b < 2; ++b) {
-                RestoreRect(OSD::GetBottomScreen(), 0, 224, 320, 16, s_bot_rgb, BOT_WIDTH, 240);
+                RestoreRect(OSD::GetBottomScreen(), 0, 224, 320, 16, s_bot_565, BOT_WIDTH, 240);
                 OSD::SwapBuffers();
             }
             OCR_FreeSessionBuffers();
@@ -2682,9 +3664,17 @@ namespace CTRPluginFramework
         uint8_t capsPkt[5] = { CMD_SET_CLIENT_CAPS, 0, 3, 0, 1 };
         send_encrypted_frame(sock, &tx_stream, capsPkt, sizeof(capsPkt));
 
+        // Send per-user AnkiWeb credentials if configured on SD card
+        if (!s_ankiUser.empty() && !s_ankiPass.empty()) {
+            OCR_SendAnkiCredentials(sock, &tx_stream);
+        }
+
+        // Send 3DS console identity so server records/updates this device
+        OCR_SendDeviceInfo(sock, &tx_stream);
+
         // Clear status bar region on both buffers
         for (int b = 0; b < 2; ++b) {
-            RestoreRect(OSD::GetBottomScreen(), 0, 224, 320, 16, s_bot_rgb, BOT_WIDTH, 240);
+            RestoreRect(OSD::GetBottomScreen(), 0, 224, 320, 16, s_bot_565, BOT_WIDTH, 240);
             OSD::SwapBuffers();
         }
 
@@ -2712,8 +3702,8 @@ namespace CTRPluginFramework
         BufferState bufStates[2];
         int activeBuf = 0;
 
-        auto getScreenRgb = [&](int scr) -> const u8* {
-            return (scr == SCREEN_ID_TOP) ? s_top_rgb : s_bot_rgb;
+        auto getScreen565 = [&](int scr) -> const u16* {
+            return (scr == SCREEN_ID_TOP) ? s_top_565 : s_bot_565;
         };
 
         auto isClientBundlePopup = [&](void) -> bool {
@@ -2782,7 +3772,7 @@ namespace CTRPluginFramework
                 for (int b = 0; b < 2; ++b) {
                     const Screen &scr = (kanjiTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
                     int scrW = (kanjiTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
-                    RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(kanjiTargetScreen), scrW, 240);
+                    RestoreRect(scr, 0, 0, scrW, 240, getScreen565(kanjiTargetScreen), scrW, 240);
                     PresentFrame();
                 }
             }
@@ -2812,13 +3802,13 @@ namespace CTRPluginFramework
                 for (int b = 0; b < 2; ++b) {
                     const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
                     int scrW = (popupTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
-                    RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(popupTargetScreen), scrW, 240);
+                    RestoreRect(scr, 0, 0, scrW, 240, getScreen565(popupTargetScreen), scrW, 240);
                     PresentFrame();
                 }
             }
         };
 
-        auto getActivePopupInfo = [&](const PopupEntry *&outEntry, const GlyphMap *&outGlyphs, int &outGlossScroll, int &outPosScroll) -> bool {
+        auto getActivePopupInfo = [&](const PopupEntry *&outEntry, const GlyphMap *&outGlyphs, int &outGlossScroll, int &outPosScroll, const std::vector<std::string> *&outContexts) -> bool {
             if (cachedPopup.active && cachedPopup.sourceScreenId < 2 &&
                 screenBundles[cachedPopup.sourceScreenId].ready &&
                 cachedPopup.spotIdx < screenBundles[cachedPopup.sourceScreenId].spots.size()) {
@@ -2835,6 +3825,7 @@ namespace CTRPluginFramework
                             outGlyphs = &sb.glyphs;
                             outGlossScroll = cachedPopup.glossScrollY;
                             outPosScroll = cachedPopup.posScrollX;
+                            outContexts = &sb.contexts;
                             return true;
                         }
                     }
@@ -2848,6 +3839,7 @@ namespace CTRPluginFramework
                     outGlyphs = &popupBundle.glyphs;
                     outGlossScroll = popupBundle.glossScrollY;
                     outPosScroll = popupBundle.posScrollX;
+                    outContexts = nullptr;
                     return true;
                 }
             }
@@ -2857,10 +3849,33 @@ namespace CTRPluginFramework
         // Render initial cursor on both buffers
         SyncBothBuffers();
 
+        s_activeSessionSock = sock;
+        s_activeSessionTx = &tx_stream;
+
         // 6. Interactive Modal Loop
         while (true) {
             Controller::Update();
             u32 kDown = Controller::GetKeysPressed();
+
+            // Mid-session AnkiWeb credentials dialog (post-handshake live update)
+            if (g_ocrKeys.slimMenu != 0 && Controller::IsKeysPressed(g_ocrKeys.slimMenu)) {
+                while (true) {
+                    Controller::Update();
+                    if ((Controller::GetKeysDown(false) & g_ocrKeys.slimMenu) == 0) break;
+                    Sleep(Milliseconds(16));
+                }
+                OCR_OpenAnkiCredentialsDialog();
+                for (int b = 0; b < 2; ++b) {
+                    RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_565, TOP_WIDTH, 240);
+                    RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_565, BOT_WIDTH, 240);
+                    if (hasPopup) {
+                        if (isClientBundlePopup()) popupDirty[activeBuf] = true;
+                        else if (s_popup_rgb) DrawPopupImage(popupTargetScreen, s_popup_rgb);
+                    }
+                    PresentFrame();
+                }
+                continue;
+            }
 
             // Exit / Dismiss Key: Dismiss popup or exit session
             if (kDown & g_ocrKeys.exitSession) {
@@ -2881,8 +3896,8 @@ namespace CTRPluginFramework
                     break;
                 }
                 for (int b = 0; b < 2; ++b) {
-                    RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
-                    RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
+                    RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_565, TOP_WIDTH, 240);
+                    RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_565, BOT_WIDTH, 240);
                     if (hasPopup) {
                         if (isClientBundlePopup()) popupDirty[activeBuf] = true;
                         else if (s_popup_rgb) DrawPopupImage(popupTargetScreen, s_popup_rgb);
@@ -3035,10 +4050,37 @@ namespace CTRPluginFramework
             // Lookup / Select Point Key or Touch Screen Tap: Execute action
             bool lookupTriggered = (kDown & g_ocrKeys.lookup) != 0;
             bool touchPopupTap = touchTap && hasPopup && popupTargetScreen == SCREEN_ID_BOTTOM && !selbox.active;
-            if (lookupTriggered || touchPopupTap) {
-                int actionScreen = touchPopupTap ? SCREEN_ID_BOTTOM : curScreen;
-                int actionX = touchPopupTap ? newX : curX;
-                int actionY = touchPopupTap ? newY : curY;
+            bool touchKanjiTap = touchTap && hasKanjiWindow && kanjiTargetScreen == SCREEN_ID_BOTTOM && !selbox.active;
+            if (lookupTriggered || touchPopupTap || touchKanjiTap) {
+                bool isTouchAction = touchPopupTap || touchKanjiTap;
+                int actionScreen = isTouchAction ? SCREEN_ID_BOTTOM : curScreen;
+                int actionX = isTouchAction ? newX : curX;
+                int actionY = isTouchAction ? newY : curY;
+
+                // 0. Check if clicking/tapping inside the active Kanji Details window
+                if (hasKanjiWindow && kanjiTargetScreen == actionScreen) {
+                    int xOff = (actionScreen == SCREEN_ID_TOP) ? ((TOP_WIDTH - POPUP_WIDTH) / 2) : 0;
+                    int popX = actionX - xOff;
+                    int popY = actionY;
+                    if (popX >= 0 && popX < POPUP_WIDTH && popY >= 0 && popY < POPUP_HEIGHT) {
+                        int tallY = popY;
+                        if (popY >= 32 && popY < 216) {
+                            tallY = popY + std::max(0, std::min(s_kanjiScrollY, s_kanjiMaxScrollY));
+                        } else if (popY >= 216) {
+                            tallY = (KANJI_TALL_HEIGHT - 24) + (popY - 216);
+                        }
+                        uint8_t kWinPkt[5];
+                        uint16_t netX = htons((uint16_t)popX);
+                        uint16_t netY = htons((uint16_t)tallY);
+                        kWinPkt[0] = CMD_CLICK_KANJI_WIN;
+                        memcpy(&kWinPkt[1], &netX, 2);
+                        memcpy(&kWinPkt[3], &netY, 2);
+                        if (send_encrypted_frame(sock, &tx_stream, kWinPkt, sizeof(kWinPkt)) < 0) {
+                            break;
+                        }
+                        continue;
+                    }
+                }
 
                 // 1. Check if clicking/tapping inside the active translation popup
                 if (hasPopup && popupTargetScreen == actionScreen) {
@@ -3048,10 +4090,11 @@ namespace CTRPluginFramework
                     if (popX >= 0 && popX < POPUP_WIDTH && popY >= 0 && popY < POPUP_HEIGHT) {
                         const PopupEntry *pe = nullptr;
                         const GlyphMap *pg = nullptr;
+                        const std::vector<std::string> *pCtx = nullptr;
                         int gs = 0, ps = 0;
-                        if (getActivePopupInfo(pe, pg, gs, ps)) {
+                        if (getActivePopupInfo(pe, pg, gs, ps, pCtx)) {
                             uint32_t kanjiCp = 0;
-                            if (TryGetKanjiAtPopupCoord(popX, popY, *pg, *pe, gs, ps, kanjiCp)) {
+                            if (TryGetKanjiAtPopupCoord(popX, popY, *pg, *pe, gs, ps, kanjiCp, pCtx)) {
                                 lastKanjiCp = kanjiCp;
                                 kanjiScrollY = 0;
                                 if (!SendKanjiLookup(0)) break;
@@ -3157,7 +4200,7 @@ namespace CTRPluginFramework
                     continue;
                 }
                 // D-pad Up/Down scroll the kanji window locally (no network round-trip)
-                if (hasKanjiWindow && s_kanji_tall) {
+                if (hasKanjiWindow && s_kanji_tall_565) {
                     u32 dpadMask = Key::DPadUp | Key::DPadDown;
                     u32 held = Controller::GetKeysDown(false) & dpadMask;
                     u32 trig = kDown & dpadMask;
@@ -3170,14 +4213,14 @@ namespace CTRPluginFramework
                     if (trig & Key::DPadUp) {
                         s_kanjiScrollY = std::max(0, s_kanjiScrollY - 8);
                         for (int b = 0; b < 2; ++b) {
-                            DrawKanjiCrop(kanjiTargetScreen, s_kanji_tall, s_kanjiScrollY);
+                            DrawKanjiCrop(kanjiTargetScreen, s_kanji_tall_565, s_kanjiScrollY);
                             PresentFrame();
                         }
                         continue;
                     } else if (trig & Key::DPadDown) {
                         s_kanjiScrollY = std::min(s_kanjiMaxScrollY, s_kanjiScrollY + 8);
                         for (int b = 0; b < 2; ++b) {
-                            DrawKanjiCrop(kanjiTargetScreen, s_kanji_tall, s_kanjiScrollY);
+                            DrawKanjiCrop(kanjiTargetScreen, s_kanji_tall_565, s_kanjiScrollY);
                             PresentFrame();
                         }
                         continue;
@@ -3185,6 +4228,7 @@ namespace CTRPluginFramework
                 }
                 auto handleLocalNav = [&](size_t numVars, size_t numEntries, const std::string &curEngLbl,
                                           const std::string &nextEngLbl, const std::string &nextOcrTxt,
+                                          const GlyphMap &activeGlyphs,
                                           const PopupEntry &curEntry, size_t &vIdx, size_t &eIdx,
                                           int &gScroll, int &pScroll, std::string &sBanner, uint8_t &sLevel,
                                           bool &sendAnki, bool &needRedraw) {
@@ -3236,8 +4280,9 @@ namespace CTRPluginFramework
                             if (dpadHoldTicks > 14 && ((dpadHoldTicks - 14) % 3) == 0) trig |= held;
                         }
                         if (trig != 0) {
-                            int maxGlossY = std::max(0, (int)curEntry.wrappedLines.size() - GLOSS_VISIBLE_LINES);
-                            int maxPosX = std::max(0, (int)curEntry.posCodepoints.size() - POS_WINDOW_CHARS);
+                            int visGloss = ComputePopupTitleLayout(activeGlyphs, curEntry).visibleGlossLines;
+                            int maxGlossY = std::max(0, (int)curEntry.wrappedLines.size() - visGloss);
+                            int maxPosX = std::max(0, (int)Utf8ToCodepoints(curEntry.pos).size() - POS_WINDOW_CHARS);
                             int oldG = gScroll;
                             int oldP = pScroll;
                             if (trig & Key::DPadUp)        gScroll = std::max(0, gScroll - 1);
@@ -3270,7 +4315,8 @@ namespace CTRPluginFramework
                                     : ((cachedPopup.curVariantIdx + 1) % sp.variants.size());
                                 bool needRedraw = false, sendAnki = false;
                                 handleLocalNav(sp.variants.size(), sv.entryIndices.size(), sv.enginesLabel,
-                                               sp.variants[nextV].enginesLabel, sp.variants[nextV].ocrText, ce,
+                                               sp.variants[nextV].enginesLabel, sp.variants[nextV].ocrText,
+                                               sb.glyphs, ce,
                                                cachedPopup.curVariantIdx, cachedPopup.curEntryIdx,
                                                cachedPopup.glossScrollY, cachedPopup.posScrollX,
                                                cachedPopup.statusBanner, cachedPopup.statusLevel, sendAnki, needRedraw);
@@ -3296,7 +4342,8 @@ namespace CTRPluginFramework
                         : ((popupBundle.curVariantIdx + 1) % popupBundle.variants.size());
                     bool needRedraw = false, sendAnki = false;
                     handleLocalNav(popupBundle.variants.size(), curVar.entries.size(), curVar.enginesLabel,
-                                   popupBundle.variants[nextV].enginesLabel, popupBundle.variants[nextV].ocrText, curEntry,
+                                   popupBundle.variants[nextV].enginesLabel, popupBundle.variants[nextV].ocrText,
+                                   popupBundle.glyphs, curEntry,
                                    popupBundle.curVariantIdx, popupBundle.curEntryIdx,
                                    popupBundle.glossScrollY, popupBundle.posScrollX,
                                    popupBundle.statusBanner, popupBundle.statusLevel, sendAnki, needRedraw);
@@ -3352,12 +4399,23 @@ namespace CTRPluginFramework
 
                 if ((flagByte & POPUP_SCREEN_BUNDLE_FLAG) && payloadSize > 0 && payloadSize <= 2 * 1024 * 1024 &&
                     (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
-                    std::vector<uint8_t> rawBuf(payloadSize);
-                    if (recv_encrypted_frame(sock, &rx_stream, rawBuf.data(), payloadSize) < 0) {
+                    SessionBuffer rawSb;
+                    AutoFreeSessionBuffer rawGuard{rawSb};
+                    if (!rawSb.Alloc(0x073E0000, payloadSize, 0x07420000)) {
+                        if (!DrainEncryptedPayload(sock, &rx_stream, payloadSize)) break;
+                        continue;
+                    }
+                    if (recv_encrypted_frame(sock, &rx_stream, rawSb.ptr, payloadSize) < 0) {
                         break;
                     }
+                    bool hadCachedForScr = (cachedPopup.active && cachedPopup.sourceScreenId == targetScreenId);
+                    uint16_t savedX = cachedPopup.clickX;
+                    uint16_t savedY = cachedPopup.clickY;
+                    screenBundles[targetScreenId] = ScreenBundle();
+
                     ScreenBundle nextSb;
-                    if (ParseScreenBundle(rawBuf.data(), rawBuf.size(), nextSb) && nextSb.sourceScreenId < 2) {
+                    if (ParseScreenBundle(rawSb, payloadSize, nextSb) && nextSb.sourceScreenId < 2) {
+                        rawSb.Free();
                         uint8_t replacedScr = nextSb.sourceScreenId;
                         screenBundles[replacedScr] = std::move(nextSb);
                         if (cachedPopup.active && cachedPopup.sourceScreenId == replacedScr) {
@@ -3377,26 +4435,52 @@ namespace CTRPluginFramework
                                 for (int b = 0; b < 2; ++b) {
                                     const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
                                     int scrW = (popupTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
-                                    RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(popupTargetScreen), scrW, 240);
+                                    RestoreRect(scr, 0, 0, scrW, 240, getScreen565(popupTargetScreen), scrW, 240);
                                     PresentFrame();
                                 }
+                            }
+                        }
+                    } else {
+                        rawSb.Free();
+                        if (hadCachedForScr) {
+                            cachedPopup.active = false;
+                            uint8_t clickPacket[5];
+                            uint16_t netX = htons(savedX);
+                            uint16_t netY = htons(savedY);
+                            clickPacket[0] = targetScreenId;
+                            memcpy(&clickPacket[1], &netX, 2);
+                            memcpy(&clickPacket[3], &netY, 2);
+                            if (send_encrypted_frame(sock, &tx_stream, clickPacket, sizeof(clickPacket)) < 0) {
+                                break;
                             }
                         }
                     }
                 } else if ((flagByte & POPUP_BUNDLE_FLAG) && payloadSize > 0 && payloadSize <= 2 * 1024 * 1024 &&
                     (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
-                    std::vector<uint8_t> rawBuf(payloadSize);
-                    if (recv_encrypted_frame(sock, &rx_stream, rawBuf.data(), payloadSize) < 0) {
+                    SessionBuffer rawSb;
+                    AutoFreeSessionBuffer rawGuard{rawSb};
+                    if (!rawSb.Alloc(0x073E0000, payloadSize, 0x07420000)) {
+                        if (!DrainEncryptedPayload(sock, &rx_stream, payloadSize)) break;
+                        continue;
+                    }
+                    if (recv_encrypted_frame(sock, &rx_stream, rawSb.ptr, payloadSize) < 0) {
                         break;
                     }
+                    if (!HeapCanFit(payloadSize * 2 + 49152)) {
+                        screenBundles[0] = ScreenBundle();
+                        screenBundles[1] = ScreenBundle();
+                        popupBundle = PopupBundle();
+                    }
                     PopupBundle nextBundle;
-                    if (ParsePopupBundle(rawBuf.data(), rawBuf.size(), nextBundle)) {
+                    bool parsed = ParsePopupBundle(rawSb.ptr, payloadSize, nextBundle);
+                    rawSb.Free();
+                    if (parsed) {
                         DismissKanjiWindow();
                         if (hasPopup && popupTargetScreen != targetScreenId) {
                             for (int b = 0; b < 2; ++b) {
                                 const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
                                 int scrW = (popupTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
-                                RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(popupTargetScreen), scrW, 240);
+                                RestoreRect(scr, 0, 0, scrW, 240, getScreen565(popupTargetScreen), scrW, 240);
                                 PresentFrame();
                             }
                         }
@@ -3410,35 +4494,71 @@ namespace CTRPluginFramework
                     }
                 } else if ((flagByte & POPUP_STATUS_FLAG) && payloadSize > 0 && payloadSize <= 65536 &&
                            (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
-                    std::vector<uint8_t> rawBuf(payloadSize);
-                    if (recv_encrypted_frame(sock, &rx_stream, rawBuf.data(), payloadSize) < 0) {
+                    SessionBuffer rawSb;
+                    AutoFreeSessionBuffer rawGuard{rawSb};
+                    if (!rawSb.Alloc(0x073E0000, payloadSize, 0x07420000)) {
+                        if (!DrainEncryptedPayload(sock, &rx_stream, payloadSize)) break;
+                        continue;
+                    }
+                    if (recv_encrypted_frame(sock, &rx_stream, rawSb.ptr, payloadSize) < 0) {
                         break;
                     }
                     if (cachedPopup.active && cachedPopup.sourceScreenId < 2) {
-                        if (ParseStatusBannerPacket(rawBuf.data(), rawBuf.size(),
+                        if (ParseStatusBannerPacket(rawSb.ptr, payloadSize,
                                                     screenBundles[cachedPopup.sourceScreenId].glyphs,
                                                     cachedPopup.statusBanner, cachedPopup.statusLevel)) {
                             RedrawBundlePopup();
                         }
                     } else if (popupBundle.active &&
-                               ParseStatusBannerPacket(rawBuf.data(), rawBuf.size(), popupBundle.glyphs,
+                               ParseStatusBannerPacket(rawSb.ptr, payloadSize, popupBundle.glyphs,
                                                        popupBundle.statusBanner, popupBundle.statusLevel)) {
                         RedrawBundlePopup();
                     }
+                    rawSb.Free();
+                    if (flagByte & POPUP_ANKI_LOGIN_PROMPT_FLAG) {
+                        bool updated = OCR_OpenAnkiCredentialsDialog();
+                        if (updated && !s_ankiUser.empty() && !s_ankiPass.empty()) {
+                            std::string readyMsg = "AnkiWeb login set! Press [" + OCR_KeyToString(g_ocrKeys.addAnki) + "] to add";
+                            if (cachedPopup.active) {
+                                cachedPopup.statusBanner = readyMsg;
+                                cachedPopup.statusLevel = 1;
+                            } else if (popupBundle.active) {
+                                popupBundle.statusBanner = readyMsg;
+                                popupBundle.statusLevel = 1;
+                            }
+                        }
+                        for (int b = 0; b < 2; ++b) {
+                            RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_565, TOP_WIDTH, 240);
+                            RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_565, BOT_WIDTH, 240);
+                            if (hasPopup) {
+                                if (isClientBundlePopup()) popupDirty[activeBuf] = true;
+                                else if (s_popup_rgb) DrawPopupImage(popupTargetScreen, s_popup_rgb);
+                            }
+                            PresentFrame();
+                        }
+                    }
                 } else if ((flagByte & POPUP_KANJI_FLAG) && payloadSize == KANJI_TALL_PAYLOAD_SIZE &&
                            (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
-                    if (!s_kanjiTallBuffer.Alloc(0x07360000, KANJI_TALL_PAYLOAD_SIZE)) {
-                        std::vector<u8> dummy(payloadSize);
-                        recv_encrypted_frame(sock, &rx_stream, dummy.data(), payloadSize);
-                        OSD::Notify("OCR Error: Out of memory for kanji window", Color::Red);
-                        continue;
+                    if (!s_kanjiTallBuffer.Alloc(0x07360000, KANJI_TALL_565_SIZE)) {
+                        if (!cachedPopup.active) {
+                            screenBundles[0] = ScreenBundle();
+                            screenBundles[1] = ScreenBundle();
+                        } else {
+                            screenBundles[1 - cachedPopup.sourceScreenId] = ScreenBundle();
+                        }
+                        if (!s_kanjiTallBuffer.Alloc(0x07360000, KANJI_TALL_565_SIZE, 0, true)) {
+                            if (!DrainEncryptedPayload(sock, &rx_stream, payloadSize)) break;
+                            OSD::Notify("OCR Error: Out of memory for kanji window", Color::Red);
+                            continue;
+                        }
                     }
-                    if (recv_encrypted_frame(sock, &rx_stream, s_kanji_tall, KANJI_TALL_PAYLOAD_SIZE) < 0) {
+                    u16 rawContentH = 0;
+                    if (!recv_encrypted_kanji_as_rgb565(sock, &rx_stream, s_kanji_tall_565, POPUP_WIDTH * KANJI_TALL_HEIGHT, rawContentH)) {
                         OCR_FreeKanjiBuffer();
                         hasKanjiWindow = false;
                         break;
                     }
-                    int contentH = ((int)s_kanji_tall[KANJI_TALL_RGB_SIZE] << 8) | (int)s_kanji_tall[KANJI_TALL_RGB_SIZE + 1];
+                    int contentH = (int)rawContentH;
                     if (contentH > KANJI_TALL_HEIGHT) contentH = KANJI_TALL_HEIGHT;
                     // Scrollable viewport is POPUP_HEIGHT - 24 (216px; footer is fixed)
                     s_kanjiMaxScrollY = std::max(0, contentH - (POPUP_HEIGHT - 24));
@@ -3446,7 +4566,7 @@ namespace CTRPluginFramework
                     kanjiTargetScreen = targetScreenId;
                     hasKanjiWindow = true;
                     for (int b = 0; b < 2; ++b) {
-                        DrawKanjiCrop(kanjiTargetScreen, s_kanji_tall, 0);
+                        DrawKanjiCrop(kanjiTargetScreen, s_kanji_tall_565, 0);
                         PresentFrame();
                     }
                 } else if (payloadSize == POPUP_RGB_SIZE && (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
@@ -3461,7 +4581,7 @@ namespace CTRPluginFramework
                         for (int b = 0; b < 2; ++b) {
                             const Screen &scr = (popupTargetScreen == SCREEN_ID_TOP) ? OSD::GetTopScreen() : OSD::GetBottomScreen();
                             int scrW = (popupTargetScreen == SCREEN_ID_TOP) ? TOP_WIDTH : BOT_WIDTH;
-                            RestoreRect(scr, 0, 0, scrW, 240, getScreenRgb(popupTargetScreen), scrW, 240);
+                            RestoreRect(scr, 0, 0, scrW, 240, getScreen565(popupTargetScreen), scrW, 240);
                             PresentFrame();
                         }
                     }
@@ -3478,14 +4598,8 @@ namespace CTRPluginFramework
                 } else {
                     // Drain unhandled/unexpected payload so TCP stream stays synchronized
                     if (payloadSize > 0) {
-                        std::vector<u8> discard(std::min<u32>(payloadSize, 65536));
-                        u32 rem = payloadSize;
-                        while (rem > 0) {
-                            u32 chunk = std::min<u32>(rem, (u32)discard.size());
-                            if (recv_encrypted_frame(sock, &rx_stream, discard.data(), chunk) < 0) {
-                                break;
-                            }
-                            rem -= chunk;
+                        if (!DrainEncryptedPayload(sock, &rx_stream, payloadSize)) {
+                            break;
                         }
                     }
                 }
@@ -3497,21 +4611,227 @@ namespace CTRPluginFramework
 
         // 7. Cleanup & Restore Original Game Screens (both buffers to prevent tearing)
         for (int b = 0; b < 2; ++b) {
-            RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
-            RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
+            RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_565, TOP_WIDTH, 240);
+            RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_565, BOT_WIDTH, 240);
             OSD::SwapBuffers();
         }
+
+        s_activeSessionSock = -1;
+        s_activeSessionTx = nullptr;
 
         closesocket(sock);
         crypto_wipe(&tx_stream, sizeof(tx_stream));
         crypto_wipe(&rx_stream, sizeof(rx_stream));
+
+        // Tear down heap/aliased socInit state before resuming Mode 3 games (e.g. Smash Bros)
+        if (s_socBufferIsHeap || s_socAliasAddr != 0) {
+            OCR_CloseSocLocked(false);
+        }
 
         // Free session snapshot buffers to return ~750 KB to the game process
         OCR_FreeSessionBuffers();
 
         OCR_ExitCStick();
 
+        while (Controller::IsKeysDown(g_ocrKeys.exitSession)) {
+            Controller::Update();
+            Sleep(Milliseconds(16));
+        }
+
         // Unpause game
+        Process::Play();
+        Sleep(Milliseconds(30));
+    }
+
+    void OCR_OpenKeyBindingsMenu(void)
+    {
+        Process::Pause();
+
+        bool hasTopSnap = s_topBuffer.Alloc(0x07250000, TOP_FB_565_SIZE);
+        bool hasBotSnap = s_botBuffer.Alloc(0x072A0000, BOT_FB_565_SIZE);
+        if (hasTopSnap) CaptureScreen(OSD::GetTopScreen(), TOP_WIDTH, TOP_HEIGHT, s_top_565);
+        if (hasBotSnap) CaptureScreen(OSD::GetBottomScreen(), BOT_WIDTH, BOT_HEIGHT, s_bot_565);
+
+        // Wait for opening combo keys to be released
+        while (true) {
+            Controller::Update();
+            if (Controller::GetKeysDown(false) == 0) break;
+            Sleep(Milliseconds(16));
+        }
+
+        enum ItemKind { ITEM_KEY, ITEM_ANKI, ITEM_RESET };
+        struct MenuItem {
+            const char *label;
+            u32 *target;
+            ItemKind kind;
+        };
+        MenuItem items[13] = {
+            { "Activation",     &g_ocrKeys.activation,   ITEM_KEY },
+            { "Slim Menu",      &g_ocrKeys.slimMenu,     ITEM_KEY },
+            { "Lookup / Point", &g_ocrKeys.lookup,       ITEM_KEY },
+            { "Mode Toggle",    &g_ocrKeys.modeToggle,   ITEM_KEY },
+            { "Switch Screen",  &g_ocrKeys.switchScreen, ITEM_KEY },
+            { "Add to Anki",    &g_ocrKeys.addAnki,      ITEM_KEY },
+            { "Prev Entry",     &g_ocrKeys.prevEntry,    ITEM_KEY },
+            { "Next Entry",     &g_ocrKeys.nextEntry,    ITEM_KEY },
+            { "Prev OCR",       &g_ocrKeys.prevOcr,      ITEM_KEY },
+            { "Next OCR",       &g_ocrKeys.nextOcr,      ITEM_KEY },
+            { "Exit Session",   &g_ocrKeys.exitSession,  ITEM_KEY },
+            { "AnkiWeb Login",  nullptr,                 ITEM_ANKI },
+            { "Reset Defaults", nullptr,                 ITEM_RESET }
+        };
+
+        const u32 validMask = Key::A | Key::B | Key::X | Key::Y | Key::L | Key::R |
+                              Key::ZL | Key::ZR | Key::Start | Key::Select |
+                              Key::DPadUp | Key::DPadDown | Key::DPadLeft | Key::DPadRight;
+
+        int sel = 0;
+        bool capturing = false;
+        u32 capturedMask = 0;
+        u32 prevCaptureHeld = 0;
+        int statusTimer = 0;
+        int needRedraw = 2;
+
+        while (true) {
+            Controller::Update();
+            u32 kDown = Controller::GetKeysPressed();
+            u32 held = Controller::GetKeysDown(false) & validMask;
+
+            if (capturing) {
+                if (held != 0) {
+                    u32 nextMask = capturedMask | held;
+                    if (nextMask != capturedMask || held != prevCaptureHeld) {
+                        capturedMask = nextMask;
+                        prevCaptureHeld = held;
+                        needRedraw = 2;
+                    }
+                } else if (capturedMask != 0) {
+                    if (items[sel].target) {
+                        *items[sel].target = capturedMask;
+                        OCR_SaveKeyBindings();
+                    }
+                    capturing = false;
+                    capturedMask = 0;
+                    prevCaptureHeld = 0;
+                    needRedraw = 2;
+                }
+            } else {
+                if (kDown & Key::B) {
+                    break;
+                } else if (kDown & Key::DPadUp) {
+                    sel = (sel + 12) % 13;
+                    needRedraw = 2;
+                } else if (kDown & Key::DPadDown) {
+                    sel = (sel + 1) % 13;
+                    needRedraw = 2;
+                } else if (kDown & Key::A) {
+                    if (items[sel].kind == ITEM_RESET) {
+                        OCR_ResetKeyBindings();
+                        statusTimer = 90;
+                        needRedraw = 2;
+                    } else if (items[sel].kind == ITEM_ANKI) {
+                        while (true) {
+                            Controller::Update();
+                            if ((Controller::GetKeysDown(false) & Key::A) == 0) break;
+                            Sleep(Milliseconds(16));
+                        }
+                        OCR_OpenAnkiCredentialsDialog();
+                        for (int b = 0; b < 2; ++b) {
+                            if (hasTopSnap) RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_565, TOP_WIDTH, 240);
+                            OSD::SwapBuffers();
+                        }
+                        needRedraw = 2;
+                    } else {
+                        while (true) {
+                            Controller::Update();
+                            if ((Controller::GetKeysDown(false) & Key::A) == 0) break;
+                            Sleep(Milliseconds(16));
+                        }
+                        capturing = true;
+                        capturedMask = 0;
+                        prevCaptureHeld = 0;
+                        needRedraw = 2;
+                    }
+                }
+            }
+
+            if (statusTimer > 0) {
+                --statusTimer;
+                if (statusTimer == 0) needRedraw = 2;
+            }
+
+            if (needRedraw > 0) {
+                const Screen &bot = OSD::GetBottomScreen();
+                bot.DrawRect(0, 0, BOT_WIDTH, BOT_HEIGHT, Color(20, 24, 34), true);
+                bot.DrawRect(0, 0, BOT_WIDTH, 22, Color(34, 42, 64), true);
+                bot.Draw("OCR Settings & Anki Login", 8, 5, Color(255, 230, 115), Color(34, 42, 64));
+
+                for (int i = 0; i < 13; ++i) {
+                    int y = 24 + i * 15;
+                    bool isSel = (i == sel);
+                    Color rowBg = isSel ? Color(48, 62, 96) : Color(20, 24, 34);
+                    if (isSel) {
+                        bot.DrawRect(4, y - 1, BOT_WIDTH - 8, 14, rowBg, true);
+                    }
+                    Color labelCol = isSel ? Color(255, 255, 255) : Color(195, 210, 230);
+                    bot.Draw(items[i].label, 10, y + 1, labelCol, rowBg);
+
+                    if (items[i].kind == ITEM_KEY && items[i].target != nullptr) {
+                        std::string keyStr = "[" + OCR_KeyToString(*items[i].target) + "]";
+                        if (keyStr.size() > 21) keyStr = keyStr.substr(0, 20) + "]";
+                        Color valCol = isSel ? Color(125, 230, 165) : Color(145, 195, 245);
+                        bot.Draw(keyStr, 130, y + 1, valCol, rowBg);
+                    } else if (items[i].kind == ITEM_ANKI) {
+                        std::string ankiStr = "[" + OCR_GetAnkiCredentialsLabel() + "]";
+                        if (ankiStr.size() > 21) ankiStr = ankiStr.substr(0, 18) + "...]";
+                        Color valCol = isSel ? Color(125, 230, 165) : Color(255, 215, 120);
+                        bot.Draw(ankiStr, 130, y + 1, valCol, rowBg);
+                    } else {
+                        bot.Draw("[Restore All]", 130, y + 1, Color(255, 175, 80), rowBg);
+                    }
+                }
+
+                bot.DrawRect(0, 220, BOT_WIDTH, 20, Color(28, 34, 50), true);
+                if (statusTimer > 0) {
+                    bot.Draw("Defaults restored!", 8, 224, Color(125, 230, 165), Color(28, 34, 50));
+                } else {
+                    bot.Draw("[D-Pad]Nav  [A]Assign  [B]Save&Exit", 8, 224, Color(150, 175, 210), Color(28, 34, 50));
+                }
+
+                if (capturing) {
+                    bot.DrawRect(28, 74, 264, 92, Color(88, 166, 255), true);
+                    bot.DrawRect(30, 76, 260, 88, Color(22, 28, 42), true);
+                    std::string title = std::string("Assign: ") + items[sel].label;
+                    bot.Draw(title, 42, 86, Color(255, 230, 115), Color(22, 28, 42));
+                    bot.Draw("Hold button(s) & release", 42, 106, Color(195, 210, 230), Color(22, 28, 42));
+                    std::string cur = (capturedMask != 0) ? OCR_KeyToString(capturedMask) : "Waiting...";
+                    if (cur.size() > 34) cur = cur.substr(0, 34);
+                    bot.Draw(cur, 42, 132, Color(125, 230, 165), Color(22, 28, 42));
+                }
+
+                OSD::SwapBuffers();
+                --needRedraw;
+            }
+
+            Sleep(Milliseconds(16));
+        }
+
+        // Wait for B release before resuming game
+        while (true) {
+            Controller::Update();
+            if ((Controller::GetKeysDown(false) & Key::B) == 0) break;
+            Sleep(Milliseconds(16));
+        }
+
+        OCR_SaveKeyBindings();
+
+        for (int b = 0; b < 2; ++b) {
+            if (hasTopSnap) RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_565, TOP_WIDTH, 240);
+            if (hasBotSnap) RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_565, BOT_WIDTH, 240);
+            OSD::SwapBuffers();
+        }
+
+        OCR_FreeSessionBuffers();
         Process::Play();
         Sleep(Milliseconds(30));
     }

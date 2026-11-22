@@ -44,6 +44,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+import psk_store
 
 # Server & Protocol Configuration
 HOST = "0.0.0.0"
@@ -201,13 +202,16 @@ SHA256_SIZE = 32
 AUTH_TIMEOUT_SEC = 5.0
 FB_TRANSFER_TIMEOUT_SEC = 20.0
 IDLE_SESSION_TIMEOUT_SEC = 600.0
-MAX_CONCURRENT_CONNECTIONS = 2
-MAX_PREAUTH_CONNECTIONS = 16
-MAX_PREAUTH_PER_IP = 2
+MAX_CONCURRENT_CONNECTIONS = 16
+MAX_PREAUTH_CONNECTIONS = 32
+MAX_PREAUTH_PER_IP = 4
 MAX_AUTH_FAILURES_PER_IP = 3
 AUTH_BAN_DURATION_SEC = 600.0
 SCANNER_BAN_DURATION_SEC = 3600.0
 MIN_OCR_INTERVAL_SEC = 0.45
+MAX_ANKI_CRED_FIELD_LEN = 256
+MAX_DEVICE_INFO_LEN = 512
+PAIRING_PING_MAGIC = b"PAIRPING"
 
 # 3DS Screen Dimensions & Formats
 SCREEN_ID_TOP = 0
@@ -232,10 +236,14 @@ CMD_TRANSLATE_TOP = 0x20  # 2-point selection box on Top Screen (2x 5-byte frame
 CMD_TRANSLATE_BOT = 0x21  # 2-point selection box on Bottom Screen (2x 5-byte frames: x1,y1 then x2,y2)
 CMD_LOOKUP_KANJI = 0x22   # Kanji click in translation overlay: [0x22, cp_high16, cp_low16]
 CMD_ADD_ANKI_KANJI = 0x23 # Add currently viewed kanji to Anki deck
+CMD_SET_ANKI_CREDS = 0x24 # Client AnkiWeb credentials: [0x24, u_len_hi, u_len_lo, p_len_hi, p_len_lo] + (user||pass)
+CMD_SET_DEVICE_INFO = 0x25 # Client device identity: [0x25, len_hi, len_lo, 0, 0] + (id\nname\nmodel)
+CMD_CLICK_KANJI_WIN = 0x26 # Click/tap inside Kanji Details window: [0x26, popX_hi, popX_lo, tallY_hi, tallY_lo]
 POPUP_BUNDLE_FLAG = 0x80
 POPUP_STATUS_FLAG = 0x40
 POPUP_SCREEN_BUNDLE_FLAG = 0x20
 POPUP_KANJI_FLAG = 0x10
+POPUP_ANKI_LOGIN_PROMPT_FLAG = 0x08
 
 OCR_ENGINE_NAMES: Tuple[str, ...] = ("Manga", "Paddle", "Yomi", "NDL")
 
@@ -1605,10 +1613,14 @@ class WordMetaManager:
         }
         if jam is not None:
             try:
-                kd_res = jam.lookup(kanji_char)
+                _kanjidic_lookup_aliases = {
+                    "\u2ecc": ("\u8fb6", 3),  # ⻌ (1-dot Joyo shinnyou) -> query 辶 in Kanjidic2, 3 strokes
+                }
+                lookup_char, override_strokes = _kanjidic_lookup_aliases.get(kanji_char, (kanji_char, None))
+                kd_res = jam.lookup(lookup_char)
                 if kd_res and kd_res.chars:
                     c = kd_res.chars[0]
-                    info["stroke_count"] = c.stroke_count
+                    info["stroke_count"] = override_strokes if override_strokes is not None else c.stroke_count
                     info["grade"] = c.grade
                     info["freq"] = c.freq
                     if info["jlpt"] is None and c.jlpt is not None:
@@ -1618,9 +1630,19 @@ class WordMetaManager:
                             rad_num = int(c.radicals[0].value)
                             info["rad_num"] = rad_num
                             if 1 <= rad_num <= 214:
-                                # Normalize Kangxi Radical (U+2F00..U+2FD5) to standard CJK Unified Ideograph
-                                # so fonts without the Kangxi Radicals block (e.g., msgothic.ttc) don't draw □
-                                info["rad_char"] = unicodedata.normalize("NFKC", chr(0x2F00 + rad_num - 1))
+                                # Use recognizable Japanese radical forms where the classical Kangxi
+                                # standalone character rarely/never appears in modern Japanese kanji;
+                                # otherwise NFKC-normalize U+2F00..U+2FD5 so msgothic.ttc doesn't draw □.
+                                _jp_rad_overrides = {
+                                    122: "罒",      # 网 -> 罒 (あみがしら)
+                                    140: "艹",      # 艸 -> 艹 (くさかんむり)
+                                    162: "\u2ecc",  # 辵 -> ⻌ (1-dot しんにょう)
+                                    163: "阝",      # 邑 -> 阝 (おおざと)
+                                    170: "阝",      # 阜 -> 阝 (こざとへん)
+                                }
+                                info["rad_char"] = _jp_rad_overrides.get(
+                                    rad_num, unicodedata.normalize("NFKC", chr(0x2F00 + rad_num - 1))
+                                )
                                 rad_meta = self._kangxi_radicals.get(str(rad_num))
                                 if rad_meta and len(rad_meta) >= 2:
                                     info["rad_reading"] = rad_meta[0]
@@ -1873,7 +1895,7 @@ class JapaneseOCRDictionaryPipeline:
             for fname in sorted(os.listdir(DICTIONARIES_DIR)):
                 if (
                     fname.endswith(".json")
-                    and fname not in ("index.json",)
+                    and fname not in ("index.json", "kangxi_radicals.json")
                     and not fname.startswith("term_bank_")
                     and not fname.startswith("jlpt_")
                 ):
@@ -1886,13 +1908,22 @@ class JapaneseOCRDictionaryPipeline:
                 try:
                     with open(c_path, "r", encoding="utf-8") as f:
                         loaded_cd = json.load(f)
+                        added_count = 0
                         if isinstance(loaded_cd, dict):
                             for k, v in loaded_cd.items():
                                 if isinstance(v, list):
-                                    self._custom_dict.setdefault(k, []).extend(v)
-                                elif isinstance(v, dict):
+                                    valid = [
+                                        e for e in v
+                                        if isinstance(e, dict) and "headword" in e and "glosses" in e
+                                    ]
+                                    if valid:
+                                        self._custom_dict.setdefault(k, []).extend(valid)
+                                        added_count += 1
+                                elif isinstance(v, dict) and "headword" in v and "glosses" in v:
                                     self._custom_dict.setdefault(k, []).append(v)
-                    logger.info("Loaded custom/Pokémon dictionary terms from %s (total: %d terms).", c_path, len(self._custom_dict))
+                                    added_count += 1
+                    if added_count > 0:
+                        logger.info("Loaded custom/Pokémon dictionary terms from %s (total: %d terms).", c_path, len(self._custom_dict))
                 except Exception as exc:
                     logger.warning("Failed to load custom dictionary %s: %s", c_path, exc)
 
@@ -6854,8 +6885,8 @@ def recv_exact(
 def load_cjk_ttf_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     """Load a Japanese-capable TTF/TTC font across Windows, macOS, and Linux."""
     candidates = [
-        r"C:\Windows\Fonts\meiryo.ttc",
         r"C:\Windows\Fonts\msgothic.ttc",
+        r"C:\Windows\Fonts\meiryo.ttc",
         r"C:\Windows\Fonts\YuGothM.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/takao-gothic/TakaoPGothic.ttf",
@@ -7039,42 +7070,75 @@ def render_dictionary_popup(
         header_text = header_text[:28]
     draw.text((8, 7), header_text, fill=(185, 215, 255), font=font_small)
 
-    # Headword + Reading (dynamically fit to 295px width without cutting off characters)
-    title_str = (
-        f"{result.headword} 【{result.reading}】"
-        if result.reading and result.reading != result.headword
-        else result.headword
-    )
-    title_display = title_str
-    try:
-        while font_title.getlength(title_display) > 295 and len(title_display) > 4:
-            title_display = title_display[:-2] + "…"
-    except Exception:
-        title_display = title_str[:26]
-    draw.text((12, 36), title_display, fill=(255, 230, 115), font=font_title)
+    # Headword + Reading — wrap to lines below instead of truncating
+    def _wrap_title_seg(seg: str, max_w: int, max_lines: int, out_lines: List[str]) -> None:
+        if not seg or len(out_lines) >= max_lines:
+            return
+        cur = ""
+        for ch in seg:
+            if len(out_lines) == max_lines - 1:
+                cand = cur + ch
+                if font_title.getlength(cand) > max_w and cur:
+                    while len(cur) > 1 and font_title.getlength(cur + "…") > max_w:
+                        cur = cur[:-1]
+                    out_lines.append(cur + "…")
+                    return
+                cur = cand
+            else:
+                cand = cur + ch
+                if font_title.getlength(cand) > max_w and cur:
+                    out_lines.append(cur)
+                    cur = ch
+                else:
+                    cur = cand
+        if cur and len(out_lines) < max_lines:
+            out_lines.append(cur)
+
+    has_reading = bool(result.reading and result.reading != result.headword)
+    full_title = f"{result.headword} 【{result.reading}】" if has_reading else result.headword
+    title_lines: List[str] = []
+    if font_title.getlength(full_title) <= 295:
+        title_lines = [full_title]
+    elif has_reading:
+        _wrap_title_seg(result.headword, 295, 3, title_lines)
+        _wrap_title_seg(f"【{result.reading}】", 295, 3, title_lines)
+    else:
+        _wrap_title_seg(result.headword, 295, 3, title_lines)
+    if not title_lines:
+        title_lines = [result.headword]
+
+    for ti, t_ln in enumerate(title_lines):
+        draw.text((12, 36 + ti * 22), t_ln, fill=(255, 230, 115), font=font_title)
+
+    extra_y = max(0, len(title_lines) - 1) * 22
+    pos_y = 64 + extra_y
+    div_y = 85 + extra_y
+    gloss_start_y = 90 + extra_y
+    vis_gloss = max(1, min(GLOSS_VISIBLE_LINES, (212 - gloss_start_y + 3) // 17))
 
     # Grammar note / Part of speech header (horizontally scrollable via D-Pad Left / Right)
-    max_gloss_y, max_pos_x = compute_popup_scroll_limits(result)
+    all_lines = _wrap_result_glosses(result)
+    max_gloss_y = max(0, len(all_lines) - vis_gloss)
+    _, max_pos_x = compute_popup_scroll_limits(result)
     pos_text = result.pos or "Word"
     pos_offset = max(0, min(pos_scroll_x, max_pos_x))
     pos_slice = pos_text[pos_offset : pos_offset + POS_WINDOW_CHARS]
 
     if pos_offset > 0:
-        draw.text((4, 64), "<", fill=(255, 220, 110), font=font_reading)
+        draw.text((4, pos_y), "<", fill=(255, 220, 110), font=font_reading)
     pos_x_start = 14 if pos_offset > 0 else 12
-    draw.text((pos_x_start, 64), pos_slice, fill=(125, 210, 175), font=font_reading)
+    draw.text((pos_x_start, pos_y), pos_slice, fill=(125, 210, 175), font=font_reading)
     if pos_offset < max_pos_x:
-        draw.rectangle([302, 62, 317, 83], fill=(20, 24, 34))
-        draw.text((306, 64), ">", fill=(255, 220, 110), font=font_reading)
+        draw.rectangle([302, pos_y - 2, 317, pos_y + 19], fill=(20, 24, 34))
+        draw.text((306, pos_y), ">", fill=(255, 220, 110), font=font_reading)
 
-    draw.line([(12, 85), (308, 85)], fill=(55, 68, 95), width=1)
+    draw.line([(12, div_y), (308, div_y)], fill=(55, 68, 95), width=1)
 
     # Word-wrapped English definitions (vertically scrollable via D-Pad Up / Down)
-    all_lines = _wrap_result_glosses(result)
     g_offset = max(0, min(gloss_scroll_y, max_gloss_y))
-    visible_lines = all_lines[g_offset : g_offset + GLOSS_VISIBLE_LINES]
+    visible_lines = all_lines[g_offset : g_offset + vis_gloss]
 
-    y_cursor = 90
+    y_cursor = gloss_start_y
     for line in visible_lines:
         if line.startswith("★"):
             line_col = (255, 195, 95)
@@ -7089,11 +7153,11 @@ def render_dictionary_popup(
 
     # Draw vertical scrollbar on the right edge if definitions exceed visible lines
     if max_gloss_y > 0:
-        track_top = 90
+        track_top = gloss_start_y
         track_bot = 206
-        track_h = track_bot - track_top
+        track_h = max(24, track_bot - track_top)
         draw.rectangle([311, track_top, 314, track_bot], fill=(38, 46, 68))
-        thumb_h = max(14, int(track_h * (GLOSS_VISIBLE_LINES / float(len(all_lines)))))
+        thumb_h = max(14, int(track_h * (vis_gloss / float(len(all_lines)))))
         thumb_y = track_top + int((track_h - thumb_h) * (g_offset / float(max_gloss_y)))
         draw.rectangle([311, thumb_y, 314, thumb_y + thumb_h], fill=(88, 166, 255))
 
@@ -7148,6 +7212,7 @@ def render_kanji_popup(
     target_screen_id: int,
     jamdict: Any = None,
     word_meta_mgr: Optional[WordMetaManager] = None,
+    out_hotspots: Optional[List[Tuple[int, int, int, int, int]]] = None,
 ) -> bytes:
     """
     Render a 320x400 RGB bitmap for the kanji popup. The 3DS receives the full tall canvas
@@ -7169,9 +7234,42 @@ def render_kanji_popup(
     font_body = load_cjk_ttf_font(12)
     font_small = load_cjk_ttf_font(11)
 
+    def _load_rad_fallback_font(size: int) -> Optional[ImageFont.ImageFont]:
+        for path in (
+            r"C:\Windows\Fonts\meiryo.ttc",
+            r"C:\Windows\Fonts\YuGothM.ttc",
+            r"C:\Windows\Fonts\YuGothR.ttc",
+        ):
+            if os.path.isfile(path):
+                try:
+                    return ImageFont.truetype(path, size=size)
+                except Exception:
+                    pass
+        return None
+
+    def _draw_text_with_rad_fallback(
+        pos: Tuple[int, int],
+        text: str,
+        fill: tuple,
+        font: ImageFont.ImageFont,
+        rad_font: Optional[ImageFont.ImageFont],
+    ) -> None:
+        if rad_font is None or not any(0x2E80 <= ord(ch) <= 0x2EFF for ch in text):
+            draw.text(pos, text, fill=fill, font=font)
+            return
+        pen_x = float(pos[0])
+        y0 = pos[1]
+        for ch in text:
+            use_font = rad_font if (0x2E80 <= ord(ch) <= 0x2EFF) else font
+            draw.text((int(round(pen_x)), y0), ch, fill=fill, font=use_font)
+            pen_x += float(use_font.getlength(ch))
+
+    rad_font_hdr = _load_rad_fallback_font(13)
+    rad_font_small = _load_rad_fallback_font(11)
+
     # Header text
     hdr_label = f"[Kanji Details]  {kanji_char}"
-    draw.text((10, 8), hdr_label, fill=(185, 215, 255), font=font_hdr)
+    _draw_text_with_rad_fallback((10, 8), hdr_label, (185, 215, 255), font_hdr, rad_font_hdr)
     draw.text((250, 9), "[B: Close]", fill=(150, 175, 210), font=font_small)
 
     # Get kanji details
@@ -7218,6 +7316,30 @@ def render_kanji_popup(
             cur = cur[:-2] + "…"
         return cur
 
+    def _is_clickable_kanji_or_rad(ch: str) -> bool:
+        cp = ord(ch)
+        return (
+            (0x4E00 <= cp <= 0x9FFF)
+            or (0x3400 <= cp <= 0x4DBF)
+            or (0xF900 <= cp <= 0xFAFF)
+            or (0x2E80 <= cp <= 0x2FDF)
+            or cp == 0x3005
+        )
+
+    def _record_text_hotspots(
+        text: str, x0: int, y0: int, font: ImageFont.ImageFont, line_h: int
+    ) -> None:
+        if out_hotspots is None or not text:
+            return
+        pen_x = float(x0)
+        for ch in text:
+            adv = float(font.getlength(ch))
+            if _is_clickable_kanji_or_rad(ch):
+                out_hotspots.append(
+                    (int(pen_x) - 1, y0 - 1, int(pen_x + adv) + 1, y0 + line_h, ord(ch))
+                )
+            pen_x += adv
+
     # --- Stroke order font (load once, used after body paste) ---
     stroke_font = None
     if os.path.isfile(KANJI_STROKE_FONT_PATH):
@@ -7251,6 +7373,7 @@ def render_kanji_popup(
     y_cur = 36
     for ln in meta_lines:
         draw.text((right_x, y_cur), ln, fill=(255, 220, 110), font=font_small)
+        _record_text_hotspots(ln, right_x, y_cur, font_small, 13)
         y_cur += 14
     y_cur += 2  # spacing before readings
 
@@ -7261,9 +7384,11 @@ def render_kanji_popup(
         for i, ln in enumerate(lines):
             if i == 0:
                 draw.text((right_x, y_cur), label, fill=(125, 210, 175), font=font_small)
+                _record_text_hotspots(label, right_x, y_cur, font_small, 14)
                 draw.text((right_x + 22, y_cur), ln, fill=color, font=font)
             else:
                 draw.text((right_x + 22, y_cur), ln, fill=color, font=font)
+            _record_text_hotspots(ln, right_x + 22, y_cur, font, 14)
             y_cur += 16
 
     if on_readings:
@@ -7283,7 +7408,14 @@ def render_kanji_popup(
         f"Radical: {rad_char} (#{rad_num})" if rad_char and rad_num
         else (f"Radical: #{rad_num}" if rad_num else "Radical: -")
     )
-    draw.text((right_x, y_cur), _fit_text(rad_lbl, font_small, READ_MAX_W), fill=(160, 185, 215), font=font_small)
+    rad_y0 = y_cur
+    _draw_text_with_rad_fallback(
+        (right_x, y_cur),
+        _fit_text(rad_lbl, font_small, READ_MAX_W),
+        (160, 185, 215),
+        font_small,
+        rad_font_small,
+    )
     y_cur += 14
     if rad_reading or rad_meaning:
         rad_sub_parts = []
@@ -7293,7 +7425,10 @@ def render_kanji_popup(
             rad_sub_parts.append(f"({rad_meaning})")
         for ln in _wrap_items(rad_sub_parts, " ", font_small, READ_MAX_W):
             draw.text((right_x, y_cur), ln, fill=(140, 170, 200), font=font_small)
+            _record_text_hotspots(ln, right_x, y_cur, font_small, 13)
             y_cur += 13
+    if out_hotspots is not None and rad_char:
+        out_hotspots.append((right_x - 2, rad_y0 - 2, 312, y_cur + 1, ord(rad_char[0])))
     y_cur += 4
 
     # Meanings (full width, below stroke box and right column)
@@ -7305,6 +7440,7 @@ def render_kanji_popup(
     y_m = y_meanings_start + 14
     for ln in wrapped_meanings:
         draw.text((12, y_m), ln, fill=(240, 245, 255), font=font_body)
+        _record_text_hotspots(ln, 12, y_m, font_body, 14)
         y_m += 14
 
     # Track actual content bottom (clamped to tall canvas height)
@@ -7871,6 +8007,8 @@ class _AnkiQueueItem:
     reading: str
     deck_name: str
     game_name: str
+    anki_creds: Optional[Tuple[str, str]] = None
+    account_key: str = "default"
     callbacks: List[Callable[[str, int], None]] = field(default_factory=list)
     done_events: List[threading.Event] = field(default_factory=list)
     status_result: str = ""
@@ -7895,18 +8033,35 @@ class AnkiExporter:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._cached_auth = None
-        self._cached_user = ""
+        self._cached_auths: Dict[Tuple[str, str], Any] = {}
         self._queue_lock = threading.Lock()
         self._queue_cv = threading.Condition(self._queue_lock)
         self._queue: deque[_AnkiQueueItem] = deque()
         self._active_item: Optional[_AnkiQueueItem] = None
         self._worker_thread: Optional[threading.Thread] = None
-        self._pending_sync_mode: str = ""
-        self._pending_ac_url: str = ""
-        self._pending_aw_user: str = ""
-        self._pending_aw_pass: str = ""
-        self._pending_aw_media: bool = False
+        self._pending_syncs: Dict[str, Tuple[str, Tuple[Any, ...]]] = {}
+
+    @staticmethod
+    def _account_key_for_creds(anki_creds: Optional[Tuple[str, str]]) -> str:
+        if anki_creds and anki_creds[0] and anki_creds[1]:
+            user_norm = anki_creds[0].strip().lower().encode("utf-8")
+            return "user:" + hashlib.sha256(user_norm).hexdigest()[:16]
+        return "default"
+
+    @staticmethod
+    def _sync_dir_for_creds(anki_creds: Optional[Tuple[str, str]]) -> str:
+        if anki_creds and anki_creds[0] and anki_creds[1]:
+            user_norm = anki_creds[0].strip().lower().encode("utf-8")
+            user_hash = hashlib.sha256(user_norm).hexdigest()[:16]
+            return os.path.join(ANKI_SYNC_DIR, "users", user_hash)
+        return ANKI_SYNC_DIR
+
+    @staticmethod
+    def _auth_cache_key(username: str, password: str) -> Tuple[str, str]:
+        return (
+            username.strip().lower(),
+            hashlib.sha256(password.encode("utf-8")).hexdigest(),
+        )
 
     def _ensure_worker_locked(self) -> None:
         if self._worker_thread is None or not self._worker_thread.is_alive():
@@ -8170,41 +8325,33 @@ class AnkiExporter:
         mode = sync_info[0]
         args = sync_info[1]
         if mode == "ankiconnect":
-            self._pending_sync_mode = "ankiconnect"
-            self._pending_ac_url = str(args[0])
+            ac_url = str(args[0])
+            self._pending_syncs[f"ankiconnect:{ac_url}"] = ("ankiconnect", (ac_url,))
         elif mode == "ankiweb":
-            username, password, has_media = args
-            self._pending_sync_mode = "ankiweb"
-            self._pending_aw_user = str(username)
-            self._pending_aw_pass = str(password)
-            self._pending_aw_media = self._pending_aw_media or bool(has_media)
+            username, password, has_media, sync_dir = args
+            key = f"ankiweb:{sync_dir}"
+            prev_media = False
+            prev = self._pending_syncs.get(key)
+            if prev is not None and prev[0] == "ankiweb" and len(prev[1]) >= 3:
+                prev_media = bool(prev[1][2])
+            self._pending_syncs[key] = (
+                "ankiweb",
+                (str(username), str(password), prev_media or bool(has_media), str(sync_dir)),
+            )
 
     def _consume_pending_sync_locked(self) -> Optional[Tuple[str, Tuple[Any, ...]]]:
-        mode = self._pending_sync_mode
-        if not mode:
+        if not self._pending_syncs:
             return None
-        self._pending_sync_mode = ""
-        if mode == "ankiconnect":
-            url = self._pending_ac_url
-            self._pending_ac_url = ""
-            return ("ankiconnect", (url,))
-        if mode == "ankiweb":
-            u = self._pending_aw_user
-            p = self._pending_aw_pass
-            has_media = self._pending_aw_media
-            self._pending_aw_user = ""
-            self._pending_aw_pass = ""
-            self._pending_aw_media = False
-            return ("ankiweb", (u, p, has_media))
-        return None
+        first_key = next(iter(self._pending_syncs))
+        return self._pending_syncs.pop(first_key)
 
     def _run_pending_sync(self, sync_task: Tuple[str, Tuple[Any, ...]]) -> None:
         mode, args = sync_task
         if mode == "ankiconnect":
             self._sync_ankiconnect(str(args[0]))
         elif mode == "ankiweb":
-            username, password, has_media = args
-            self._sync_to_ankiweb_bg(str(username), str(password), bool(has_media))
+            username, password, has_media, sync_dir = args
+            self._sync_to_ankiweb_bg(str(username), str(password), bool(has_media), str(sync_dir))
 
     def _worker_loop(self) -> None:
         while True:
@@ -8213,7 +8360,7 @@ class AnkiExporter:
 
             with self._queue_lock:
                 while not self._queue:
-                    if self._pending_sync_mode:
+                    if self._pending_syncs:
                         self._queue_cv.wait(timeout=self.SYNC_DEBOUNCE_SEC)
                         if self._queue:
                             continue
@@ -8285,40 +8432,51 @@ class AnkiExporter:
         media_item = self._encode_screenshot_jpeg(item.screenshot_img)
 
         with self._lock:
-            anki_mode = cfg.get("anki_mode")
-            if not anki_mode:
-                if cfg.get("use_ankiconnect", True):
-                    anki_mode = "ankiconnect"
-                elif _load_anki_credentials()[0]:
-                    anki_mode = "ankiweb"
-                else:
-                    anki_mode = "ankiconnect"
+            has_session_creds = bool(
+                item.anki_creds and item.anki_creds[0] and item.anki_creds[1]
+            )
+            if has_session_creds:
+                username, password = item.anki_creds[0].strip(), item.anki_creds[1]
+                sync_dir = self._sync_dir_for_creds(item.anki_creds)
+            else:
+                if bool(cfg.get("multi_user_mode", False)):
+                    return "AnkiWeb login required (Multi-3DS mode)", None
 
-            if anki_mode == "disabled":
-                return "Anki disabled in settings", None
+                anki_mode = cfg.get("anki_mode")
+                if not anki_mode:
+                    if cfg.get("use_ankiconnect", True):
+                        anki_mode = "ankiconnect"
+                    elif _load_anki_credentials()[0]:
+                        anki_mode = "ankiweb"
+                    else:
+                        anki_mode = "ankiconnect"
 
-            if anki_mode == "ankiconnect":
-                ac_url = cfg.get("ankiconnect_url", "http://127.0.0.1:8765")
-                ac_status, needs_sync = self._try_ankiconnect(
-                    deck_name,
-                    result.headword,
-                    result.reading,
-                    base_front_html,
-                    back_html,
-                    tags,
-                    media_item,
-                    url=ac_url,
-                    defer_sync=True,
-                )
-                if ac_status is not None:
-                    sync_info = ("ankiconnect", (ac_url,)) if needs_sync else None
-                    return ac_status, sync_info
-                return "Anki Error: Start Anki Desktop with AnkiConnect", None
+                if anki_mode == "disabled":
+                    return "Anki disabled in settings", None
 
-            # 2. Direct AnkiWeb Cloud Sync via official `anki` library
-            username, password = _load_anki_credentials()
-            if not username or not password:
-                return "Set AnkiWeb login in GUI Anki Settings", None
+                if anki_mode == "ankiconnect":
+                    ac_url = cfg.get("ankiconnect_url", "http://127.0.0.1:8765")
+                    ac_status, needs_sync = self._try_ankiconnect(
+                        deck_name,
+                        result.headword,
+                        result.reading,
+                        base_front_html,
+                        back_html,
+                        tags,
+                        media_item,
+                        url=ac_url,
+                        defer_sync=True,
+                    )
+                    if ac_status is not None:
+                        sync_info = ("ankiconnect", (ac_url,)) if needs_sync else None
+                        return ac_status, sync_info
+                    return "Anki Error: Start Anki Desktop with AnkiConnect", None
+
+                # 2. Direct AnkiWeb Cloud Sync via official `anki` library (server default)
+                username, password = _load_anki_credentials()
+                if not username or not password:
+                    return "Set AnkiWeb login in GUI Anki Settings", None
+                sync_dir = ANKI_SYNC_DIR
 
             try:
                 from anki.collection import Collection
@@ -8326,31 +8484,40 @@ class AnkiExporter:
             except ImportError:
                 return "Anki Error: pip install anki required", None
 
-            os.makedirs(ANKI_SYNC_DIR, exist_ok=True)
-            col_path = os.path.join(ANKI_SYNC_DIR, "collection.anki2")
+            os.makedirs(sync_dir, exist_ok=True)
+            col_path = os.path.join(sync_dir, "collection.anki2")
             is_fresh_mirror = not os.path.exists(col_path)
+            auth_key = self._auth_cache_key(username, password)
 
             col = None
             try:
                 col = Collection(col_path)
 
-                # Only block on an initial download if our local mirror does not exist yet
-                if is_fresh_mirror or col.note_count() == 0:
-                    if self._cached_auth is None or self._cached_user != username:
-                        endpoint = self._cached_auth.endpoint if self._cached_auth else None
-                        self._cached_auth = col.sync_login(username, password, endpoint)
-                        self._cached_user = username
-                    auth = self._cached_auth
-                    sync_out = col.sync_collection(auth, sync_media=False)
-                    if sync_out.new_endpoint:
-                        auth = SyncAuth(hkey=auth.hkey, endpoint=sync_out.new_endpoint)
-                        self._cached_auth = auth
-                    if sync_out.required in (SyncOutput.FULL_DOWNLOAD, SyncOutput.FULL_SYNC):
-                        col.full_upload_or_download(
-                            auth=auth, server_usn=sync_out.server_media_usn, upload=False
-                        )
-                        col.close()
-                        col = Collection(col_path)
+                # Verify credentials before mutating mirror for new session accounts, and download initial mirror if empty
+                if is_fresh_mirror or col.note_count() == 0 or (has_session_creds and auth_key not in self._cached_auths):
+                    auth = self._cached_auths.get(auth_key)
+                    if auth is None:
+                        auth = col.sync_login(username, password, None)
+                        self._cached_auths[auth_key] = auth
+                    if is_fresh_mirror or col.note_count() == 0:
+                        try:
+                            sync_out = col.sync_collection(auth, sync_media=False)
+                        except Exception as first_sync_exc:
+                            if "sync again" in str(first_sync_exc).lower():
+                                auth = col.sync_login(username, password, None)
+                                self._cached_auths[auth_key] = auth
+                                sync_out = col.sync_collection(auth, sync_media=False)
+                            else:
+                                raise
+                        if sync_out.new_endpoint:
+                            auth = SyncAuth(hkey=auth.hkey, endpoint=sync_out.new_endpoint)
+                            self._cached_auths[auth_key] = auth
+                        if sync_out.required in (SyncOutput.FULL_DOWNLOAD, SyncOutput.FULL_SYNC):
+                            col.full_upload_or_download(
+                                auth=auth, server_usn=sync_out.server_media_usn, upload=False
+                            )
+                            col.close()
+                            col = Collection(col_path)
 
                 did = col.decks.id(deck_name)
                 model = col.models.by_name("Basic") or col.models.all()[0]
@@ -8386,7 +8553,7 @@ class AnkiExporter:
                 note.tags = tags
                 col.add_note(note, did)
             except Exception as exc:
-                self._cached_auth = None
+                self._cached_auths.pop(auth_key, None)
                 logger.exception("Local Anki note write failed: %s", exc)
                 return f"Anki Error: {str(exc)[:30]}", None
             finally:
@@ -8396,7 +8563,7 @@ class AnkiExporter:
                     except Exception:
                         pass
 
-        return f"{action_label}: {game_name}", ("ankiweb", (username, password, media_item is not None))
+        return f"{action_label}: {game_name}", ("ankiweb", (username, password, media_item is not None, sync_dir))
 
     def _enqueue_item(
         self,
@@ -8405,18 +8572,21 @@ class AnkiExporter:
         screenshot_img: Optional[Image.Image] = None,
         on_done: Optional[Callable[[str, int], None]] = None,
         done_event: Optional[threading.Event] = None,
+        anki_creds: Optional[Tuple[str, str]] = None,
     ) -> Tuple[int, str, Optional[_AnkiQueueItem]]:
         if not result.found or not result.headword:
             return 0, "Anki Error: No valid dictionary match", None
 
         cfg = _load_anki_config()
         game_name, deck_name = self._resolve_deck_for_game(title_id, cfg)
+        account_key = self._account_key_for_creds(anki_creds)
 
         with self._queue_lock:
             existing: Optional[_AnkiQueueItem] = None
             for q_item in self._queue:
                 if (
-                    q_item.deck_name == deck_name
+                    q_item.account_key == account_key
+                    and q_item.deck_name == deck_name
                     and q_item.headword == result.headword
                     and q_item.reading == result.reading
                 ):
@@ -8438,6 +8608,8 @@ class AnkiExporter:
                     reading=result.reading,
                     deck_name=deck_name,
                     game_name=game_name,
+                    anki_creds=anki_creds,
+                    account_key=account_key,
                     callbacks=[on_done] if on_done is not None else [],
                     done_events=[done_event] if done_event is not None else [],
                 )
@@ -8460,6 +8632,7 @@ class AnkiExporter:
         title_id: Union[int, str],
         screenshot_img: Optional[Image.Image] = None,
         on_done: Optional[Callable[[str, int], None]] = None,
+        anki_creds: Optional[Tuple[str, str]] = None,
     ) -> Tuple[int, str]:
         """
         Enqueue a card add without blocking the caller.
@@ -8470,6 +8643,7 @@ class AnkiExporter:
             title_id,
             screenshot_img=screenshot_img,
             on_done=on_done,
+            anki_creds=anki_creds,
         )
         return q_len, immediate_banner
 
@@ -8478,6 +8652,7 @@ class AnkiExporter:
         result: DictionaryResult,
         title_id: Union[int, str],
         screenshot_img: Optional[Image.Image] = None,
+        anki_creds: Optional[Tuple[str, str]] = None,
     ) -> str:
         """
         Add `result` (along with the full OCR context sentence and 3DS screenshot)
@@ -8490,42 +8665,46 @@ class AnkiExporter:
             title_id,
             screenshot_img=screenshot_img,
             done_event=done_evt,
+            anki_creds=anki_creds,
         )
         if q_len == 0 or target_item is None:
             return immediate_banner
         done_evt.wait()
         return target_item.status_result
 
-    def _sync_to_ankiweb_bg(self, username: str, password: str, has_media: bool) -> None:
+    def _sync_to_ankiweb_bg(
+        self, username: str, password: str, has_media: bool, sync_dir: str = ANKI_SYNC_DIR
+    ) -> None:
         """Background worker that syncs `collection.anki2` and newly written screenshots to AnkiWeb."""
         with self._lock:
             col = None
+            auth_key = self._auth_cache_key(username, password)
             try:
                 from anki.collection import Collection
                 from anki.sync import SyncAuth, SyncOutput
 
-                col_path = os.path.join(ANKI_SYNC_DIR, "collection.anki2")
-                media_db_path = os.path.join(ANKI_SYNC_DIR, "collection.media.db2")
+                os.makedirs(sync_dir, exist_ok=True)
+                col_path = os.path.join(sync_dir, "collection.anki2")
+                media_db_path = os.path.join(sync_dir, "collection.media.db2")
                 col = Collection(col_path)
 
-                if self._cached_auth is None or self._cached_user != username:
-                    endpoint = self._cached_auth.endpoint if self._cached_auth else None
-                    self._cached_auth = col.sync_login(username, password, endpoint)
-                    self._cached_user = username
+                auth = self._cached_auths.get(auth_key)
+                if auth is None:
+                    auth = col.sync_login(username, password, None)
+                    self._cached_auths[auth_key] = auth
 
-                auth = self._cached_auth
                 try:
                     sync_out = col.sync_collection(auth, sync_media=False)
                 except Exception as first_sync_exc:
                     if "sync again" in str(first_sync_exc).lower():
                         auth = col.sync_login(username, password, None)
-                        self._cached_auth = auth
+                        self._cached_auths[auth_key] = auth
                         sync_out = col.sync_collection(auth, sync_media=False)
                     else:
                         raise
                 if sync_out.new_endpoint:
                     auth = SyncAuth(hkey=auth.hkey, endpoint=sync_out.new_endpoint)
-                    self._cached_auth = auth
+                    self._cached_auths[auth_key] = auth
 
                 if sync_out.required in (SyncOutput.FULL_UPLOAD, SyncOutput.FULL_SYNC):
                     col.full_upload_or_download(
@@ -8557,7 +8736,7 @@ class AnkiExporter:
 
                 logger.info("Background AnkiWeb sync completed.")
             except Exception as exc:
-                self._cached_auth = None
+                self._cached_auths.pop(auth_key, None)
                 logger.warning("Background AnkiWeb sync error: %s", exc)
             finally:
                 if col is not None:
@@ -8728,7 +8907,7 @@ _auth_lock = threading.Lock()
 _auth_failures: Dict[str, Tuple[List[float], float]] = {}  # ip -> (failure_timestamps, ban_until_epoch)
 _session_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_CONNECTIONS)
 _active_sessions_lock = threading.Lock()
-_active_session_socks: List[socket.socket] = []
+_active_session_socks: List[Tuple[socket.socket, str]] = []
 
 _preauth_lock = threading.Lock()
 _preauth_active: List[Tuple[socket.socket, str, float]] = []  # [(conn, ip, start_time), ...]
@@ -8872,19 +9051,21 @@ def _record_auth_result(ip: str, success: bool) -> None:
 
 def authenticate_client(
     conn: socket.socket, addr: Tuple[str, int]
-) -> Optional[Tuple[SHA256Stream, SHA256Stream]]:
+) -> Optional[Tuple[SHA256Stream, SHA256Stream, str, str]]:
     """
     Execute the Ephemeral X25519 ECDH + Mutual PSK SHA-256 Handshake (Perfect Forward Secrecy):
     1. Generate ephemeral server keypair (`s_priv`, `s_pub = X25519(s_priv, 9)`) and send `s_pub` (32B).
-    2. Enforce 1.2s cumulative deadline to receive `c_pub (32B) || client_digest (32B)`.
+    2. Enforce cumulative deadline to receive `c_pub (32B) || client_digest (32B)`.
     3. Filter probe payloads (HTTP, TLS ClientHello, SSH) and instantly ban scanner IPs for 1 hour.
     4. Compute `shared_secret = X25519(s_priv, c_pub)` (rejecting all-zero low-order points).
-    5. Verify `client_digest == SHA256(shared_secret || s_pub || c_pub || OCR_PSK || "CLIENT")`.
-    6. Send `server_digest = SHA256(shared_secret || s_pub || c_pub || OCR_PSK || "SERVER")` (32B).
+    5. Verify `client_digest` against all active per-3DS PSKs and the pending pairing PSK.
+    6. Send `server_digest = SHA256(shared_secret || s_pub || c_pub || matched_psk || "SERVER")` (32B).
     7. Derive directional `(rx_stream, tx_stream)`.
     """
     ip = addr[0]
-    psk = load_ocr_psk()
+    candidates = psk_store.get_all_valid_psks(APP_DIR)
+    if not candidates:
+        candidates = [(load_ocr_psk(), "legacy", None)]
     conn.settimeout(AUTH_TIMEOUT_SEC)
     s_priv = secrets.token_bytes(X25519_KEY_SIZE)
     s_pub = x25519_basepoint(s_priv)
@@ -8910,7 +9091,19 @@ def authenticate_client(
     probe_prefixes = (b"GET ", b"POST ", b"HEAD ", b"CONNECT ", b"OPTIONS ", b"\x16\x03", b"SSH-")
     if client_reply.startswith(probe_prefixes):
         _instant_ban_scanner(ip)
-        logger.warning("Instant 1-hr ban on scanner/crawler from %s:%d (probe detected)", *addr)
+        probe_data = client_reply
+        try:
+            conn.settimeout(0.05)
+            extra = conn.recv(512)
+            if extra:
+                probe_data += extra
+        except OSError:
+            pass
+        logger.warning(
+            "Instant 1-hr ban on scanner/crawler from %s:%d (probe detected: %r)",
+            *addr,
+            probe_data[:512],
+        )
         return None
 
     if len(client_reply) != (X25519_KEY_SIZE + SHA256_SIZE):
@@ -8928,18 +9121,26 @@ def authenticate_client(
         logger.warning("Authentication rejected (low-order X25519 point) from %s:%d", *addr)
         return None
 
-    expected_client_hash = hashlib.sha256(
-        shared_secret + s_pub + c_pub + psk + b"CLIENT"
-    ).digest()
+    matched_psk: Optional[bytes] = None
+    matched_role = ""
+    matched_dev_id: Optional[str] = None
+    for cand_psk, role, dev_id in candidates:
+        expected_client_hash = hashlib.sha256(
+            shared_secret + s_pub + c_pub + cand_psk + b"CLIENT"
+        ).digest()
+        if hmac.compare_digest(client_hash, expected_client_hash) and matched_psk is None:
+            matched_psk = cand_psk
+            matched_role = role
+            matched_dev_id = dev_id
 
-    if not hmac.compare_digest(client_hash, expected_client_hash):
+    if matched_psk is None:
         _record_auth_result(ip, False)
         logger.warning("Authentication rejected (hash mismatch) from %s:%d", *addr)
         return None
 
     # Prove server authenticity to the 3DS before it uploads any screen pixels
     server_hash = hashlib.sha256(
-        shared_secret + s_pub + c_pub + psk + b"SERVER"
+        shared_secret + s_pub + c_pub + matched_psk + b"SERVER"
     ).digest()
     try:
         conn.sendall(server_hash)
@@ -8947,10 +9148,15 @@ def authenticate_client(
         return None
 
     _record_auth_result(ip, True)
-    logger.info("Client %s:%d mutually authenticated (X25519 PFS encrypted stream active).", *addr)
-    rx_stream = SHA256Stream(shared_secret, s_pub, c_pub, psk, STREAM_DIR_C2S)
-    tx_stream = SHA256Stream(shared_secret, s_pub, c_pub, psk, STREAM_DIR_S2C)
-    return rx_stream, tx_stream
+    logger.info(
+        "Client %s:%d mutually authenticated (role=%s%s, X25519 PFS encrypted stream active).",
+        *addr,
+        matched_role,
+        f", id={matched_dev_id}" if matched_dev_id else "",
+    )
+    rx_stream = SHA256Stream(shared_secret, s_pub, c_pub, matched_psk, STREAM_DIR_C2S)
+    tx_stream = SHA256Stream(shared_secret, s_pub, c_pub, matched_psk, STREAM_DIR_S2C)
+    return rx_stream, tx_stream, matched_psk.decode("utf-8", errors="replace"), matched_role
 
 
 def export_latest_ocr_state(
@@ -9049,11 +9255,16 @@ def handle_3ds_session(
                 return
 
             # If all session slots are occupied by stale half-open sockets (e.g., dropped mobile hotspot),
-            # evict the oldest active session so a newly authenticated 3DS never locks itself out.
+            # evict the oldest active session (preferring same IP first) so a newly authenticated 3DS never locks itself out.
             if not _session_semaphore.acquire(blocking=False):
                 with _active_sessions_lock:
                     if _active_session_socks:
-                        stale_sock = _active_session_socks.pop(0)
+                        evict_idx = 0
+                        for idx, (_, s_ip) in enumerate(_active_session_socks):
+                            if s_ip == ip:
+                                evict_idx = idx
+                                break
+                        stale_sock, _ = _active_session_socks.pop(evict_idx)
                         try:
                             stale_sock.shutdown(socket.SHUT_RDWR)
                         except OSError:
@@ -9068,14 +9279,47 @@ def handle_3ds_session(
 
             session_acquired = True
             with _active_sessions_lock:
-                _active_session_socks.append(conn)
+                _active_session_socks.append((conn, ip))
 
-            rx_stream, tx_stream = streams
+            rx_stream, tx_stream, matched_psk_str, matched_role = streams
 
             title_raw = rx_stream.recv_frame(conn, TITLE_ID_SIZE, max_total_sec=FB_TRANSFER_TIMEOUT_SEC)
             if title_raw is None:
                 logger.warning("Connection closed while receiving Title_ID from %s:%d.", *addr)
                 return
+
+            if title_raw == PAIRING_PING_MAGIC:
+                len_raw = rx_stream.recv_frame(conn, 2, max_total_sec=5.0)
+                if len_raw is None:
+                    logger.warning("Connection closed while receiving pairing info length from %s:%d.", *addr)
+                    return
+                (info_len,) = struct.unpack("!H", len_raw)
+                if info_len <= 0 or info_len > MAX_DEVICE_INFO_LEN:
+                    logger.warning("Invalid pairing info length %d from %s:%d.", info_len, *addr)
+                    return
+                info_raw = rx_stream.recv_frame(conn, info_len, max_total_sec=5.0)
+                if info_raw is None:
+                    logger.warning("Connection closed while receiving pairing info from %s:%d.", *addr)
+                    return
+                lines = info_raw.decode("utf-8", errors="replace").split("\n")
+                dev_id = lines[0].strip() if len(lines) > 0 else ""
+                dev_name = lines[1].strip() if len(lines) > 1 else "3DS"
+                dev_model = lines[2].strip() if len(lines) > 2 else "3DS"
+                rotated, _, dev_rec = psk_store.claim_pairing_psk(
+                    APP_DIR, matched_psk_str, dev_id, dev_name, dev_model
+                )
+                logger.info(
+                    "[PAIRING] Paired 3DS '%s' (%s, ID=%s) from %s:%d%s",
+                    _sanitize_log_str(dev_rec.get("name", dev_name)),
+                    _sanitize_log_str(dev_rec.get("model", dev_model)),
+                    _sanitize_log_str(dev_rec.get("device_id", dev_id)),
+                    *addr,
+                    " — generated new QR pairing key." if rotated else ".",
+                )
+                tx_stream.send_frame(conn, b"\x01")
+                return
+
+            psk_store.touch_device_last_seen(APP_DIR, matched_psk_str, fallback_ip=ip)
             (active_title_id,) = struct.unpack(TITLE_ID_FMT, title_raw)
             active_game_name = resolve_3ds_game_name(active_title_id)
             logger.info(
@@ -9142,11 +9386,14 @@ def handle_3ds_session(
             last_x: int = 0
             last_y: int = 0
             last_kanji_char: str = ""
+            last_kanji_target_scr: int = SCREEN_ID_TOP
+            last_kanji_hotspots: List[Tuple[int, int, int, int, int]] = []
             status_banner: str = ""
             last_ocr_time: float = 0.0
             active_footer_keys = ["A", "SEL", "X"]
             client_supports_bundle: bool = False
             client_supports_screen_bundle: bool = False
+            session_anki_creds: Optional[Tuple[str, str]] = None
 
             def _safe_send_pair(hdr: bytes, payload: bytes) -> bool:
                 with tx_lock:
@@ -9307,7 +9554,7 @@ def handle_3ds_session(
                             pipeline.precache_screens_batch([top_img, bot_img], ocr_mode=precache_mode)
                         _push_screen_bundles(precache_mode)
                 except Exception as ex:
-                    logger.debug("Background screen precache/bundle error: %s", ex)
+                    logger.warning("Background screen precache/bundle error: %s", ex, exc_info=True)
             threading.Thread(target=_bg_precache, daemon=True).start()
 
             def _send_active_popup(banner_override: str = "") -> None:
@@ -9349,11 +9596,15 @@ def handle_3ds_session(
                             last_target_screen_id,
                         )
 
-            def _send_status_update(banner_txt: str, target_scr_override: Optional[int] = None) -> None:
+            def _send_status_update(
+                banner_txt: str,
+                target_scr_override: Optional[int] = None,
+                extra_flags: int = 0,
+            ) -> None:
                 t_scr = last_target_screen_id if target_scr_override is None else target_scr_override
                 if client_supports_bundle:
                     pkt = build_status_banner_packet(banner_txt)
-                    hdr = struct.pack(POPUP_HEADER_FMT, t_scr | POPUP_STATUS_FLAG, len(pkt))
+                    hdr = struct.pack(POPUP_HEADER_FMT, t_scr | POPUP_STATUS_FLAG | extra_flags, len(pkt))
                     _safe_send_pair(hdr, pkt)
                 else:
                     prog_rgb = render_dictionary_popup(
@@ -9387,6 +9638,10 @@ def handle_3ds_session(
                 click_data = rx_stream.recv_frame(conn, CLICK_PACKET_SIZE)
                 if click_data is None:
                     logger.info("3DS client %s:%d closed the session.", *addr)
+                    break
+
+                if not psk_store.is_psk_valid(APP_DIR, matched_psk_str):
+                    logger.warning("Terminating session for %s:%d: PSK was invalidated.", *addr)
                     break
 
                 cmd_or_screen, x, y = struct.unpack(CLICK_PACKET_FMT, click_data)
@@ -9765,6 +10020,22 @@ def handle_3ds_session(
                             entry_idx = y
                         result = active_results[entry_idx]
 
+                    with anki_state_lock:
+                        creds_snap = session_anki_creds
+
+                    if not (creds_snap and creds_snap[0] and creds_snap[1]) and bool(_load_anki_config().get("multi_user_mode", False)):
+                        prompt_msg = "AnkiWeb login required (Multi-3DS mode)"
+                        logger.info(
+                            "Multi-3DS mode: prompting %s:%d to set AnkiWeb login.",
+                            *addr,
+                        )
+                        _send_status_update(
+                            prompt_msg,
+                            target_scr_override=last_target_screen_id,
+                            extra_flags=POPUP_ANKI_LOGIN_PROMPT_FLAG,
+                        )
+                        continue
+
                     ss_img = _build_anki_screenshot()
 
                     if not client_supports_bundle:
@@ -9772,7 +10043,7 @@ def handle_3ds_session(
                         progress_banner = f"Adding card to {active_game_name} deck..."
                         _send_status_update(progress_banner)
                         status_banner = _anki_exporter.add_card_for_game(
-                            result, active_title_id, screenshot_img=ss_img
+                            result, active_title_id, screenshot_img=ss_img, anki_creds=creds_snap
                         )
                         logger.info(
                             "Anki export for '%s' (Title_ID=0x%016X): %s",
@@ -9837,6 +10108,7 @@ def handle_3ds_session(
                                 active_title_id,
                                 screenshot_img=ss_img,
                                 on_done=_on_anki_done,
+                                anki_creds=creds_snap,
                             )
                             if q_len == 0:
                                 session_anki_pending = max(0, session_anki_pending - 1)
@@ -9857,15 +10129,56 @@ def handle_3ds_session(
                         target_kanji_scr = SCREEN_ID_BOTTOM
                     else:
                         target_kanji_scr = SCREEN_ID_BOTTOM if last_target_screen_id == SCREEN_ID_TOP else SCREEN_ID_TOP
+                    last_kanji_target_scr = target_kanji_scr
+                    last_kanji_hotspots = []
                     logger.info("Lookup Kanji '%s' (U+%04X) -> target screen %d", kanji_char, cp_val, target_kanji_scr)
                     kanji_rgb = render_kanji_popup(
                         kanji_char,
                         target_kanji_scr,
                         jamdict=pipeline.jamdict,
                         word_meta_mgr=pipeline.word_meta_mgr,
+                        out_hotspots=last_kanji_hotspots,
                     )
                     hdr = struct.pack(POPUP_HEADER_FMT, target_kanji_scr | POPUP_KANJI_FLAG, len(kanji_rgb))
                     _safe_send_pair(hdr, kanji_rgb)
+                    continue
+                elif cmd_or_screen == CMD_CLICK_KANJI_WIN:
+                    pop_x, tall_y = x, y
+                    hit_cp = 0
+                    for hx1, hy1, hx2, hy2, hcp in last_kanji_hotspots:
+                        if hx1 <= pop_x <= hx2 and hy1 <= tall_y <= hy2:
+                            hit_cp = hcp
+                            break
+                    if hit_cp == 0:
+                        for hx1, hy1, hx2, hy2, hcp in last_kanji_hotspots:
+                            if (hx1 - 3) <= pop_x <= (hx2 + 3) and (hy1 - 3) <= tall_y <= (hy2 + 3):
+                                hit_cp = hcp
+                                break
+                    if hit_cp != 0:
+                        try:
+                            next_kanji = chr(hit_cp)
+                        except (ValueError, OverflowError):
+                            continue
+                        if next_kanji != last_kanji_char:
+                            last_kanji_char = next_kanji
+                            last_kanji_hotspots = []
+                            logger.info(
+                                "Lookup Kanji (in-window) '%s' (U+%04X) -> target screen %d",
+                                next_kanji,
+                                hit_cp,
+                                last_kanji_target_scr,
+                            )
+                            kanji_rgb = render_kanji_popup(
+                                next_kanji,
+                                last_kanji_target_scr,
+                                jamdict=pipeline.jamdict,
+                                word_meta_mgr=pipeline.word_meta_mgr,
+                                out_hotspots=last_kanji_hotspots,
+                            )
+                            hdr = struct.pack(
+                                POPUP_HEADER_FMT, last_kanji_target_scr | POPUP_KANJI_FLAG, len(kanji_rgb)
+                            )
+                            _safe_send_pair(hdr, kanji_rgb)
                     continue
                 elif cmd_or_screen == CMD_ADD_ANKI_KANJI:
                     if not last_kanji_char:
@@ -9875,6 +10188,19 @@ def handle_3ds_session(
                     ss_img = _build_anki_screenshot()
 
                     with anki_state_lock:
+                        creds_snap = session_anki_creds
+                        if not (creds_snap and creds_snap[0] and creds_snap[1]) and bool(_load_anki_config().get("multi_user_mode", False)):
+                            prompt_msg = "AnkiWeb login required (Multi-3DS mode)"
+                            logger.info(
+                                "Multi-3DS mode: prompting %s:%d to set AnkiWeb login (kanji).",
+                                *addr,
+                            )
+                            _send_status_update(
+                                prompt_msg,
+                                target_scr_override=target_scr_snap,
+                                extra_flags=POPUP_ANKI_LOGIN_PROMPT_FLAG,
+                            )
+                            continue
                         anki_req_seq += 1
                         req_id = anki_req_seq
                         session_anki_pending += 1
@@ -9908,10 +10234,87 @@ def handle_3ds_session(
                             active_title_id,
                             screenshot_img=ss_img,
                             on_done=_on_anki_kanji_done,
+                            anki_creds=creds_snap,
                         )
                         if q_len == 0:
                             session_anki_pending = max(0, session_anki_pending - 1)
                         _send_status_update(immediate_banner, target_scr_override=target_scr_snap)
+                    continue
+                elif cmd_or_screen == CMD_SET_ANKI_CREDS:
+                    u_len, p_len = x, y
+                    if u_len > MAX_ANKI_CRED_FIELD_LEN or p_len > MAX_ANKI_CRED_FIELD_LEN:
+                        logger.warning(
+                            "Invalid Anki credential lengths (%d, %d) from %s:%d; closing session.",
+                            u_len,
+                            p_len,
+                            *addr,
+                        )
+                        break
+                    if u_len == 0 and p_len == 0:
+                        with anki_state_lock:
+                            session_anki_creds = None
+                        logger.info(
+                            "Client %s:%d cleared session AnkiWeb credentials (using server default).",
+                            *addr,
+                        )
+                        continue
+                    if u_len == 0 or p_len == 0:
+                        if rx_stream.recv_frame(conn, u_len + p_len, max_total_sec=5.0) is None:
+                            break
+                        with anki_state_lock:
+                            session_anki_creds = None
+                        logger.warning(
+                            "Incomplete AnkiWeb credentials (%d, %d) from %s:%d; cleared session override.",
+                            u_len,
+                            p_len,
+                            *addr,
+                        )
+                        continue
+                    cred_raw = rx_stream.recv_frame(conn, u_len + p_len, max_total_sec=5.0)
+                    if cred_raw is None:
+                        logger.warning("Connection closed while receiving Anki credentials from %s:%d.", *addr)
+                        break
+                    u_str = cred_raw[:u_len].decode("utf-8", errors="replace").strip()
+                    p_str = cred_raw[u_len:].decode("utf-8", errors="replace")
+                    with anki_state_lock:
+                        session_anki_creds = (u_str, p_str) if (u_str and p_str) else None
+                    if u_str and p_str:
+                        masked_u = (u_str[:3] + "***") if len(u_str) > 3 else "***"
+                        logger.info(
+                            "Client %s:%d set session AnkiWeb credentials for user '%s'.",
+                            *addr,
+                            _sanitize_log_str(masked_u),
+                        )
+                    else:
+                        logger.info(
+                            "Client %s:%d cleared session AnkiWeb credentials (empty after strip).",
+                            *addr,
+                        )
+                    continue
+                elif cmd_or_screen == CMD_SET_DEVICE_INFO:
+                    info_len = x
+                    if info_len <= 0 or info_len > MAX_DEVICE_INFO_LEN:
+                        logger.warning("Invalid device info length %d from %s:%d; closing session.", info_len, *addr)
+                        break
+                    info_raw = rx_stream.recv_frame(conn, info_len, max_total_sec=5.0)
+                    if info_raw is None:
+                        logger.warning("Connection closed while receiving device info from %s:%d.", *addr)
+                        break
+                    lines = info_raw.decode("utf-8", errors="replace").split("\n")
+                    dev_id = lines[0].strip() if len(lines) > 0 else ""
+                    dev_name = lines[1].strip() if len(lines) > 1 else "3DS"
+                    dev_model = lines[2].strip() if len(lines) > 2 else "3DS"
+                    rotated, _, dev_rec = psk_store.claim_pairing_psk(
+                        APP_DIR, matched_psk_str, dev_id, dev_name, dev_model
+                    )
+                    logger.info(
+                        "[PAIRING] Updated device info for '%s' (%s, ID=%s) from %s:%d%s",
+                        _sanitize_log_str(dev_rec.get("name", dev_name)),
+                        _sanitize_log_str(dev_rec.get("model", dev_model)),
+                        _sanitize_log_str(dev_rec.get("device_id", dev_id)),
+                        *addr,
+                        " — generated new QR pairing key." if rotated else ".",
+                    )
                     continue
                 else:
                     logger.warning("Unknown Screen_ID/Cmd=0x%02X; ignoring packet.", cmd_or_screen)
@@ -9929,8 +10332,9 @@ def handle_3ds_session(
             pass
         if session_acquired:
             with _active_sessions_lock:
-                if conn in _active_session_socks:
-                    _active_session_socks.remove(conn)
+                _active_session_socks[:] = [
+                    (s, s_ip) for (s, s_ip) in _active_session_socks if s is not conn
+                ]
             _session_semaphore.release()
 
 
@@ -9970,8 +10374,12 @@ class ServerManager:
             if self.status_callback:
                 self.status_callback("starting", self.port)
 
-            psk = load_ocr_psk()
-            logger.info("Loaded OCR PSK (%d bytes) from %s.", len(psk), OCR_PSK_PATH)
+            store = psk_store.load_or_init_store(APP_DIR)
+            logger.info(
+                "Loaded per-3DS PSK store (%d paired 3DS(es), pending pairing key ready) from %s.",
+                len(store.get("devices", [])),
+                psk_store.get_store_path(APP_DIR),
+            )
             u, _ = _load_anki_credentials()
             if u:
                 masked_u = (u[:3] + "***") if len(u) > 3 else "***"

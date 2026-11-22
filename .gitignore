@@ -2,6 +2,7 @@
 anki_credentials.json
 gemini_credentials.json
 ocr_psk.txt
+ocr_psks.json
 anki_config.json
 *.env
 

@@ -48,6 +48,21 @@ namespace CTRPluginFramework
         OCR_ScanQrCode();
     }
 
+    static MenuEntry *s_entryAnkiLogin = nullptr;
+
+    static void UpdateAnkiEntryName(void)
+    {
+        if (s_entryAnkiLogin)
+            s_entryAnkiLogin->Name() = "AnkiWeb Login: [" + OCR_GetAnkiCredentialsLabel() + "]";
+    }
+
+    static void MenuEntry_AnkiLogin(MenuEntry *entry)
+    {
+        if (OCR_OpenAnkiCredentialsDialog()) {
+            UpdateAnkiEntryName();
+        }
+    }
+
     static void MenuEntry_OcrInstructions(MenuEntry *entry)
     {
         MessageBox("How to Use OCR", OCR_GetInstructionsText())();
@@ -219,6 +234,11 @@ namespace CTRPluginFramework
     {
         menu += new MenuEntry("Scan Server QR Code", nullptr, MenuEntry_ScanQr,
             "Launch outer camera to scan the Server GUI QR code. Automatically saves new PSK and server IPs.");
+
+        s_entryAnkiLogin = new MenuEntry("AnkiWeb Login", nullptr, MenuEntry_AnkiLogin,
+            "Set your personal AnkiWeb email and password for this 3DS, or clear to use the server default.");
+        UpdateAnkiEntryName();
+        menu += s_entryAnkiLogin;
 
         menu += new MenuEntry("Test OCR Server Connection", nullptr, MenuEntry_OcrTest,
             "Tests TCP connection and PSK authentication with the OCR server.");

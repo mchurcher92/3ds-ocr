@@ -432,6 +432,224 @@ namespace CTRPluginFramework
         return false;
     }
 
+    static std::string s_ankiUser;
+    static std::string s_ankiPass;
+    static int s_activeSessionSock = -1;
+    static sha256_stream_t *s_activeSessionTx = nullptr;
+
+    // Forward declaration (send_encrypted_frame is defined later in this file)
+    static int send_encrypted_frame(int sock, sha256_stream_t *tx, const void *buf, size_t len);
+
+    static std::string TrimWhitespace(const std::string &s)
+    {
+        size_t first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return "";
+        size_t last = s.find_last_not_of(" \t\r\n");
+        return s.substr(first, last - first + 1);
+    }
+
+    static void WipeStringBuffer(std::string &s)
+    {
+        if (!s.empty()) {
+            crypto_wipe(&s[0], s.size());
+            s.clear();
+        }
+    }
+
+    static void OCR_LoadAnkiCredentials(void)
+    {
+        WipeStringBuffer(s_ankiPass);
+        s_ankiUser.clear();
+
+        char buf[640];
+        memset(buf, 0, sizeof(buf));
+        File file;
+        if (File::Open(file, OCR_ANKI_SD_PATH, File::READ) == File::SUCCESS) {
+            u64 size = file.GetSize();
+            if (size > 0 && size < sizeof(buf)) {
+                file.Read(buf, (u32)size);
+            }
+            file.Close();
+        } else {
+            FILE *fp = fopen(OCR_ANKI_SD_PATH, "r");
+            if (fp) {
+                fread(buf, 1, sizeof(buf) - 1, fp);
+                fclose(fp);
+            }
+        }
+
+        if (buf[0] != '\0') {
+            std::string content(buf);
+            size_t start = 0;
+            while (start < content.length()) {
+                size_t end = content.find_first_of("\r\n", start);
+                if (end == std::string::npos) end = content.length();
+                std::string line = content.substr(start, end - start);
+                start = end + 1;
+
+                if (line.compare(0, 5, "user=") == 0) {
+                    s_ankiUser = TrimWhitespace(line.substr(5));
+                    if (s_ankiUser.size() > OCR_ANKI_MAX_LEN) {
+                        s_ankiUser.resize(OCR_ANKI_MAX_LEN);
+                    }
+                } else if (line.compare(0, 5, "pass=") == 0) {
+                    std::string p = line.substr(5);
+                    while (!p.empty() && (p.back() == '\r' || p.back() == '\n')) {
+                        p.pop_back();
+                    }
+                    if (p.size() > OCR_ANKI_MAX_LEN) {
+                        p.resize(OCR_ANKI_MAX_LEN);
+                    }
+                    s_ankiPass = p;
+                    WipeStringBuffer(p);
+                }
+            }
+            WipeStringBuffer(content);
+        }
+        crypto_wipe(buf, sizeof(buf));
+        if (s_ankiUser.empty() || s_ankiPass.empty()) {
+            WipeStringBuffer(s_ankiPass);
+            s_ankiUser.clear();
+        }
+    }
+
+    static bool OCR_SendAnkiCredentials(int sock, sha256_stream_t *tx)
+    {
+        if (sock < 0 || tx == nullptr) return false;
+        if (!s_ankiUser.empty() && !s_ankiPass.empty()) {
+            size_t uLen = std::min<size_t>(s_ankiUser.size(), OCR_ANKI_MAX_LEN);
+            size_t pLen = std::min<size_t>(s_ankiPass.size(), OCR_ANKI_MAX_LEN);
+            uint8_t hdr[5] = {
+                CMD_SET_ANKI_CREDS,
+                (uint8_t)((uLen >> 8) & 0xFF),
+                (uint8_t)(uLen & 0xFF),
+                (uint8_t)((pLen >> 8) & 0xFF),
+                (uint8_t)(pLen & 0xFF)
+            };
+            if (send_encrypted_frame(sock, tx, hdr, sizeof(hdr)) < 0) {
+                return false;
+            }
+            uint8_t payload[OCR_ANKI_MAX_LEN * 2];
+            memcpy(payload, s_ankiUser.data(), uLen);
+            memcpy(payload + uLen, s_ankiPass.data(), pLen);
+            int res = send_encrypted_frame(sock, tx, payload, uLen + pLen);
+            crypto_wipe(payload, sizeof(payload));
+            return res >= 0;
+        } else {
+            uint8_t hdr[5] = { CMD_SET_ANKI_CREDS, 0, 0, 0, 0 };
+            return send_encrypted_frame(sock, tx, hdr, sizeof(hdr)) >= 0;
+        }
+    }
+
+    static bool OCR_SaveAnkiCredentials(const std::string &user, const std::string &pass)
+    {
+        WipeStringBuffer(s_ankiPass);
+        s_ankiUser = user;
+        s_ankiPass = pass;
+
+        bool ok = false;
+        if (s_ankiUser.empty() || s_ankiPass.empty()) {
+            WipeStringBuffer(s_ankiPass);
+            s_ankiUser.clear();
+            if (File::Remove(OCR_ANKI_SD_PATH) == File::SUCCESS) {
+                ok = true;
+            } else {
+                FILE *fp = fopen(OCR_ANKI_SD_PATH, "w");
+                if (fp) {
+                    fclose(fp);
+                    ok = true;
+                }
+            }
+        } else {
+            std::string cfg = "user=" + s_ankiUser + "\npass=" + s_ankiPass + "\n";
+            File file;
+            if (File::Open(file, OCR_ANKI_SD_PATH, File::WRITE | File::CREATE | File::TRUNCATE) == File::SUCCESS) {
+                file.Write(cfg.c_str(), cfg.length());
+                file.Close();
+                ok = true;
+            } else {
+                FILE *fp = fopen(OCR_ANKI_SD_PATH, "w");
+                if (fp) {
+                    fputs(cfg.c_str(), fp);
+                    fclose(fp);
+                    ok = true;
+                }
+            }
+            WipeStringBuffer(cfg);
+        }
+
+        if (s_activeSessionSock >= 0 && s_activeSessionTx != nullptr) {
+            OCR_SendAnkiCredentials(s_activeSessionSock, s_activeSessionTx);
+        }
+        return ok;
+    }
+
+    std::string OCR_GetAnkiCredentialsLabel(void)
+    {
+        if (s_ankiUser.empty() || s_ankiPass.empty()) {
+            return "Server Default";
+        }
+        if (s_ankiUser.size() > 24) {
+            return s_ankiUser.substr(0, 21) + "...";
+        }
+        return s_ankiUser;
+    }
+
+    bool OCR_OpenAnkiCredentialsDialog(void)
+    {
+        std::string statusLine = (!s_ankiUser.empty() && !s_ankiPass.empty())
+            ? ("Current: " + s_ankiUser)
+            : "Current: Server Default";
+        std::vector<std::string> opts = {
+            "Set AnkiWeb Login",
+            "Clear (Use Server Default)",
+            "Cancel"
+        };
+        Keyboard menuKbd("AnkiWeb Account Settings\n" + statusLine, opts);
+        menuKbd.CanAbort(true);
+        int choice = menuKbd.Open();
+        if (choice == 0) {
+            std::string newUser = s_ankiUser;
+            Keyboard userKbd("Enter AnkiWeb Email / Username:");
+            userKbd.CanAbort(true);
+            userKbd.SetMaxLength(OCR_ANKI_MAX_LEN);
+            if (userKbd.Open(newUser, s_ankiUser) < 0) {
+                return false;
+            }
+            newUser = TrimWhitespace(newUser);
+            if (newUser.empty()) {
+                OSD::Notify("AnkiWeb username cannot be empty!", Color::Red);
+                return false;
+            }
+
+            std::string newPass;
+            Keyboard passKbd("Enter AnkiWeb Password for:\n" + newUser);
+            passKbd.CanAbort(true);
+            passKbd.SetMaxLength(OCR_ANKI_MAX_LEN);
+            if (passKbd.Open(newPass, "") < 0) {
+                WipeStringBuffer(newPass);
+                return false;
+            }
+            if (newPass.empty()) {
+                WipeStringBuffer(newPass);
+                OSD::Notify("AnkiWeb password cannot be empty!", Color::Red);
+                return false;
+            }
+
+            bool live = (s_activeSessionSock >= 0 && s_activeSessionTx != nullptr);
+            OCR_SaveAnkiCredentials(newUser, newPass);
+            WipeStringBuffer(newPass);
+            OSD::Notify(live ? "AnkiWeb login updated for session!" : "AnkiWeb login saved!", Color::Green);
+            return true;
+        } else if (choice == 1) {
+            bool live = (s_activeSessionSock >= 0 && s_activeSessionTx != nullptr);
+            OCR_SaveAnkiCredentials("", "");
+            OSD::Notify(live ? "Session reset to server default Anki!" : "AnkiWeb login cleared (server default)", Color::Yellow);
+            return true;
+        }
+        return false;
+    }
+
     OcrKeyBindings g_ocrKeys = {
         Key::R | Key::Start | Key::Select, // activation
         Key::A,                            // lookup
@@ -831,6 +1049,7 @@ namespace CTRPluginFramework
 
         // Defer NDMU/AC locking until the game finishes nnMain boot and begins rendering frames
         OCR_LoadConfig();
+        OCR_LoadAnkiCredentials();
         OCR_InitKeyBindings();
     }
 
@@ -948,6 +1167,8 @@ namespace CTRPluginFramework
             OCR_CloseSocLocked(true);
         }
         OCR_UnlockNetwork();
+        WipeStringBuffer(s_ankiPass);
+        s_ankiUser.clear();
         OCR_FreeSessionBuffers();
     }
 
@@ -2339,6 +2560,64 @@ namespace CTRPluginFramework
         return CodepointsToUtf8(cps, 0, keep) + "…";
     }
 
+    struct PopupTitleLayout {
+        std::vector<std::string> lines;
+        int posY;
+        int divY;
+        int glossStartY;
+        int visibleGlossLines;
+    };
+
+    static void AppendWrappedGlyphSegment(const GlyphMap &glyphs, uint8_t fontId, const std::string &seg,
+                                          int maxPx, int maxLines, std::vector<std::string> &out)
+    {
+        if (seg.empty() || (int)out.size() >= maxLines) return;
+        std::vector<uint32_t> cps = Utf8ToCodepoints(seg);
+        size_t pos = 0;
+        while (pos < cps.size() && (int)out.size() < maxLines) {
+            if ((int)out.size() == maxLines - 1) {
+                std::string rem = CodepointsToUtf8(cps, pos, cps.size() - pos);
+                out.push_back(TruncateGlyphText(glyphs, fontId, rem, maxPx));
+                break;
+            }
+            int w = 0;
+            size_t end = pos;
+            while (end < cps.size()) {
+                auto it = glyphs.find(GlyphKey(fontId, cps[end]));
+                int adv = (it != glyphs.end()) ? (int)it->second.advanceX : ((cps[end] > 0x7E) ? ((fontId == 2) ? 18 : 12) : ((fontId == 2) ? 10 : 7));
+                if (w + adv > maxPx && end > pos) break;
+                w += adv;
+                end++;
+            }
+            if (end == pos) end = pos + 1;
+            out.push_back(CodepointsToUtf8(cps, pos, end - pos));
+            pos = end;
+        }
+    }
+
+    static PopupTitleLayout ComputePopupTitleLayout(const GlyphMap &glyphs, const PopupEntry &res,
+                                                    int maxPx = 295, int maxLines = 3)
+    {
+        PopupTitleLayout tl;
+        bool hasReading = (!res.reading.empty() && res.reading != res.headword);
+        std::string fullTitle = hasReading ? (res.headword + " 【" + res.reading + "】") : res.headword;
+        if (MeasureGlyphTextWidth(glyphs, 2, fullTitle) <= maxPx) {
+            tl.lines.push_back(fullTitle);
+        } else if (hasReading) {
+            AppendWrappedGlyphSegment(glyphs, 2, res.headword, maxPx, maxLines, tl.lines);
+            AppendWrappedGlyphSegment(glyphs, 2, "【" + res.reading + "】", maxPx, maxLines, tl.lines);
+        } else {
+            AppendWrappedGlyphSegment(glyphs, 2, res.headword, maxPx, maxLines, tl.lines);
+        }
+        if (tl.lines.empty()) tl.lines.push_back(res.headword);
+        int extraY = std::max(0, (int)tl.lines.size() - 1) * 22;
+        tl.posY = 64 + extraY;
+        tl.divY = 85 + extraY;
+        tl.glossStartY = 90 + extraY;
+        tl.visibleGlossLines = std::max(1, std::min(GLOSS_VISIBLE_LINES, (212 - tl.glossStartY + 3) / 17));
+        return tl;
+    }
+
     static void DrawGlyphText(const Screen &screen, int xOff, const GlyphMap &glyphs, uint8_t fontId,
                               const std::string &text, int startX, int startY, const Color &fg, const Color &bg, int maxRightX = 315)
     {
@@ -2449,36 +2728,35 @@ namespace CTRPluginFramework
         hdrText = TruncateGlyphText(glyphs, 0, hdrText, maxHdrW);
         DrawGlyphText(screen, xOff, glyphs, 0, hdrText, 8, 7, Color(185, 215, 255), bgHeader, badgeX - ocrBadgeW - 4);
 
-        // Title (headword + reading)
-        std::string titleStr = (!res.reading.empty() && res.reading != res.headword)
-                             ? (res.headword + " 【" + res.reading + "】")
-                             : res.headword;
-        titleStr = TruncateGlyphText(glyphs, 2, titleStr, 295);
-        DrawGlyphText(screen, xOff, glyphs, 2, titleStr, 12, 36, Color(255, 230, 115), bgBody, 312);
+        // Title (headword + reading) — wrap to lines below instead of truncating
+        PopupTitleLayout tl = ComputePopupTitleLayout(glyphs, res);
+        for (size_t i = 0; i < tl.lines.size(); ++i) {
+            DrawGlyphText(screen, xOff, glyphs, 2, tl.lines[i], 12, 36 + (int)i * 22, Color(255, 230, 115), bgBody, 312);
+        }
 
         // Grammar / POS horizontally scrollable line
         int maxPosX = std::max(0, (int)res.posCodepoints.size() - POS_WINDOW_CHARS);
         int posOff = std::max(0, std::min(posScrollX, maxPosX));
         std::string posSlice = CodepointsToUtf8(res.posCodepoints, (size_t)posOff, POS_WINDOW_CHARS);
         if (posOff > 0) {
-            DrawGlyphText(screen, xOff, glyphs, 1, "<", 4, 64, Color(255, 220, 110), bgBody, 16);
+            DrawGlyphText(screen, xOff, glyphs, 1, "<", 4, tl.posY, Color(255, 220, 110), bgBody, 16);
         }
         int posStartX = (posOff > 0) ? 14 : 12;
         int posMaxRight = (posOff < maxPosX) ? 300 : 312;
-        DrawGlyphText(screen, xOff, glyphs, 1, posSlice, posStartX, 64, Color(125, 210, 175), bgBody, posMaxRight);
+        DrawGlyphText(screen, xOff, glyphs, 1, posSlice, posStartX, tl.posY, Color(125, 210, 175), bgBody, posMaxRight);
         if (posOff < maxPosX) {
-            DrawGlyphText(screen, xOff, glyphs, 1, ">", 306, 64, Color(255, 220, 110), bgBody, 317);
+            DrawGlyphText(screen, xOff, glyphs, 1, ">", 306, tl.posY, Color(255, 220, 110), bgBody, 317);
         }
 
         // Divider line
-        screen.DrawRect(xOff + 12, 85, 296, 1, Color(55, 68, 95), true);
+        screen.DrawRect(xOff + 12, tl.divY, 296, 1, Color(55, 68, 95), true);
 
         // Vertically scrollable gloss lines
         int totalLines = (int)res.wrappedLines.size();
-        int maxGlossY = std::max(0, totalLines - GLOSS_VISIBLE_LINES);
+        int maxGlossY = std::max(0, totalLines - tl.visibleGlossLines);
         int gOff = std::max(0, std::min(glossScrollY, maxGlossY));
-        int visCount = std::min(GLOSS_VISIBLE_LINES, totalLines - gOff);
-        int yCur = 90;
+        int visCount = std::min(tl.visibleGlossLines, totalLines - gOff);
+        int yCur = tl.glossStartY;
         for (int i = 0; i < visCount; ++i) {
             const std::string &ln = res.wrappedLines[(size_t)(gOff + i)];
             Color lc(235, 240, 248);
@@ -2495,10 +2773,10 @@ namespace CTRPluginFramework
 
         // Scrollbar
         if (maxGlossY > 0) {
-            int trackTop = 90;
-            int trackH = 116;
+            int trackTop = tl.glossStartY;
+            int trackH = std::max(24, 206 - tl.glossStartY);
             screen.DrawRect(xOff + 311, trackTop, 4, trackH, Color(38, 46, 68), true);
-            int thumbH = std::max(14, (trackH * GLOSS_VISIBLE_LINES) / std::max(1, totalLines));
+            int thumbH = std::max(14, (trackH * tl.visibleGlossLines) / std::max(1, totalLines));
             int thumbY = trackTop + ((trackH - thumbH) * gOff) / maxGlossY;
             screen.DrawRect(xOff + 311, thumbY, 4, thumbH, Color(88, 166, 255), true);
         }
@@ -2591,13 +2869,12 @@ namespace CTRPluginFramework
                                         const PopupEntry &res, int glossScrollY, int posScrollX,
                                         uint32_t &outKanji)
     {
-        // 1. Title (headword + reading) at y=36, fontId=2
-        std::string titleStr = (!res.reading.empty() && res.reading != res.headword)
-                             ? (res.headword + " 【" + res.reading + "】")
-                             : res.headword;
-        titleStr = TruncateGlyphText(glyphs, 2, titleStr, 295);
-        if (TryGetKanjiInText(glyphs, 2, titleStr, 12, 30, 28, popX, popY, outKanji, 312)) {
-            return true;
+        // 1. Title (headword + reading) starting at y=36, fontId=2
+        PopupTitleLayout tl = ComputePopupTitleLayout(glyphs, res);
+        for (size_t i = 0; i < tl.lines.size(); ++i) {
+            if (TryGetKanjiInText(glyphs, 2, tl.lines[i], 12, 34 + (int)i * 22, 22, popX, popY, outKanji, 312)) {
+                return true;
+            }
         }
 
         // 2. Header label at y=7, fontId=0
@@ -2621,22 +2898,22 @@ namespace CTRPluginFramework
             return true;
         }
 
-        // 3. POS line at y=64, fontId=1
+        // 3. POS line at tl.posY, fontId=1
         int maxPosX = std::max(0, (int)res.posCodepoints.size() - POS_WINDOW_CHARS);
         int posOff = std::max(0, std::min(posScrollX, maxPosX));
         std::string posSlice = CodepointsToUtf8(res.posCodepoints, (size_t)posOff, POS_WINDOW_CHARS);
         int posStartX = (posOff > 0) ? 14 : 12;
         int posMaxRight = (posOff < maxPosX) ? 300 : 312;
-        if (TryGetKanjiInText(glyphs, 1, posSlice, posStartX, 60, 24, popX, popY, outKanji, posMaxRight)) {
+        if (TryGetKanjiInText(glyphs, 1, posSlice, posStartX, tl.posY - 4, 24, popX, popY, outKanji, posMaxRight)) {
             return true;
         }
 
-        // 4. Vertically scrollable gloss lines starting at y=90, fontId=1
+        // 4. Vertically scrollable gloss lines starting at tl.glossStartY, fontId=1
         int totalLines = (int)res.wrappedLines.size();
-        int maxGlossY = std::max(0, totalLines - GLOSS_VISIBLE_LINES);
+        int maxGlossY = std::max(0, totalLines - tl.visibleGlossLines);
         int gOff = std::max(0, std::min(glossScrollY, maxGlossY));
-        int visCount = std::min(GLOSS_VISIBLE_LINES, totalLines - gOff);
-        int yCur = 90;
+        int visCount = std::min(tl.visibleGlossLines, totalLines - gOff);
+        int yCur = tl.glossStartY;
         for (int i = 0; i < visCount; ++i) {
             const std::string &ln = res.wrappedLines[(size_t)(gOff + i)];
             if (TryGetKanjiInText(glyphs, 1, ln, 12, yCur - 2, 19, popX, popY, outKanji, 309)) {
@@ -2756,6 +3033,159 @@ namespace CTRPluginFramework
         }
     }
 
+    static int recv_encrypted_frame(int sock, sha256_stream_t *rx, void *buf, size_t len);
+    static int OCR_ConnectServer(std::string *out_diag);
+    static bool OCR_PerformHandshake(int sock, sha256_stream_t *tx, sha256_stream_t *rx);
+
+    static void OCR_GetDeviceIdentity(std::string &outId, std::string &outName, std::string &outModel)
+    {
+        outId.clear();
+        outName.clear();
+        outModel.clear();
+
+        if (R_SUCCEEDED(cfguInit())) {
+            u64 consoleHash = 0;
+            if (R_SUCCEEDED(CFGU_GenHashConsoleUnique(0x3D50C801, &consoleHash))) {
+                char idBuf[20];
+                snprintf(idBuf, sizeof(idBuf), "%016llX", (unsigned long long)consoleHash);
+                outId = idBuf;
+            }
+
+            u16 rawName[14];
+            memset(rawName, 0, sizeof(rawName));
+            if (R_SUCCEEDED(CFGU_GetConfigInfoBlk2(0x1C, 0x000A0000, rawName))) {
+                for (int i = 0; i < 10; ++i) {
+                    u16 ch = rawName[i];
+                    if (ch == 0) break;
+                    if (ch == '\r' || ch == '\n') continue;
+                    if (ch < 0x80) {
+                        outName.push_back((char)ch);
+                    } else if (ch < 0x800) {
+                        outName.push_back((char)(0xC0 | (ch >> 6)));
+                        outName.push_back((char)(0x80 | (ch & 0x3F)));
+                    } else {
+                        outName.push_back((char)(0xE0 | (ch >> 12)));
+                        outName.push_back((char)(0x80 | ((ch >> 6) & 0x3F)));
+                        outName.push_back((char)(0x80 | (ch & 0x3F)));
+                    }
+                }
+            }
+
+            u8 model = 0xFF;
+            if (R_SUCCEEDED(CFGU_GetSystemModel(&model))) {
+                switch (model) {
+                    case 0: outModel = "Old 3DS"; break;
+                    case 1: outModel = "Old 3DS XL"; break;
+                    case 2: outModel = "New 3DS"; break;
+                    case 3: outModel = "2DS"; break;
+                    case 4: outModel = "New 3DS XL"; break;
+                    case 5: outModel = "New 2DS XL"; break;
+                    default: outModel = "3DS"; break;
+                }
+            }
+            cfguExit();
+        }
+
+        if (outId.empty()) {
+            char idBuf[64];
+            memset(idBuf, 0, sizeof(idBuf));
+            File file;
+            if (File::Open(file, OCR_DEVICE_ID_SD_PATH, File::READ) == File::SUCCESS) {
+                u64 sz = file.GetSize();
+                if (sz > 0 && sz < sizeof(idBuf)) {
+                    file.Read(idBuf, (u32)sz);
+                }
+                file.Close();
+            } else {
+                FILE *fp = fopen(OCR_DEVICE_ID_SD_PATH, "r");
+                if (fp) {
+                    fread(idBuf, 1, sizeof(idBuf) - 1, fp);
+                    fclose(fp);
+                }
+            }
+            outId = TrimWhitespace(std::string(idBuf));
+            if (outId.empty()) {
+                u8 rnd[8];
+                if (R_SUCCEEDED(psInit())) {
+                    PS_GenerateRandomBytes(rnd, sizeof(rnd));
+                    psExit();
+                } else {
+                    u64 tk = svcGetSystemTick();
+                    memcpy(rnd, &tk, sizeof(rnd));
+                }
+                char genBuf[20];
+                snprintf(genBuf, sizeof(genBuf), "%02X%02X%02X%02X%02X%02X%02X%02X",
+                         rnd[0], rnd[1], rnd[2], rnd[3], rnd[4], rnd[5], rnd[6], rnd[7]);
+                outId = genBuf;
+                File wf;
+                if (File::Open(wf, OCR_DEVICE_ID_SD_PATH, File::WRITE | File::CREATE | File::TRUNCATE) == File::SUCCESS) {
+                    wf.Write(outId.c_str(), outId.size());
+                    wf.Close();
+                } else {
+                    FILE *fp = fopen(OCR_DEVICE_ID_SD_PATH, "w");
+                    if (fp) {
+                        fputs(outId.c_str(), fp);
+                        fclose(fp);
+                    }
+                }
+            }
+        }
+
+        outName = TrimWhitespace(outName);
+        if (outName.empty()) outName = "3DS";
+        if (outModel.empty()) outModel = "3DS";
+    }
+
+    static std::string OCR_BuildDeviceInfoPayload(std::string *outName = nullptr)
+    {
+        std::string devId, devName, devModel;
+        OCR_GetDeviceIdentity(devId, devName, devModel);
+        if (outName) *outName = devName;
+        std::string payload = devId + "\n" + devName + "\n" + devModel;
+        if (payload.size() > 256) payload.resize(256);
+        return payload;
+    }
+
+    static bool OCR_SendDeviceInfo(int sock, sha256_stream_t *tx)
+    {
+        if (sock < 0 || tx == nullptr) return false;
+        std::string payload = OCR_BuildDeviceInfoPayload();
+        uint16_t len = (uint16_t)payload.size();
+        uint8_t hdr[5] = {
+            CMD_SET_DEVICE_INFO,
+            (uint8_t)((len >> 8) & 0xFF),
+            (uint8_t)(len & 0xFF),
+            0,
+            0
+        };
+        if (send_encrypted_frame(sock, tx, hdr, sizeof(hdr)) < 0) return false;
+        return send_encrypted_frame(sock, tx, payload.data(), len) >= 0;
+    }
+
+    static bool OCR_PingServerPairing(std::string &outName)
+    {
+        std::string payload = OCR_BuildDeviceInfoPayload(&outName);
+        int sock = OCR_ConnectServer(nullptr);
+        if (sock < 0) return false;
+
+        sha256_stream_t tx, rx;
+        bool ok = OCR_PerformHandshake(sock, &tx, &rx);
+        if (ok) {
+            const uint8_t magic[8] = { 'P', 'A', 'I', 'R', 'P', 'I', 'N', 'G' };
+            uint16_t netLen = htons((uint16_t)payload.size());
+            uint8_t ack = 0;
+            ok = (send_encrypted_frame(sock, &tx, magic, sizeof(magic)) >= 0) &&
+                 (send_encrypted_frame(sock, &tx, &netLen, sizeof(netLen)) >= 0) &&
+                 (send_encrypted_frame(sock, &tx, payload.data(), payload.size()) >= 0) &&
+                 (recv_encrypted_frame(sock, &rx, &ack, 1) >= 0) &&
+                 (ack == 1);
+        }
+        closesocket(sock);
+        crypto_wipe(&tx, sizeof(tx));
+        crypto_wipe(&rx, sizeof(rx));
+        return ok;
+    }
+
     static void OCR_ApplyScannedPayload(std::string &payload)
     {
         std::string psk, lan, wan;
@@ -2801,6 +3231,13 @@ namespace CTRPluginFramework
 
         OSD::Notify("QR Code Scanned! Config Saved.", Color::Green);
         OSD::Notify("LAN: " + s_serverLanHost + ":" + std::to_string(s_serverLanPort), Color::Cyan);
+
+        std::string devName;
+        if (OCR_PingServerPairing(devName)) {
+            OSD::Notify("Paired with server as " + devName + "!", Color::Green);
+        } else {
+            OSD::Notify("QR saved (server offline - will register on connect)", Color::Yellow);
+        }
     }
 
     bool OCR_ScanQrCode(void)
@@ -3039,6 +3476,7 @@ namespace CTRPluginFramework
 
         // Ensure server endpoints and PSK are configured on SD card
         OCR_LoadConfig();
+        OCR_LoadAnkiCredentials();
         char testPsk[OCR_PSK_MAX_LEN];
         size_t pskLen = OCR_LoadPskFromSd(testPsk, sizeof(testPsk));
         crypto_wipe(testPsk, sizeof(testPsk));
@@ -3172,6 +3610,14 @@ namespace CTRPluginFramework
         // Advertise client-side POPUP_BUNDLE (bit 0) + SCREEN_BUNDLE (bit 1) capability
         uint8_t capsPkt[5] = { CMD_SET_CLIENT_CAPS, 0, 3, 0, 1 };
         send_encrypted_frame(sock, &tx_stream, capsPkt, sizeof(capsPkt));
+
+        // Send per-user AnkiWeb credentials if configured on SD card
+        if (!s_ankiUser.empty() && !s_ankiPass.empty()) {
+            OCR_SendAnkiCredentials(sock, &tx_stream);
+        }
+
+        // Send 3DS console identity so server records/updates this device
+        OCR_SendDeviceInfo(sock, &tx_stream);
 
         // Clear status bar region on both buffers
         for (int b = 0; b < 2; ++b) {
@@ -3343,10 +3789,33 @@ namespace CTRPluginFramework
         // Render initial cursor on both buffers
         SyncBothBuffers();
 
+        s_activeSessionSock = sock;
+        s_activeSessionTx = &tx_stream;
+
         // 6. Interactive Modal Loop
         while (true) {
             Controller::Update();
             u32 kDown = Controller::GetKeysPressed();
+
+            // Mid-session AnkiWeb credentials dialog (post-handshake live update)
+            if (Controller::IsKeysPressed(Key::Start | Key::Select | Key::L)) {
+                while (true) {
+                    Controller::Update();
+                    if ((Controller::GetKeysDown(false) & (Key::Start | Key::Select | Key::L)) == 0) break;
+                    Sleep(Milliseconds(16));
+                }
+                OCR_OpenAnkiCredentialsDialog();
+                for (int b = 0; b < 2; ++b) {
+                    RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
+                    RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
+                    if (hasPopup) {
+                        if (isClientBundlePopup()) popupDirty[activeBuf] = true;
+                        else if (s_popup_rgb) DrawPopupImage(popupTargetScreen, s_popup_rgb);
+                    }
+                    PresentFrame();
+                }
+                continue;
+            }
 
             // Exit / Dismiss Key: Dismiss popup or exit session
             if (kDown & g_ocrKeys.exitSession) {
@@ -3485,10 +3954,37 @@ namespace CTRPluginFramework
             // Lookup / Select Point Key or Touch Screen Tap: Execute action
             bool lookupTriggered = (kDown & g_ocrKeys.lookup) != 0;
             bool touchPopupTap = touchTap && hasPopup && popupTargetScreen == SCREEN_ID_BOTTOM && !selbox.active;
-            if (lookupTriggered || touchPopupTap) {
-                int actionScreen = touchPopupTap ? SCREEN_ID_BOTTOM : curScreen;
-                int actionX = touchPopupTap ? newX : curX;
-                int actionY = touchPopupTap ? newY : curY;
+            bool touchKanjiTap = touchTap && hasKanjiWindow && kanjiTargetScreen == SCREEN_ID_BOTTOM && !selbox.active;
+            if (lookupTriggered || touchPopupTap || touchKanjiTap) {
+                bool isTouchAction = touchPopupTap || touchKanjiTap;
+                int actionScreen = isTouchAction ? SCREEN_ID_BOTTOM : curScreen;
+                int actionX = isTouchAction ? newX : curX;
+                int actionY = isTouchAction ? newY : curY;
+
+                // 0. Check if clicking/tapping inside the active Kanji Details window
+                if (hasKanjiWindow && kanjiTargetScreen == actionScreen) {
+                    int xOff = (actionScreen == SCREEN_ID_TOP) ? ((TOP_WIDTH - POPUP_WIDTH) / 2) : 0;
+                    int popX = actionX - xOff;
+                    int popY = actionY;
+                    if (popX >= 0 && popX < POPUP_WIDTH && popY >= 0 && popY < POPUP_HEIGHT) {
+                        int tallY = popY;
+                        if (popY >= 32 && popY < 216) {
+                            tallY = popY + std::max(0, std::min(s_kanjiScrollY, s_kanjiMaxScrollY));
+                        } else if (popY >= 216) {
+                            tallY = (KANJI_TALL_HEIGHT - 24) + (popY - 216);
+                        }
+                        uint8_t kWinPkt[5];
+                        uint16_t netX = htons((uint16_t)popX);
+                        uint16_t netY = htons((uint16_t)tallY);
+                        kWinPkt[0] = CMD_CLICK_KANJI_WIN;
+                        memcpy(&kWinPkt[1], &netX, 2);
+                        memcpy(&kWinPkt[3], &netY, 2);
+                        if (send_encrypted_frame(sock, &tx_stream, kWinPkt, sizeof(kWinPkt)) < 0) {
+                            break;
+                        }
+                        continue;
+                    }
+                }
 
                 // 1. Check if clicking/tapping inside the active translation popup
                 if (hasPopup && popupTargetScreen == actionScreen) {
@@ -3635,6 +4131,7 @@ namespace CTRPluginFramework
                 }
                 auto handleLocalNav = [&](size_t numVars, size_t numEntries, const std::string &curEngLbl,
                                           const std::string &nextEngLbl, const std::string &nextOcrTxt,
+                                          const GlyphMap &activeGlyphs,
                                           const PopupEntry &curEntry, size_t &vIdx, size_t &eIdx,
                                           int &gScroll, int &pScroll, std::string &sBanner, uint8_t &sLevel,
                                           bool &sendAnki, bool &needRedraw) {
@@ -3686,7 +4183,8 @@ namespace CTRPluginFramework
                             if (dpadHoldTicks > 14 && ((dpadHoldTicks - 14) % 3) == 0) trig |= held;
                         }
                         if (trig != 0) {
-                            int maxGlossY = std::max(0, (int)curEntry.wrappedLines.size() - GLOSS_VISIBLE_LINES);
+                            int visGloss = ComputePopupTitleLayout(activeGlyphs, curEntry).visibleGlossLines;
+                            int maxGlossY = std::max(0, (int)curEntry.wrappedLines.size() - visGloss);
                             int maxPosX = std::max(0, (int)curEntry.posCodepoints.size() - POS_WINDOW_CHARS);
                             int oldG = gScroll;
                             int oldP = pScroll;
@@ -3720,7 +4218,8 @@ namespace CTRPluginFramework
                                     : ((cachedPopup.curVariantIdx + 1) % sp.variants.size());
                                 bool needRedraw = false, sendAnki = false;
                                 handleLocalNav(sp.variants.size(), sv.entryIndices.size(), sv.enginesLabel,
-                                               sp.variants[nextV].enginesLabel, sp.variants[nextV].ocrText, ce,
+                                               sp.variants[nextV].enginesLabel, sp.variants[nextV].ocrText,
+                                               sb.glyphs, ce,
                                                cachedPopup.curVariantIdx, cachedPopup.curEntryIdx,
                                                cachedPopup.glossScrollY, cachedPopup.posScrollX,
                                                cachedPopup.statusBanner, cachedPopup.statusLevel, sendAnki, needRedraw);
@@ -3746,7 +4245,8 @@ namespace CTRPluginFramework
                         : ((popupBundle.curVariantIdx + 1) % popupBundle.variants.size());
                     bool needRedraw = false, sendAnki = false;
                     handleLocalNav(popupBundle.variants.size(), curVar.entries.size(), curVar.enginesLabel,
-                                   popupBundle.variants[nextV].enginesLabel, popupBundle.variants[nextV].ocrText, curEntry,
+                                   popupBundle.variants[nextV].enginesLabel, popupBundle.variants[nextV].ocrText,
+                                   popupBundle.glyphs, curEntry,
                                    popupBundle.curVariantIdx, popupBundle.curEntryIdx,
                                    popupBundle.glossScrollY, popupBundle.posScrollX,
                                    popupBundle.statusBanner, popupBundle.statusLevel, sendAnki, needRedraw);
@@ -3875,6 +4375,28 @@ namespace CTRPluginFramework
                                                        popupBundle.statusBanner, popupBundle.statusLevel)) {
                         RedrawBundlePopup();
                     }
+                    if (flagByte & POPUP_ANKI_LOGIN_PROMPT_FLAG) {
+                        bool updated = OCR_OpenAnkiCredentialsDialog();
+                        if (updated && !s_ankiUser.empty() && !s_ankiPass.empty()) {
+                            std::string readyMsg = "AnkiWeb login set! Press [" + OCR_KeyToString(g_ocrKeys.addAnki) + "] to add";
+                            if (cachedPopup.active) {
+                                cachedPopup.statusBanner = readyMsg;
+                                cachedPopup.statusLevel = 1;
+                            } else if (popupBundle.active) {
+                                popupBundle.statusBanner = readyMsg;
+                                popupBundle.statusLevel = 1;
+                            }
+                        }
+                        for (int b = 0; b < 2; ++b) {
+                            RestoreRect(OSD::GetTopScreen(), 0, 0, TOP_WIDTH, 240, s_top_rgb, TOP_WIDTH, 240);
+                            RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
+                            if (hasPopup) {
+                                if (isClientBundlePopup()) popupDirty[activeBuf] = true;
+                                else if (s_popup_rgb) DrawPopupImage(popupTargetScreen, s_popup_rgb);
+                            }
+                            PresentFrame();
+                        }
+                    }
                 } else if ((flagByte & POPUP_KANJI_FLAG) && payloadSize == KANJI_TALL_PAYLOAD_SIZE &&
                            (targetScreenId == SCREEN_ID_TOP || targetScreenId == SCREEN_ID_BOTTOM)) {
                     if (!s_kanjiTallBuffer.Alloc(0x07360000, KANJI_TALL_PAYLOAD_SIZE)) {
@@ -3952,6 +4474,9 @@ namespace CTRPluginFramework
             RestoreRect(OSD::GetBottomScreen(), 0, 0, BOT_WIDTH, 240, s_bot_rgb, BOT_WIDTH, 240);
             OSD::SwapBuffers();
         }
+
+        s_activeSessionSock = -1;
+        s_activeSessionTx = nullptr;
 
         closesocket(sock);
         crypto_wipe(&tx_stream, sizeof(tx_stream));

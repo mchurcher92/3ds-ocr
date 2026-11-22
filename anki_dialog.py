@@ -100,6 +100,7 @@ def _load_anki_config() -> dict:
         "player_name": "",
         "auto_sync_interval_sec": 300,
         "screenshot_mode": "clicked",
+        "multi_user_mode": False,
     }
 
 

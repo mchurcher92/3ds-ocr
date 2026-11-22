@@ -332,6 +332,14 @@ namespace CTRPluginFramework
                 {
                     if (shouldClose)
                         SoundEngine::PlayMenuSound(SoundEngine::Event::CANCEL);
+                    if (shouldClose && !SystemImpl::WantsToSleep())
+                    {
+                        while (Controller::IsKeyDown(Key::B) && !SystemImpl::WantsToSleep())
+                        {
+                            Controller::Update();
+                            Sleep(Milliseconds(16));
+                        }
+                    }
                     ProcessImpl::Play(true);
                     _isOpen = false;
                     openManager.Clear();

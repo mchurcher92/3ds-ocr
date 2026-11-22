@@ -19,11 +19,12 @@ import threading
 import time
 import tkinter as tk
 import urllib.request
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import qrcode
 from PIL import Image, ImageDraw, ImageFont, ImageTk
+import psk_store
 
 from anki_dialog import (
     AI_MODEL_OPTIONS,
@@ -565,7 +566,12 @@ class OcrServerLauncherGui:
             self._app_icon = None
 
         self.python_bin = find_system_python()
-        self.current_psk = load_ocr_psk()
+        store = psk_store.load_or_init_store(APP_DIR)
+        self.current_psk = str(store.get("pending_psk", "") or "")
+        self._psk_store_mtime: int = -1
+        self.paired_count_var = tk.StringVar(
+            value=f"Paired 3DSes: {len(store.get('devices', []))}"
+        )
         self.server_proc: Optional[subprocess.Popen] = None
         self.log_queue: queue.Queue = queue.Queue()
         self.reader_thread: Optional[threading.Thread] = None
@@ -578,8 +584,10 @@ class OcrServerLauncherGui:
 
         self._build_ui()
         self._refresh_qr_code()
+        self._refresh_devices_table()
         self._detect_wan_async()
         self._poll_log_queue()
+        self._poll_psk_store()
 
         # Auto-start server on launch
         self.root.after(300, self._start_server)
@@ -642,15 +650,20 @@ class OcrServerLauncherGui:
         self.tab_server = ttk.Frame(self.tab_content, padding=(0, 6, 0, 0))
         self.tab_bar.add_tab("server", "Server & Pairing", self.tab_server)
 
-        # Tab 2: Screen Preview
+        # Tab 2: Paired 3DSes
+        self.tab_devices = ttk.Frame(self.tab_content, padding=(0, 6, 0, 0))
+        self.tab_bar.add_tab("devices", "Paired 3DSes", self.tab_devices)
+
+        # Tab 3: Screen Preview
         self.tab_preview = ttk.Frame(self.tab_content, padding=(0, 6, 0, 0))
         self.tab_bar.add_tab("preview", "Screen Preview", self.tab_preview)
 
-        # Tab 3: Server Logs
+        # Tab 4: Server Logs
         self.tab_logs = ttk.Frame(self.tab_content, padding=(0, 6, 0, 0))
         self.tab_bar.add_tab("logs", "Server Logs", self.tab_logs)
 
         self._build_server_tab()
+        self._build_devices_tab()
         self.preview_widget = ScreenPreviewWidget(
             self.tab_preview,
             dumps_dir=DUMPS_DIR,
@@ -771,6 +784,44 @@ class OcrServerLauncherGui:
             res_body, text="Configure Anki...", command=self._open_anki_dialog, padx=12, pady=4
         ).grid(row=4, column=0, columnspan=2, sticky="w")
 
+        tk.Frame(res_body, bg=BORDER, height=1).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 8))
+
+        ttk.Label(res_body, text="Server Mode:", style="SurfaceBold.TLabel").grid(
+            row=6, column=0, sticky="w", pady=(0, 4)
+        )
+        is_multi = bool(_load_anki_config().get("multi_user_mode", False))
+        self.multi_user_var = tk.BooleanVar(value=is_multi)
+        mode_frame = ttk.Frame(res_body, style="Surface.TFrame")
+        mode_frame.grid(row=6, column=1, sticky="w", padx=(10, 0), pady=(0, 4))
+        ttk.Radiobutton(
+            mode_frame,
+            text="Single 3DS",
+            variable=self.multi_user_var,
+            value=False,
+            command=self._on_multi_user_mode_changed,
+        ).pack(side="left", padx=(0, 14))
+        ttk.Radiobutton(
+            mode_frame,
+            text="Multiple 3DS",
+            variable=self.multi_user_var,
+            value=True,
+            command=self._on_multi_user_mode_changed,
+        ).pack(side="left")
+
+        self.mode_hint_var = tk.StringVar(
+            value=(
+                "Ignores server Anki login; prompts each 3DS to log in."
+                if is_multi
+                else "Uses server Anki login unless a 3DS sets its own."
+            )
+        )
+        ttk.Label(
+            res_body,
+            textvariable=self.mode_hint_var,
+            style="SurfaceMuted.TLabel",
+            wraplength=360,
+        ).grid(row=7, column=0, columnspan=2, sticky="w")
+
         # --- Left Column Card 3: Network Configuration ---
         net_card, net_body = make_card(left_col, title="Network Configuration", padding=(12, 10))
         net_card.pack(fill="both", expand=True)
@@ -842,7 +893,7 @@ class OcrServerLauncherGui:
 
         tk.Frame(pair_body, bg=BORDER, height=1).pack(fill="x", pady=(0, 10))
 
-        ttk.Label(pair_body, text="Pre-Shared Key (256-bit PSK)", style="SurfaceBold.TLabel").pack(
+        ttk.Label(pair_body, text="Next 3DS Pairing Key (256-bit PSK)", style="SurfaceBold.TLabel").pack(
             anchor="w", pady=(0, 6)
         )
 
@@ -877,7 +928,87 @@ class OcrServerLauncherGui:
             padx=12,
             pady=7,
         )
-        gen_btn.pack(fill="x", pady=(2, 0))
+        gen_btn.pack(fill="x", pady=(2, 8))
+
+        paired_row = ttk.Frame(pair_body, style="Surface.TFrame")
+        paired_row.pack(fill="x")
+        ttk.Label(paired_row, textvariable=self.paired_count_var, style="SurfaceMuted.TLabel").pack(
+            side="left"
+        )
+        make_secondary_button(
+            paired_row,
+            text="Manage...",
+            command=lambda: self.tab_bar.select("devices"),
+            padx=10,
+            pady=3,
+        ).pack(side="right")
+
+    def _build_devices_tab(self) -> None:
+        parent = self.tab_devices
+
+        bar_card, bar = make_card(parent, padding=(12, 8))
+        bar_card.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(bar, text="Paired 3DS Consoles & Active PSKs", style="CardHeader.TLabel").pack(side="left")
+        ttk.Label(bar, textvariable=self.paired_count_var, style="SurfaceMuted.TLabel").pack(
+            side="left", padx=(12, 0)
+        )
+
+        make_action_button(
+            bar,
+            text="Invalidate PSK",
+            command=self._invalidate_selected_device,
+            variant="danger",
+            padx=10,
+            pady=4,
+        ).pack(side="right")
+        make_secondary_button(
+            bar,
+            text="Rename",
+            command=self._rename_selected_device,
+            padx=10,
+            pady=4,
+        ).pack(side="right", padx=(0, 8))
+        make_secondary_button(
+            bar,
+            text="Refresh",
+            command=self._refresh_devices_table,
+            padx=10,
+            pady=4,
+        ).pack(side="right", padx=(0, 8))
+
+        table_border = tk.Frame(parent, bg=BORDER, bd=0, highlightthickness=0)
+        table_border.pack(fill="both", expand=True)
+
+        table_inner = tk.Frame(table_border, bg=BG_SURFACE, bd=0, highlightthickness=0)
+        table_inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        cols = ("name", "model", "device_id", "psk", "paired_at", "last_seen")
+        self.devices_tree = ttk.Treeview(table_inner, columns=cols, show="headings", selectmode="browse")
+        self.devices_tree.heading("name", text="3DS Name")
+        self.devices_tree.heading("model", text="Model")
+        self.devices_tree.heading("device_id", text="Console ID")
+        self.devices_tree.heading("psk", text="PSK (Masked)")
+        self.devices_tree.heading("paired_at", text="Paired")
+        self.devices_tree.heading("last_seen", text="Last Seen")
+
+        self.devices_tree.column("name", width=150, anchor="w")
+        self.devices_tree.column("model", width=110, anchor="w")
+        self.devices_tree.column("device_id", width=140, anchor="w")
+        self.devices_tree.column("psk", width=130, anchor="w")
+        self.devices_tree.column("paired_at", width=135, anchor="w")
+        self.devices_tree.column("last_seen", width=135, anchor="w")
+
+        scroll = ttk.Scrollbar(table_inner, orient="vertical", command=self.devices_tree.yview)
+        self.devices_tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.devices_tree.pack(side="left", fill="both", expand=True)
+
+        ttk.Label(
+            parent,
+            text="Tip: Scan the QR code on the Server & Pairing tab from any 3DS to pair it with its own PSK. Invalidating a PSK immediately disconnects that 3DS.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
 
     def _build_logs_tab(self) -> None:
         parent = self.tab_logs
@@ -1010,6 +1141,18 @@ class OcrServerLauncherGui:
     def _on_ai_model_changed(self, _event=None) -> None:
         primary, fallback = label_to_ai_models(self.ai_model_var.get())
         save_anki_config({"gemini_model": primary, "gemini_fallback_model": fallback})
+
+    def _on_multi_user_mode_changed(self) -> None:
+        is_multi = bool(self.multi_user_var.get())
+        save_anki_config({"multi_user_mode": is_multi})
+        self.mode_hint_var.set(
+            "Ignores server Anki login; prompts each 3DS to log in."
+            if is_multi
+            else "Uses server Anki login unless a 3DS sets its own."
+        )
+        self._log_local(
+            f"[INFO] Server Mode switched -> {'Multiple 3DS (require per-3DS AnkiWeb login)' if is_multi else 'Single 3DS (server default fallback)'}."
+        )
         fb_note = f", fallback={fallback}" if fallback else ""
         self._log_local(
             f"[INFO] AI model switched -> {self.ai_model_var.get()} (gemini_model={primary}{fb_note})."
@@ -1236,17 +1379,112 @@ class OcrServerLauncherGui:
             if hasattr(self, "toggle_qr_btn"):
                 self.toggle_qr_btn.configure(text="Show QR Code")
 
+    def _refresh_devices_table(self) -> None:
+        if not hasattr(self, "devices_tree"):
+            return
+        store = psk_store.load_or_init_store(APP_DIR)
+        devices = store.get("devices", [])
+        self.paired_count_var.set(f"Paired 3DSes: {len(devices)}")
+
+        selected = self.devices_tree.selection()
+        selected_id = selected[0] if selected else None
+
+        for item in self.devices_tree.get_children():
+            self.devices_tree.delete(item)
+
+        for dev in devices:
+            dev_id = str(dev.get("device_id", "") or "")
+            psk = str(dev.get("psk", "") or "")
+            masked_psk = (psk[:6] + "…" + psk[-4:]) if len(psk) > 12 else "••••••"
+            self.devices_tree.insert(
+                "",
+                "end",
+                iid=dev_id,
+                values=(
+                    dev.get("name", "3DS"),
+                    dev.get("model", "3DS"),
+                    dev_id,
+                    masked_psk,
+                    dev.get("paired_at", "") or "—",
+                    dev.get("last_seen", "") or "Never",
+                ),
+            )
+
+        if selected_id and self.devices_tree.exists(selected_id):
+            self.devices_tree.selection_set(selected_id)
+
+    def _rename_selected_device(self) -> None:
+        sel = self.devices_tree.selection()
+        if not sel:
+            messagebox.showinfo("Rename 3DS", "Select a paired 3DS from the list first.")
+            return
+        dev_id = sel[0]
+        cur_name = str(self.devices_tree.item(dev_id, "values")[0])
+        new_name = simpledialog.askstring(
+            "Rename 3DS",
+            f"Enter a display name for console {dev_id}:",
+            initialvalue=cur_name,
+            parent=self.root,
+        )
+        if new_name and new_name.strip():
+            if psk_store.rename_device(APP_DIR, dev_id, new_name.strip()):
+                self._refresh_devices_table()
+                self._log_local(f"[PAIRING] Renamed 3DS '{dev_id}' to '{new_name.strip()}'.")
+
+    def _invalidate_selected_device(self) -> None:
+        sel = self.devices_tree.selection()
+        if not sel:
+            messagebox.showinfo("Invalidate PSK", "Select a paired 3DS from the list first.")
+            return
+        dev_id = sel[0]
+        dev_name = str(self.devices_tree.item(dev_id, "values")[0])
+        if not messagebox.askyesno(
+            "Invalidate 3DS PSK",
+            f"Invalidate the PSK for '{dev_name}' ({dev_id})?\n\n"
+            "This 3DS will be disconnected immediately and must scan a new QR code to reconnect.",
+            parent=self.root,
+        ):
+            return
+        removed = psk_store.invalidate_device_psk(APP_DIR, dev_id)
+        if removed is not None:
+            self._refresh_devices_table()
+            self._log_local(
+                f"[PAIRING] Invalidated PSK for 3DS '{removed.get('name', dev_id)}' (ID={dev_id})."
+            )
+
+    def _poll_psk_store(self) -> None:
+        try:
+            path = psk_store.get_store_path(APP_DIR)
+            try:
+                mtime_ns = os.stat(path).st_mtime_ns
+            except OSError:
+                mtime_ns = -1
+
+            if mtime_ns != self._psk_store_mtime:
+                self._psk_store_mtime = mtime_ns
+                store = psk_store.load_or_init_store(APP_DIR)
+                new_pending = str(store.get("pending_psk", "") or "")
+                if new_pending and new_pending != self.current_psk:
+                    self.current_psk = new_pending
+                    if hasattr(self, "psk_var"):
+                        self.psk_var.set(new_pending)
+                    self._refresh_qr_code()
+                    self._log_local("[PAIRING] QR code rotated for next 3DS.")
+                self._refresh_devices_table()
+        except Exception:
+            pass
+        self.root.after(1000, self._poll_psk_store)
+
     def _generate_new_psk(self) -> None:
-        new_psk = secrets.token_urlsafe(32)
+        new_psk = psk_store.rotate_pending_psk(APP_DIR)
         self.current_psk = new_psk
         self.psk_var.set(new_psk)
-        save_ocr_psk(new_psk)
         self._refresh_qr_code()
-        self._log_local("[INFO] Generated fresh 256-bit PSK and updated QR pairing code.")
+        self._log_local("[INFO] Generated fresh 256-bit pending pairing PSK and updated QR code.")
         messagebox.showinfo(
             "New Key Generated",
-            "A fresh 256-bit PSK has been generated!\n\n"
-            "Click 'Show QR Code' (or the placeholder) to view the updated QR code and pair with your 3DS.",
+            "A fresh 256-bit pairing PSK has been generated!\n\n"
+            "Already-paired 3DS consoles remain active. Click 'Show QR Code' to pair an additional 3DS.",
         )
 
     def _detect_wan_async(self) -> None:

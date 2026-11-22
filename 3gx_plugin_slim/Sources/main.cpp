@@ -32,7 +32,11 @@ namespace CTRPluginFramework
         {
             Sleep(Milliseconds(16));
             Controller::Update();
-            OCR_UpdateFrame();
+            if (g_ocrKeys.slimMenu != 0 && Controller::IsKeysPressed(g_ocrKeys.slimMenu)) {
+                OCR_OpenKeyBindingsMenu();
+            } else {
+                OCR_UpdateFrame();
+            }
         }
 
         OCR_Cleanup();

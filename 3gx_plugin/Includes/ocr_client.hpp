@@ -11,7 +11,10 @@ namespace CTRPluginFramework
     #define OCR_CONFIG_SD_PATH      "/luma/ocr_config.txt"
     #define OCR_PSK_SD_PATH         "/luma/ocr_psk.txt"
     #define OCR_KEYS_SD_PATH        "/luma/ocr_keys.txt"
+    #define OCR_ANKI_SD_PATH        "/luma/ocr_anki.txt"
+    #define OCR_DEVICE_ID_SD_PATH   "/luma/ocr_device_id.txt"
     #define OCR_PSK_MAX_LEN         128
+    #define OCR_ANKI_MAX_LEN        256
 
     // Screen Dimensions & Formats
     #define SCREEN_ID_TOP           0
@@ -49,16 +52,21 @@ namespace CTRPluginFramework
     #define CMD_TRANSLATE_BOT       0x21
     #define CMD_LOOKUP_KANJI        0x22
     #define CMD_ADD_ANKI_KANJI      0x23
+    #define CMD_SET_ANKI_CREDS      0x24
+    #define CMD_SET_DEVICE_INFO     0x25
+    #define CMD_CLICK_KANJI_WIN     0x26
 
     // Server Response Flags (OR'd onto target_screen_id in 5-byte popup header)
     #define POPUP_BUNDLE_FLAG        0x80
     #define POPUP_STATUS_FLAG        0x40
     #define POPUP_SCREEN_BUNDLE_FLAG 0x20
     #define POPUP_KANJI_FLAG         0x10
+    #define POPUP_ANKI_LOGIN_PROMPT_FLAG 0x08
 
     // Keybindings Structure
     struct OcrKeyBindings {
         u32 activation;   // Default: Key::R | Key::Start | Key::Select
+        u32 slimMenu;     // Default: Key::Start | Key::Select | Key::L
         u32 lookup;       // Default: Key::A
         u32 modeToggle;   // Default: Key::Select
         u32 switchScreen; // Default: Key::Y
@@ -85,8 +93,11 @@ namespace CTRPluginFramework
     void        OCR_Cleanup(void);
     bool        OCR_TestServerConnection(std::string &out_msg);
     void        OCR_LaunchSession(void);
+    void        OCR_OpenKeyBindingsMenu(void);
     void        OCR_UpdateFrame(void);
     bool        OCR_ScanQrCode(void);
+    bool        OCR_OpenAnkiCredentialsDialog(void);
+    std::string OCR_GetAnkiCredentialsLabel(void);
     void        OCR_InitKeyBindings(void);
     void        OCR_SaveKeyBindings(void);
     void        OCR_ResetKeyBindings(void);

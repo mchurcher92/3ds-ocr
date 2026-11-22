@@ -383,6 +383,14 @@ namespace CTRPluginFramework
                     HbBootLog(Utils::Format("[menu] close should=%d sleep=%d", shouldClose ? 1 : 0, SystemImpl::WantsToSleep() ? 1 : 0).c_str());
                     if (shouldClose)
                         SoundEngine::PlayMenuSound(SoundEngine::Event::CANCEL);
+                    if (shouldClose && !SystemImpl::WantsToSleep())
+                    {
+                        while (Controller::IsKeyDown(Key::B) && !SystemImpl::WantsToSleep())
+                        {
+                            Controller::Update();
+                            Sleep(Milliseconds(16));
+                        }
+                    }
                     ProcessImpl::Play(true);
                     HbBootLog("[menu] after Play");
                     _isOpen = false;

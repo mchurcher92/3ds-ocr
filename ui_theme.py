@@ -313,6 +313,37 @@ def apply_dark_theme(root: tk.Misc) -> ttk.Style:
         background=[("active", BORDER_BTN), ("pressed", BORDER_BTN_HOVER)],
     )
 
+    # Dark Treeview (Paired 3DSes list, etc.)
+    style.configure(
+        "Treeview",
+        background=BG_CANVAS,
+        fieldbackground=BG_CANVAS,
+        foreground=FG_PRIMARY,
+        bordercolor=BORDER,
+        borderwidth=0,
+        rowheight=26,
+        font=(UI_FONT, 9),
+    )
+    style.map(
+        "Treeview",
+        background=[("selected", ACCENT)],
+        foreground=[("selected", "#FFFFFF")],
+    )
+    style.configure(
+        "Treeview.Heading",
+        background=BG_ELEVATED,
+        foreground=FG_PRIMARY,
+        bordercolor=BORDER,
+        relief="flat",
+        padding=[8, 6],
+        font=(UI_FONT, 9, "bold"),
+    )
+    style.map(
+        "Treeview.Heading",
+        background=[("active", BG_ELEVATED_HOVER)],
+        foreground=[("active", "#FFFFFF")],
+    )
+
     return style
 
 
