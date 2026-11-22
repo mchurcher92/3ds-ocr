@@ -1504,6 +1504,14 @@ class WordMetaManager:
                     self._jlpt_kanji = json.load(f)
             except Exception as exc:
                 logger.warning("Failed to load JLPT kanji JSON %s: %s", jlpt_kanji_path, exc)
+        self._kangxi_radicals: Dict[str, List[str]] = {}
+        rad_json_path = os.path.join(os.path.dirname(jlpt_kanji_path), "kangxi_radicals.json")
+        if os.path.isfile(rad_json_path):
+            try:
+                with open(rad_json_path, "r", encoding="utf-8") as f:
+                    self._kangxi_radicals = json.load(f)
+            except Exception as exc:
+                logger.warning("Failed to load Kangxi radicals JSON %s: %s", rad_json_path, exc)
         self._cache: Dict[Tuple[str, str], str] = {}
         self._init_db()
 
@@ -1588,6 +1596,8 @@ class WordMetaManager:
             "jlpt": self._jlpt_kanji.get(kanji_char),
             "rad_num": None,
             "rad_char": "",
+            "rad_reading": "",
+            "rad_meaning": "",
             "on_readings": [],
             "kun_readings": [],
             "nanori": [],
@@ -1611,6 +1621,10 @@ class WordMetaManager:
                                 # Normalize Kangxi Radical (U+2F00..U+2FD5) to standard CJK Unified Ideograph
                                 # so fonts without the Kangxi Radicals block (e.g., msgothic.ttc) don't draw □
                                 info["rad_char"] = unicodedata.normalize("NFKC", chr(0x2F00 + rad_num - 1))
+                                rad_meta = self._kangxi_radicals.get(str(rad_num))
+                                if rad_meta and len(rad_meta) >= 2:
+                                    info["rad_reading"] = rad_meta[0]
+                                    info["rad_meaning"] = rad_meta[1]
                         except (ValueError, TypeError):
                             pass
                     if c.rm_groups:
@@ -7171,6 +7185,8 @@ def render_kanji_popup(
     jlpt = info.get("jlpt")
     rad_num = info.get("rad_num")
     rad_char = info.get("rad_char", "")
+    rad_reading = info.get("rad_reading", "")
+    rad_meaning = info.get("rad_meaning", "")
     on_readings: List[str] = info.get("on_readings", [])
     kun_readings: List[str] = info.get("kun_readings", [])
     nanori: List[str] = info.get("nanori", [])
@@ -7262,12 +7278,23 @@ def render_kanji_popup(
     draw.line([(right_x, y_cur - 2), (308, y_cur - 2)], fill=(40, 50, 70), width=1)
     strk_lbl = f"Strokes: {stroke_count}" if stroke_count else "Strokes: -"
     draw.text((right_x, y_cur), strk_lbl, fill=(200, 220, 240), font=font_small)
+    y_cur += 14
     rad_lbl = (
         f"Radical: {rad_char} (#{rad_num})" if rad_char and rad_num
         else (f"Radical: #{rad_num}" if rad_num else "Radical: -")
     )
-    draw.text((right_x, y_cur + 14), _fit_text(rad_lbl, font_small, READ_MAX_W), fill=(160, 185, 215), font=font_small)
-    y_cur += 32
+    draw.text((right_x, y_cur), _fit_text(rad_lbl, font_small, READ_MAX_W), fill=(160, 185, 215), font=font_small)
+    y_cur += 14
+    if rad_reading or rad_meaning:
+        rad_sub_parts = []
+        if rad_reading:
+            rad_sub_parts.append(rad_reading)
+        if rad_meaning:
+            rad_sub_parts.append(f"({rad_meaning})")
+        for ln in _wrap_items(rad_sub_parts, " ", font_small, READ_MAX_W):
+            draw.text((right_x, y_cur), ln, fill=(140, 170, 200), font=font_small)
+            y_cur += 13
+    y_cur += 4
 
     # Meanings (full width, below stroke box and right column)
     y_meanings_start = max(y_cur + 8, 170)
