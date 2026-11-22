@@ -24,6 +24,7 @@ import csv
 import hashlib
 import io
 import json
+import lzma
 import os
 import re
 import sys
@@ -279,7 +280,9 @@ def _extract_single_tar_member(
                 raise RuntimeError("Failed to open archive member stream.")
 
             total = int(target_member.size or 0)
-            written = 0
+            is_xz = target_member.name.lower().endswith(".xz")
+            decompressor = lzma.LZMADecompressor() if is_xz else None
+            processed = 0
             with src_stream, open(tmp_out, "wb") as out:
                 while True:
                     if cancel_event is not None and cancel_event.is_set():
@@ -287,10 +290,15 @@ def _extract_single_tar_member(
                     chunk = src_stream.read(CHUNK_SIZE)
                     if not chunk:
                         break
-                    out.write(chunk)
-                    written += len(chunk)
+                    processed += len(chunk)
+                    if decompressor is not None:
+                        data_out = decompressor.decompress(chunk)
+                        if data_out:
+                            out.write(data_out)
+                    else:
+                        out.write(chunk)
                     if progress_cb is not None:
-                        progress_cb(written, total, label)
+                        progress_cb(processed, total, label)
                 out.flush()
                 os.fsync(out.fileno())
 
@@ -341,7 +349,7 @@ def _update_jamdict(
         )
         _extract_single_tar_member(
             archive_tmp,
-            predicate=lambda name: os.path.basename(name) == "jamdict.db",
+            predicate=lambda name: os.path.basename(name) in ("jamdict.db", "jamdict.db.xz"),
             dest_path=dest_db,
             progress_cb=progress_cb,
             cancel_event=cancel_event,
