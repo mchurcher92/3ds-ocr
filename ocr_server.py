@@ -1522,6 +1522,14 @@ class WordMetaManager:
                     self._kangxi_radicals = json.load(f)
             except Exception as exc:
                 logger.warning("Failed to load Kangxi radicals JSON %s: %s", rad_json_path, exc)
+        self._radical_positions: Dict[str, str] = {}
+        rad_pos_path = os.path.join(os.path.dirname(jlpt_kanji_path), "radical_positions.json")
+        if os.path.isfile(rad_pos_path):
+            try:
+                with open(rad_pos_path, "r", encoding="utf-8") as f:
+                    self._radical_positions = json.load(f)
+            except Exception as exc:
+                logger.warning("Failed to load radical positions JSON %s: %s", rad_pos_path, exc)
         self._cache: Dict[Tuple[str, str], str] = {}
         self._init_db()
 
@@ -1689,6 +1697,177 @@ class WordMetaManager:
                                 if rad_meta and len(rad_meta) >= 2:
                                     info["rad_reading"] = rad_meta[0]
                                     info["rad_meaning"] = rad_meta[1]
+                                    _RADICAL_VARIANT_READINGS = {
+                                        (9, "亻"): "にんべん",
+                                        (18, "刂"): "りっとう",
+                                        (42, "⺌"): "しょうかんむり",
+                                        (61, "忄"): "りっしんべん",
+                                        (64, "扌"): "てへん",
+                                        (85, "氵"): "さんずい",
+                                        (86, "灬"): "れっか",
+                                        (94, "犭"): "けものへん",
+                                        (96, "王"): "おうへん",
+                                        (113, "礻"): "しめすへん",
+                                        (122, "罒"): "あみがしら",
+                                        (125, "耂"): "おいかんむり",
+                                        (130, "月"): "にくづき",
+                                        (140, "艹"): "くさかんむり",
+                                        (145, "衤"): "ころもへん",
+                                        (163, "阝"): "おおざと",
+                                        (170, "阝"): "こざとへん",
+                                    }
+                                    _RADICAL_POS_READINGS = {
+                                        (4, "T"): "のかんむり",
+                                        (12, "T"): "はちがしら",
+                                        (16, "BL"): "きにょう",
+                                        (16, "C"): "かぜかんむり",
+                                        (30, "L"): "くちへん",
+                                        (32, "L"): "つちへん",
+                                        (33, "T"): "さむらいかんむり",
+                                        (38, "L"): "おんなへん",
+                                        (39, "L"): "こへん",
+                                        (41, "R"): "すんづくり",
+                                        (46, "L"): "やまへん",
+                                        (46, "T"): "やまかんむり",
+                                        (48, "L"): "たくみへん",
+                                        (50, "L"): "はばへん",
+                                        (57, "L"): "ゆみへん",
+                                        (61, "SM"): "したごころ",
+                                        (63, "TL"): "とだれ",
+                                        (70, "L"): "ほうへん",
+                                        (72, "L"): "ひへん",
+                                        (74, "L"): "つきへん",
+                                        (75, "L"): "きへん",
+                                        (78, "L"): "がつへん",
+                                        (85, "SM"): "したみず",
+                                        (86, "L"): "ひへん",
+                                        (87, "T"): "つめかんむり",
+                                        (91, "L"): "かたへん",
+                                        (92, "L"): "きばへん",
+                                        (93, "L"): "うしへん",
+                                        (102, "L"): "たへん",
+                                        (103, "L"): "ひきへん",
+                                        (106, "L"): "はくへん",
+                                        (109, "L"): "めへん",
+                                        (110, "L"): "ほこへん",
+                                        (111, "L"): "やへん",
+                                        (112, "L"): "いしへん",
+                                        (116, "T"): "あなかんむり",
+                                        (117, "L"): "たつへん",
+                                        (118, "T"): "たけかんむり",
+                                        (119, "L"): "こめへん",
+                                        (120, "L"): "いとへん",
+                                        (128, "L"): "みみへん",
+                                        (133, "L"): "いたるへん",
+                                        (137, "L"): "ふねへん",
+                                        (142, "L"): "むしへん",
+                                        (148, "L"): "つのへん",
+                                        (149, "L"): "ごんべん",
+                                        (150, "L"): "たにへん",
+                                        (151, "L"): "まめへん",
+                                        (154, "L"): "かいへん",
+                                        (156, "BL"): "そうにょう",
+                                        (157, "L"): "あしへん",
+                                        (158, "L"): "みへん",
+                                        (159, "L"): "くるまへん",
+                                        (164, "L"): "とりへん",
+                                        (165, "L"): "のごめへん",
+                                        (166, "L"): "さとへん",
+                                        (167, "L"): "かねへん",
+                                        (173, "T"): "あめかんむり",
+                                        (184, "L"): "しょくへん",
+                                        (187, "L"): "うまへん",
+                                        (188, "L"): "ほねへん",
+                                        (195, "L"): "うおへん",
+                                        (200, "TL"): "あさかんむり",
+                                        (200, "T"): "あさかんむり",
+                                    }
+                                    _RADICAL_BASE_READINGS = {
+                                        4: "の",
+                                        9: "ひと",
+                                        12: "はち",
+                                        16: "きにょう",
+                                        18: "かたな",
+                                        30: "くち",
+                                        32: "つち",
+                                        33: "さむらい",
+                                        38: "おんな",
+                                        39: "こ",
+                                        41: "すん",
+                                        42: "しょう",
+                                        46: "やま",
+                                        48: "たくみ",
+                                        50: "はば",
+                                        57: "ゆみ",
+                                        61: "こころ",
+                                        63: "と",
+                                        64: "て",
+                                        70: "ほう",
+                                        72: "ひ",
+                                        74: "つき",
+                                        75: "き",
+                                        78: "がつ",
+                                        85: "みず",
+                                        86: "ひ",
+                                        87: "つめ",
+                                        91: "かた",
+                                        92: "きば",
+                                        93: "うし",
+                                        94: "いぬ",
+                                        96: "たま",
+                                        102: "た",
+                                        103: "ひき",
+                                        106: "しろ",
+                                        109: "め",
+                                        110: "ほこ",
+                                        111: "や",
+                                        112: "いし",
+                                        113: "しめす",
+                                        116: "あな",
+                                        117: "たつ",
+                                        118: "たけ",
+                                        119: "こめ",
+                                        120: "いと",
+                                        122: "あみめ",
+                                        125: "おい",
+                                        128: "みみ",
+                                        130: "にく",
+                                        133: "いたる",
+                                        137: "ふね",
+                                        140: "くさ",
+                                        142: "むし",
+                                        145: "ころも",
+                                        148: "つの",
+                                        149: "げん",
+                                        150: "たに",
+                                        151: "まめ",
+                                        154: "かい",
+                                        156: "はしる",
+                                        157: "あし",
+                                        158: "み",
+                                        159: "くるま",
+                                        163: "むら",
+                                        164: "とり",
+                                        165: "のごめ",
+                                        166: "さと",
+                                        167: "かね",
+                                        170: "こざと",
+                                        173: "あめ",
+                                        184: "しょく",
+                                        187: "うま",
+                                        188: "ほね",
+                                        195: "うお",
+                                        200: "あさ",
+                                    }
+                                    rad_pos = self._radical_positions.get(kanji_char, "")
+                                    if (rad_num, info["rad_char"]) in _RADICAL_VARIANT_READINGS:
+                                        info["rad_reading"] = _RADICAL_VARIANT_READINGS[(rad_num, info["rad_char"])]
+                                    elif rad_num == 9 and "𠆢" in comps:
+                                        info["rad_reading"] = "ひとやね"
+                                    elif rad_pos and (rad_num, rad_pos) in _RADICAL_POS_READINGS:
+                                        info["rad_reading"] = _RADICAL_POS_READINGS[(rad_num, rad_pos)]
+                                    elif rad_num in _RADICAL_BASE_READINGS:
+                                        info["rad_reading"] = _RADICAL_BASE_READINGS[rad_num]
                         except (ValueError, TypeError):
                             pass
                     if c.rm_groups:
@@ -1969,7 +2148,7 @@ class JapaneseOCRDictionaryPipeline:
             for fname in sorted(os.listdir(DICTIONARIES_DIR)):
                 if (
                     fname.endswith(".json")
-                    and fname not in ("index.json", "kangxi_radicals.json")
+                    and fname not in ("index.json", "kangxi_radicals.json", "radical_positions.json")
                     and not fname.startswith("term_bank_")
                     and not fname.startswith("jlpt_")
                 ):
