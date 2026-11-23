@@ -22,6 +22,7 @@ from ui_theme import (
     SUCCESS,
     UI_FONT,
     apply_dark_titlebar,
+    center_window,
     make_action_button,
     make_card,
     make_secondary_button,
@@ -238,7 +239,7 @@ class AnkiSettingsDialog(tk.Toplevel):
         self._build_dialog()
         self.update_idletasks()
         req_h = self.winfo_reqheight()
-        self.geometry(f"590x{req_h}")
+        center_window(self, 580, req_h, parent=parent)
 
     def _build_dialog(self) -> None:
         main_frame = ttk.Frame(self, padding=(16, 12))
@@ -305,8 +306,8 @@ class AnkiSettingsDialog(tk.Toplevel):
         ).pack(anchor="w", padx=(24, 0))
 
         # AnkiConnect Frame
-        ac_card, self.ac_frame = make_card(main_frame, title="AnkiConnect Configuration", padding=(12, 8))
-        ac_card.pack(fill="x", pady=(0, 8))
+        self.ac_card, self.ac_frame = make_card(main_frame, title="AnkiConnect Configuration", padding=(14, 10))
+        self.ac_card.pack(fill="x", pady=(0, 10))
 
         ac_grid = ttk.Frame(self.ac_frame, style="Surface.TFrame")
         ac_grid.pack(fill="x")
@@ -329,8 +330,8 @@ class AnkiSettingsDialog(tk.Toplevel):
         self.ac_status_lbl.pack(anchor="w", pady=(4, 0))
 
         # AnkiWeb Frame
-        web_card, self.web_frame = make_card(main_frame, title="AnkiWeb Cloud Credentials", padding=(12, 8))
-        web_card.pack(fill="x", pady=(0, 8))
+        self.web_card, self.web_frame = make_card(main_frame, title="AnkiWeb Cloud Credentials", padding=(14, 10))
+        self.web_card.pack(fill="x", pady=(0, 10))
 
         web_grid = ttk.Frame(self.web_frame, style="Surface.TFrame")
         web_grid.pack(fill="x")
@@ -360,8 +361,8 @@ class AnkiSettingsDialog(tk.Toplevel):
         self.web_status_lbl.pack(anchor="w", pady=(4, 0))
 
         # Deck & Note Preferences Frame
-        pref_card, pref_frame = make_card(main_frame, title="Deck & Card Preferences", padding=(12, 8))
-        pref_card.pack(fill="x", pady=(0, 8))
+        self.pref_card, pref_frame = make_card(main_frame, title="Deck & Card Preferences", padding=(14, 10))
+        self.pref_card.pack(fill="x", pady=(0, 10))
 
         pref_grid = ttk.Frame(pref_frame, style="Surface.TFrame")
         pref_grid.pack(fill="x")
@@ -403,45 +404,12 @@ class AnkiSettingsDialog(tk.Toplevel):
         self.player_en_var = tk.StringVar(value=self.cfg.get("player_english_name", ""))
         ttk.Entry(name_pair, textvariable=self.player_en_var).grid(row=0, column=2, sticky="ew")
 
-        ttk.Label(pref_grid, text="OCR Mode:", style="SurfaceBold.TLabel").grid(
-            row=3, column=0, sticky="w", padx=(0, 10), pady=3
-        )
-        self.ocr_mode_var = tk.StringVar(
-            value=ocr_mode_to_label(self.cfg.get("ocr_mode", "local_cached"))
-        )
-        ttk.Combobox(
-            pref_grid,
-            textvariable=self.ocr_mode_var,
-            values=[lbl for lbl, _ in OCR_MODE_OPTIONS],
-            state="readonly",
-        ).grid(row=3, column=1, sticky="ew", pady=3)
-
-        ttk.Label(pref_grid, text="AI Model:", style="SurfaceBold.TLabel").grid(
-            row=4, column=0, sticky="w", padx=(0, 10), pady=3
-        )
-        self.ai_model_var = tk.StringVar(
-            value=ai_model_to_label(self.cfg.get("gemini_model", "gemini-3.5-flash-lite"))
-        )
-        ttk.Combobox(
-            pref_grid,
-            textvariable=self.ai_model_var,
-            values=[lbl for lbl, _, _ in AI_MODEL_OPTIONS],
-            state="readonly",
-        ).grid(row=4, column=1, sticky="ew", pady=3)
-
         self.sub_hira_var = tk.BooleanVar(value=bool(self.cfg.get("substitute_hiragana_terms", True)))
         ttk.Checkbutton(
             pref_frame,
             text="Substitute custom game vocabulary & Pokémon names into sentences",
             variable=self.sub_hira_var,
-        ).pack(anchor="w", pady=(8, 2))
-
-        self.gemini_vision_var = tk.BooleanVar(value=bool(self.cfg.get("gemini_use_vision", True)))
-        ttk.Checkbutton(
-            pref_frame,
-            text="Pass 3DS screenshot to Gemini API (visual context)",
-            variable=self.gemini_vision_var,
-        ).pack(anchor="w", pady=(2, 0))
+        ).pack(anchor="w", pady=(8, 0))
 
         # Bottom Buttons
         btn_box = ttk.Frame(main_frame)
@@ -464,12 +432,18 @@ class AnkiSettingsDialog(tk.Toplevel):
 
     def _on_mode_changed(self) -> None:
         mode = self.mode_var.get()
-        ac_state = "normal" if mode == "ankiconnect" else "disabled"
-        web_state = "normal" if mode == "ankiweb" else "disabled"
-        for w in (self.ac_url_entry, self.ac_test_btn):
-            w.configure(state=ac_state)
-        for w in (self.web_user_entry, self.web_pass_entry, self.web_test_btn):
-            w.configure(state=web_state)
+        self.ac_card.pack_forget()
+        self.web_card.pack_forget()
+
+        if mode == "ankiconnect":
+            self.ac_card.pack(fill="x", pady=(0, 10), before=self.pref_card)
+        elif mode == "ankiweb":
+            self.web_card.pack(fill="x", pady=(0, 10), before=self.pref_card)
+
+        self.update_idletasks()
+        req_h = self.winfo_reqheight()
+        if req_h > 100:
+            self.geometry(f"580x{req_h}")
 
     def _test_ankiconnect(self) -> None:
         url = self.ac_url_var.get().strip() or "http://127.0.0.1:8765"
@@ -508,7 +482,6 @@ class AnkiSettingsDialog(tk.Toplevel):
 
     def _save_and_close(self) -> None:
         mode = self.mode_var.get()
-        gm_primary, gm_fallback = label_to_ai_models(self.ai_model_var.get())
         cfg_updates = {
             "anki_mode": mode,
             "use_ankiconnect": (mode == "ankiconnect"),
@@ -518,10 +491,6 @@ class AnkiSettingsDialog(tk.Toplevel):
             "player_name": self.player_jp_var.get().strip(),
             "player_english_name": self.player_en_var.get().strip(),
             "substitute_hiragana_terms": self.sub_hira_var.get(),
-            "gemini_use_vision": self.gemini_vision_var.get(),
-            "ocr_mode": label_to_ocr_mode(self.ocr_mode_var.get()),
-            "gemini_model": gm_primary,
-            "gemini_fallback_model": gm_fallback,
         }
         save_anki_config(cfg_updates)
 

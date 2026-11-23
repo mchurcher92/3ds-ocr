@@ -14,9 +14,9 @@ from typing import Callable, Dict, List, Optional, Sequence
 
 import dict_updater
 from ui_theme import (
-    BG_ELEVATED,
     BG_ROOT,
     BG_SURFACE,
+    BG_SURFACE_ALT,
     BORDER,
     FG_MUTED,
     FG_PRIMARY,
@@ -27,18 +27,10 @@ from ui_theme import (
     UI_FONT,
     WARNING,
     apply_dark_titlebar,
+    center_window,
     make_action_button,
     make_secondary_button,
 )
-
-
-def _center_dialog(win: tk.Toplevel, width: int, height: int) -> None:
-    win.update_idletasks()
-    sw = win.winfo_screenwidth()
-    sh = win.winfo_screenheight()
-    x = max(0, (sw - width) // 2)
-    y = max(0, (sh - height) // 2)
-    win.geometry(f"{width}x{height}+{x}+{y}")
 
 
 def _fmt_size(num_bytes: int) -> str:
@@ -92,7 +84,7 @@ class DictionaryUpdaterDialog:
 
         self._build_ui()
         self._refresh_statuses()
-        _center_dialog(self.win, 680, 585)
+        center_window(self.win, 680, 585, parent=self.parent)
 
     def _build_asset_list(
         self,
@@ -224,12 +216,12 @@ class DictionaryUpdaterDialog:
 
         byo_border = tk.Frame(tab_dicts, bg=BORDER)
         byo_border.pack(fill="x", pady=(0, 6))
-        byo = tk.Frame(byo_border, bg=BG_ELEVATED, padx=12, pady=8)
+        byo = tk.Frame(byo_border, bg=BG_SURFACE_ALT, padx=12, pady=8)
         byo.pack(fill="x", padx=1, pady=1)
         tk.Label(
             byo,
             text="Optional: Bring Your Own Yomitan Dictionaries",
-            bg=BG_ELEVATED,
+            bg=BG_SURFACE_ALT,
             fg=FG_PRIMARY,
             font=(UI_FONT, 9, "bold"),
         ).pack(anchor="w")
@@ -240,7 +232,7 @@ class DictionaryUpdaterDialog:
                 "automatic downloads for licensing reasons. Drop any Yomitan .zip dictionary you "
                 "own into dictionaries/ and click Reload Dictionaries."
             ),
-            bg=BG_ELEVATED,
+            bg=BG_SURFACE_ALT,
             fg=FG_SECONDARY,
             font=(UI_FONT, 8),
             wraplength=610,
@@ -253,12 +245,12 @@ class DictionaryUpdaterDialog:
 
         ocr_note_border = tk.Frame(tab_ocr, bg=BORDER)
         ocr_note_border.pack(fill="x", pady=(0, 6))
-        ocr_note = tk.Frame(ocr_note_border, bg=BG_ELEVATED, padx=12, pady=8)
+        ocr_note = tk.Frame(ocr_note_border, bg=BG_SURFACE_ALT, padx=12, pady=8)
         ocr_note.pack(fill="x", padx=1, pady=1)
         tk.Label(
             ocr_note,
             text="Note on OCR Models & Licensing",
-            bg=BG_ELEVATED,
+            bg=BG_SURFACE_ALT,
             fg=FG_PRIMARY,
             font=(UI_FONT, 9, "bold"),
         ).pack(anchor="w")
@@ -269,7 +261,7 @@ class DictionaryUpdaterDialog:
                 "• Local ONNX/Safetensors models above are pinned & SHA-256 verified to match ocr_server.py.\n"
                 "• YomiToku PARSeq-Small is CC-BY-NC-SA 4.0 (personal/non-commercial use only; opt-in)."
             ),
-            bg=BG_ELEVATED,
+            bg=BG_SURFACE_ALT,
             fg=FG_SECONDARY,
             font=(UI_FONT, 8),
             wraplength=610,

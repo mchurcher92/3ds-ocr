@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import qrcode
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 import dict_updater
+import git_updater
 import psk_store
 from dict_updater_dialog import DictionaryUpdaterDialog
 
@@ -46,8 +47,10 @@ from ui_theme import (
     BG_ELEVATED,
     BG_ROOT,
     BG_SURFACE,
+    BG_SURFACE_ALT,
     BORDER,
     BORDER_BTN,
+    BORDER_SUBTLE,
     CYAN,
     DANGER,
     DANGER_BG,
@@ -66,7 +69,9 @@ from ui_theme import (
     create_app_icon,
     make_action_button,
     make_card,
+    make_ghost_button,
     make_secondary_button,
+    make_stat_tile,
 )
 
 # Base directory resolution
@@ -206,17 +211,10 @@ class ScreenPreviewWidget(ttk.Frame):
 
     def _build_ui(self) -> None:
         # Top Controls Toolbar Card
-        toolbar_card, toolbar = make_card(self, padding=(10, 8))
-        toolbar_card.pack(fill="x", pady=(0, 8))
+        toolbar_card, toolbar = make_card(self, padding=(12, 8))
+        toolbar_card.pack(fill="x", pady=(0, 10))
 
-        ttk.Checkbutton(
-            toolbar,
-            text="Overlay OCR Results",
-            variable=self.show_overlay_var,
-            command=self.refresh,
-        ).pack(side="left", padx=(0, 14))
-
-        ttk.Label(toolbar, text="Screen:", style="SurfaceBold.TLabel").pack(side="left", padx=(0, 5))
+        ttk.Label(toolbar, text="Screen:", style="SurfaceBold.TLabel").pack(side="left", padx=(0, 6))
         mode_menu = ttk.Combobox(
             toolbar,
             textvariable=self.view_mode_var,
@@ -227,7 +225,7 @@ class ScreenPreviewWidget(ttk.Frame):
         mode_menu.pack(side="left", padx=(0, 14))
         mode_menu.bind("<<ComboboxSelected>>", lambda _e: self.refresh())
 
-        ttk.Label(toolbar, text="Scale:", style="SurfaceBold.TLabel").pack(side="left", padx=(0, 5))
+        ttk.Label(toolbar, text="Scale:", style="SurfaceBold.TLabel").pack(side="left", padx=(0, 6))
         scale_menu = ttk.Combobox(
             toolbar,
             textvariable=self.scale_var,
@@ -240,22 +238,29 @@ class ScreenPreviewWidget(ttk.Frame):
 
         ttk.Checkbutton(
             toolbar,
-            text="Auto-Refresh",
-            variable=self.auto_refresh_var,
-        ).pack(side="left", padx=(0, 10))
-
-        make_secondary_button(toolbar, text="Refresh", width=9, command=self.refresh, padx=8, pady=4).pack(
-            side="left"
-        )
+            text="OCR Overlay",
+            variable=self.show_overlay_var,
+            command=self.refresh,
+        ).pack(side="left")
 
         if self.on_popout:
             make_secondary_button(
-                toolbar, text="Pop Out Window", command=self.on_popout, padx=12, pady=4
+                toolbar, text="Pop Out", command=self.on_popout, padx=12, pady=4
             ).pack(side="right")
+
+        make_ghost_button(
+            toolbar, text="Refresh", width=8, command=self.refresh, padx=8, pady=4
+        ).pack(side="right", padx=(0, 8))
+
+        ttk.Checkbutton(
+            toolbar,
+            text="Auto-Refresh",
+            variable=self.auto_refresh_var,
+        ).pack(side="right", padx=(0, 12))
 
         # Main Canvas Area with Dark Border & Scrollbars
         canvas_border = tk.Frame(self, bg=BORDER, bd=0, highlightthickness=0)
-        canvas_border.pack(fill="both", expand=True, pady=(0, 8))
+        canvas_border.pack(fill="both", expand=True, pady=(0, 10))
 
         canvas_container = tk.Frame(canvas_border, bg=BG_CANVAS, bd=0, highlightthickness=0)
         canvas_container.pack(fill="both", expand=True, padx=1, pady=1)
@@ -282,14 +287,18 @@ class ScreenPreviewWidget(ttk.Frame):
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
 
         # Bottom Inspector Card
-        info_card, info_frame = make_card(self, title="OCR & Cursor Inspector", padding=(12, 10))
+        info_card, info_frame = make_card(self, title="OCR & Cursor Inspector", padding=(14, 10))
         info_card.pack(fill="x")
 
-        self.title_var = tk.StringVar(value="Title: (No active 3DS session)")
-        ttk.Label(info_frame, textvariable=self.title_var, style="SurfaceBold.TLabel").pack(anchor="w")
+        title_row = ttk.Frame(info_frame, style="Surface.TFrame")
+        title_row.pack(fill="x")
+        self.title_var = tk.StringVar(value="No active 3DS session")
+        ttk.Label(title_row, textvariable=self.title_var, style="SurfaceBold.TLabel").pack(side="left")
+        self.timestamp_var = tk.StringVar(value="")
+        ttk.Label(title_row, textvariable=self.timestamp_var, style="SurfaceMuted.TLabel").pack(side="right")
 
         self.word_var = tk.StringVar(value="Word: —")
-        ttk.Label(info_frame, textvariable=self.word_var, style="Accent.TLabel").pack(anchor="w", pady=(3, 1))
+        ttk.Label(info_frame, textvariable=self.word_var, style="Accent.TLabel").pack(anchor="w", pady=(6, 2))
 
         self.gloss_var = tk.StringVar(value="Definition: —")
         self.gloss_lbl = ttk.Label(
@@ -305,7 +314,7 @@ class ScreenPreviewWidget(ttk.Frame):
         )
 
         self.meta_var = tk.StringVar(value="Engines: —  •  Cursor: —")
-        ttk.Label(info_frame, textvariable=self.meta_var, style="SurfaceMuted.TLabel").pack(anchor="w", pady=(4, 0))
+        ttk.Label(info_frame, textvariable=self.meta_var, style="SurfaceMuted.TLabel").pack(anchor="w", pady=(6, 0))
 
     def _on_mousewheel(self, event: tk.Event) -> None:
         if self.canvas.yview() != (0.0, 1.0):
@@ -398,7 +407,8 @@ class ScreenPreviewWidget(ttk.Frame):
             tid_str = ocr_data.get("title_id") or ""
             ts = ocr_data.get("timestamp", 0)
             time_str = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else ""
-            self.title_var.set(f"{game_str} {tid_str}  [{time_str}]".strip())
+            self.title_var.set(f"{game_str}  {tid_str}".strip())
+            self.timestamp_var.set(f"Captured {time_str}" if time_str else "")
 
             lc = ocr_data.get("last_click")
             if lc:
@@ -420,7 +430,8 @@ class ScreenPreviewWidget(ttk.Frame):
                 self.gloss_var.set("Definition: —")
                 self.meta_var.set("Engines: —  •  Cursor: —")
         else:
-            self.title_var.set("Title: Standby")
+            self.title_var.set("Standby")
+            self.timestamp_var.set("")
             self.word_var.set("Word: —")
             self.gloss_var.set("Definition: —")
             self.meta_var.set("Engines: —  •  Cursor: —")
@@ -556,8 +567,8 @@ class OcrServerLauncherGui:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("3DS OCR & Translation Server")
-        self.root.geometry("880x750")
-        self.root.minsize(780, 700)
+        self.root.geometry("960x720")
+        self.root.minsize(840, 640)
 
         apply_dark_theme(self.root)
         apply_dark_titlebar(self.root)
@@ -571,11 +582,17 @@ class OcrServerLauncherGui:
         store = psk_store.load_or_init_store(APP_DIR)
         self.current_psk = str(store.get("pending_psk", "") or "")
         self._psk_store_mtime: int = -1
-        self.paired_count_var = tk.StringVar(
-            value=f"Paired 3DSes: {len(store.get('devices', []))}"
-        )
+        dev_count = len(store.get("devices", []))
+        self.paired_count_var = tk.StringVar(value=f"Paired 3DSes: {dev_count}")
+        self.header_subtitle_var = tk.StringVar(value="Preparing local endpoint...")
+        self.stat_endpoint_var = tk.StringVar(value="—")
+        self.stat_devices_var = tk.StringVar(value=f"{dev_count} console{'s' if dev_count != 1 else ''}")
+        self.stat_anki_var = tk.StringVar(value=get_anki_summary())
+        self.stat_dicts_var = tk.StringVar(value="—")
+
         self.server_proc: Optional[subprocess.Popen] = None
         self._pending_restart: bool = False
+        self._git_update_busy: bool = False
         self.log_queue: queue.Queue = queue.Queue()
         self.reader_thread: Optional[threading.Thread] = None
         self.qr_image_tk = None
@@ -588,6 +605,7 @@ class OcrServerLauncherGui:
         self._build_ui()
         self._refresh_qr_code()
         self._refresh_devices_table()
+        self._update_status_summary()
         self._detect_wan_async()
         self._poll_log_queue()
         self._poll_psk_store()
@@ -597,7 +615,7 @@ class OcrServerLauncherGui:
 
     def _build_ui(self) -> None:
         # Top Header Bar
-        header = ttk.Frame(self.root, padding=(16, 14, 16, 10))
+        header = ttk.Frame(self.root, padding=(20, 16, 20, 10))
         header.pack(fill="x")
 
         title_col = ttk.Frame(header)
@@ -606,9 +624,9 @@ class OcrServerLauncherGui:
         ttk.Label(title_col, text="3DS OCR & Translation Server", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             title_col,
-            text="Modular Frontend  •  External OCR Engines, Dictionaries & Anki Sync",
+            textvariable=self.header_subtitle_var,
             style="Muted.TLabel",
-        ).pack(anchor="w", pady=(2, 0))
+        ).pack(anchor="w", pady=(3, 0))
 
         ctrl_col = ttk.Frame(header)
         ctrl_col.pack(side="right")
@@ -641,7 +659,7 @@ class OcrServerLauncherGui:
 
         self.reset_server_btn = make_action_button(
             ctrl_col,
-            text="↻  Reset Server",
+            text="↻  Restart",
             command=self._restart_server,
             variant="secondary",
             padx=12,
@@ -650,33 +668,34 @@ class OcrServerLauncherGui:
         )
         self.reset_server_btn.pack(side="left", padx=(8, 0))
 
-        # Sleek Underline Tab Bar & Content Area (replaces Win98 ttk.Notebook)
+        # Sleek Underline Tab Bar & Content Area
         tab_bar_container = tk.Frame(self.root, bg=BG_ROOT, bd=0, highlightthickness=0)
-        tab_bar_container.pack(fill="x", padx=16, pady=(0, 6))
+        tab_bar_container.pack(fill="x", padx=20, pady=(0, 8))
 
         self.tab_content = ttk.Frame(self.root)
-        self.tab_content.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+        self.tab_content.pack(fill="both", expand=True, padx=20, pady=(0, 16))
 
         self.tab_bar = ModernTabBar(tab_bar_container, self.tab_content)
         self.tab_bar.pack(fill="x")
 
-        # Tab 1: Server & Pairing
-        self.tab_server = ttk.Frame(self.tab_content, padding=(0, 6, 0, 0))
-        self.tab_bar.add_tab("server", "Server & Pairing", self.tab_server)
+        self.tab_overview = ttk.Frame(self.tab_content, padding=(0, 8, 0, 0))
+        self.tab_bar.add_tab("overview", "Overview", self.tab_overview)
 
-        # Tab 2: Paired 3DSes
-        self.tab_devices = ttk.Frame(self.tab_content, padding=(0, 6, 0, 0))
-        self.tab_bar.add_tab("devices", "Paired 3DSes", self.tab_devices)
+        self.tab_devices = ttk.Frame(self.tab_content, padding=(0, 8, 0, 0))
+        self.tab_bar.add_tab("devices", "Devices & Pairing", self.tab_devices)
 
-        # Tab 3: Screen Preview
-        self.tab_preview = ttk.Frame(self.tab_content, padding=(0, 6, 0, 0))
+        self.tab_preview = ttk.Frame(self.tab_content, padding=(0, 8, 0, 0))
         self.tab_bar.add_tab("preview", "Screen Preview", self.tab_preview)
 
-        # Tab 4: Server Logs
-        self.tab_logs = ttk.Frame(self.tab_content, padding=(0, 6, 0, 0))
-        self.tab_bar.add_tab("logs", "Server Logs", self.tab_logs)
+        self.tab_logs = ttk.Frame(self.tab_content, padding=(0, 8, 0, 0))
+        self.tab_bar.add_tab("logs", "Logs", self.tab_logs)
 
-        self._build_server_tab()
+        self.tab_settings = ttk.Frame(self.tab_content, padding=(0, 8, 0, 0))
+        self.tab_bar.add_tab("settings", "Settings", self.tab_settings)
+
+        self.tab_bar.bind_shortcuts(self.root)
+
+        self._build_overview_tab()
         self._build_devices_tab()
         self.preview_widget = ScreenPreviewWidget(
             self.tab_preview,
@@ -685,42 +704,71 @@ class OcrServerLauncherGui:
         )
         self.preview_widget.pack(fill="both", expand=True)
         self._build_logs_tab()
+        self._build_settings_tab()
 
-    def _build_server_tab(self) -> None:
-        parent = self.tab_server
-        parent.columnconfigure(0, weight=5, uniform="server_cols")
-        parent.columnconfigure(1, weight=4, uniform="server_cols")
-        parent.rowconfigure(0, weight=1)
+    def _build_overview_tab(self) -> None:
+        parent = self.tab_overview
 
-        left_col = ttk.Frame(parent)
+        # Top 4-tile KPI Status Strip
+        stats_strip = ttk.Frame(parent)
+        stats_strip.pack(fill="x", pady=(0, 14))
+        for col_idx in range(4):
+            stats_strip.columnconfigure(col_idx, weight=1, uniform="stats")
+
+        make_stat_tile(
+            stats_strip,
+            "Endpoint",
+            self.stat_endpoint_var,
+            on_click=lambda: self.tab_bar.select("settings"),
+        ).grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+
+        make_stat_tile(
+            stats_strip,
+            "Paired 3DS",
+            self.stat_devices_var,
+            on_click=lambda: self.tab_bar.select("devices"),
+        ).grid(row=0, column=1, sticky="nsew", padx=(0, 8))
+
+        make_stat_tile(
+            stats_strip,
+            "Anki Sync",
+            self.stat_anki_var,
+            on_click=self._open_anki_dialog,
+        ).grid(row=0, column=2, sticky="nsew", padx=(0, 8))
+
+        make_stat_tile(
+            stats_strip,
+            "Dictionaries",
+            self.stat_dicts_var,
+            on_click=self._open_dict_updater_dialog,
+        ).grid(row=0, column=3, sticky="nsew")
+
+        # Main 2-column grid
+        cols = ttk.Frame(parent)
+        cols.pack(fill="both", expand=True)
+        cols.columnconfigure(0, weight=1, uniform="overview_cols")
+        cols.columnconfigure(1, weight=1, uniform="overview_cols")
+        cols.rowconfigure(0, weight=1)
+
+        left_col = ttk.Frame(cols)
         left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
-        right_col = ttk.Frame(parent)
-        right_col.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        right_col = ttk.Frame(cols)
+        right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
-        # --- Left Column Card 1: Backend & OCR Engine ---
-        ocr_card, ocr_body = make_card(left_col, title="Backend & OCR Engine", padding=(12, 10))
-        ocr_card.pack(fill="x", pady=(0, 8))
-        ocr_body.columnconfigure(0, minsize=126)
+        # --- Left Card 1: OCR & AI Engine ---
+        ocr_card, ocr_body = make_card(
+            left_col,
+            title="OCR & AI Engine",
+            subtitle="Recognition pipeline and language model",
+            padding=(16, 14),
+        )
+        ocr_card.pack(fill="x", pady=(0, 12))
+        ocr_body.columnconfigure(0, minsize=104)
         ocr_body.columnconfigure(1, weight=1)
 
-        backend_exists = os.path.isfile(OCR_SERVER_SCRIPT)
-        b_text = "ocr_server.py  •  Ready" if backend_exists else "ocr_server.py  •  MISSING"
-        b_color = SUCCESS if backend_exists else DANGER
-
-        ttk.Label(ocr_body, text="Backend Script:", style="SurfaceBold.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(0, 8)
-        )
-        tk.Label(
-            ocr_body,
-            text=b_text,
-            font=(UI_FONT, 9, "bold"),
-            bg=BG_SURFACE,
-            fg=b_color,
-        ).grid(row=0, column=1, sticky="w", padx=(10, 0), pady=(0, 8))
-
         ttk.Label(ocr_body, text="OCR Mode:", style="SurfaceBold.TLabel").grid(
-            row=1, column=0, sticky="w", pady=(0, 8)
+            row=0, column=0, sticky="w", pady=(0, 10)
         )
         self.ocr_mode_var = tk.StringVar(
             value=ocr_mode_to_label(_load_anki_config().get("ocr_mode", "local_cached"))
@@ -731,11 +779,11 @@ class OcrServerLauncherGui:
             values=[lbl for lbl, _ in OCR_MODE_OPTIONS],
             state="readonly",
         )
-        ocr_mode_menu.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(0, 8))
+        ocr_mode_menu.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=(0, 10))
         ocr_mode_menu.bind("<<ComboboxSelected>>", self._on_ocr_mode_changed)
 
         ttk.Label(ocr_body, text="AI Model:", style="SurfaceBold.TLabel").grid(
-            row=2, column=0, sticky="w", pady=(0, 8)
+            row=1, column=0, sticky="w", pady=(0, 10)
         )
         self.ai_model_var = tk.StringVar(
             value=ai_model_to_label(_load_anki_config().get("gemini_model", "gemini-3.5-flash-lite"))
@@ -746,7 +794,7 @@ class OcrServerLauncherGui:
             values=[lbl for lbl, _, _ in AI_MODEL_OPTIONS],
             state="readonly",
         )
-        ai_model_menu.grid(row=2, column=1, sticky="ew", padx=(10, 0), pady=(0, 8))
+        ai_model_menu.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(0, 10))
         ai_model_menu.bind("<<ComboboxSelected>>", self._on_ai_model_changed)
 
         self.gemini_vision_var = tk.BooleanVar(
@@ -757,142 +805,132 @@ class OcrServerLauncherGui:
             text="Pass 3DS screenshot to Gemini (visual context)",
             variable=self.gemini_vision_var,
             command=self._on_gemini_vision_toggled,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
-        # --- Left Column Card 2: Dictionaries & Anki Sync ---
-        res_card, res_body = make_card(left_col, title="Dictionaries & Anki Sync", padding=(12, 10))
-        res_card.pack(fill="x", pady=(0, 8))
-        res_body.columnconfigure(0, minsize=126)
-        res_body.columnconfigure(1, weight=1)
+        # --- Left Card 2: Dictionaries & Local Models ---
+        dict_card, dict_body = make_card(
+            left_col,
+            title="Dictionaries & Local Models",
+            subtitle="Offline Japanese lexicons and ONNX models",
+            padding=(16, 14),
+        )
+        dict_card.pack(fill="both", expand=True)
 
         self.dict_summary_var = tk.StringVar(value=self._get_dictionary_summary())
-        ttk.Label(res_body, text="Dictionaries:", style="SurfaceBold.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(0, 6)
-        )
         ttk.Label(
-            res_body,
+            dict_body,
             textvariable=self.dict_summary_var,
             style="Surface.TLabel",
-            wraplength=260,
-        ).grid(row=0, column=1, sticky="w", padx=(10, 0), pady=(0, 6))
+            wraplength=380,
+        ).pack(anchor="w", pady=(0, 12))
 
-        dict_btns = ttk.Frame(res_body, style="Surface.TFrame")
-        dict_btns.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        dict_btns = ttk.Frame(dict_body, style="Surface.TFrame")
+        dict_btns.pack(anchor="w")
         make_secondary_button(
-            dict_btns, text="Reload Dictionaries", command=self._reload_resources, padx=12, pady=4
+            dict_btns,
+            text="Update Dicts & Models...",
+            command=self._open_dict_updater_dialog,
+            padx=12,
+            pady=5,
         ).pack(side="left", padx=(0, 8))
         make_secondary_button(
-            dict_btns, text="Update Dicts & Models...", command=self._open_dict_updater_dialog, padx=12, pady=4
+            dict_btns,
+            text="Reload",
+            command=self._reload_resources,
+            padx=12,
+            pady=5,
         ).pack(side="left", padx=(0, 8))
-        make_secondary_button(
-            dict_btns, text="Open Folder", command=self._open_dict_folder, padx=12, pady=4
+        make_ghost_button(
+            dict_btns,
+            text="Open Folder",
+            command=self._open_dict_folder,
+            padx=10,
+            pady=5,
         ).pack(side="left")
 
-        tk.Frame(res_body, bg=BORDER, height=1).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 10))
-
-        ttk.Label(res_body, text="Anki Sync:", style="SurfaceBold.TLabel").grid(
-            row=3, column=0, sticky="w", pady=(0, 6)
+        # --- Right Card 1: Anki Integration ---
+        anki_card, anki_body = make_card(
+            right_col,
+            title="Anki Integration",
+            subtitle="Vocabulary mining and card export",
+            padding=(16, 14),
         )
+        anki_card.pack(fill="x", pady=(0, 12))
+
         self.anki_summary_var = tk.StringVar(value=get_anki_summary())
-        ttk.Label(res_body, textvariable=self.anki_summary_var, style="Surface.TLabel").grid(
-            row=3, column=1, sticky="w", padx=(10, 0), pady=(0, 6)
-        )
+        ttk.Label(
+            anki_body,
+            textvariable=self.anki_summary_var,
+            style="SurfaceBold.TLabel",
+        ).pack(anchor="w", pady=(0, 10))
+
         make_secondary_button(
-            res_body, text="Configure Anki...", command=self._open_anki_dialog, padx=12, pady=4
-        ).grid(row=4, column=0, columnspan=2, sticky="w")
+            anki_body,
+            text="Configure Anki...",
+            command=self._open_anki_dialog,
+            padx=14,
+            pady=5,
+        ).pack(anchor="w")
 
-        tk.Frame(res_body, bg=BORDER, height=1).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 8))
-
-        ttk.Label(res_body, text="Server Mode:", style="SurfaceBold.TLabel").grid(
-            row=6, column=0, sticky="w", pady=(0, 4)
+        # --- Right Card 2: 3DS Connection & Shortcuts ---
+        conn_card, conn_body = make_card(
+            right_col,
+            title="3DS Connection",
+            subtitle="Pair consoles or adjust server settings",
+            padding=(16, 14),
         )
-        is_multi = bool(_load_anki_config().get("multi_user_mode", False))
-        self.multi_user_var = tk.BooleanVar(value=is_multi)
-        mode_frame = ttk.Frame(res_body, style="Surface.TFrame")
-        mode_frame.grid(row=6, column=1, sticky="w", padx=(10, 0), pady=(0, 4))
-        ttk.Radiobutton(
-            mode_frame,
-            text="Single 3DS",
-            variable=self.multi_user_var,
-            value=False,
-            command=self._on_multi_user_mode_changed,
-        ).pack(side="left", padx=(0, 14))
-        ttk.Radiobutton(
-            mode_frame,
-            text="Multiple 3DS",
-            variable=self.multi_user_var,
-            value=True,
-            command=self._on_multi_user_mode_changed,
-        ).pack(side="left")
+        conn_card.pack(fill="both", expand=True)
 
+        is_multi = bool(_load_anki_config().get("multi_user_mode", False))
         self.mode_hint_var = tk.StringVar(
             value=(
-                "Ignores server Anki login; prompts each 3DS to log in."
+                "Multiple 3DS mode: prompts each console for its own AnkiWeb login."
                 if is_multi
-                else "Uses server Anki login unless a 3DS sets its own."
+                else "Single 3DS mode: uses server Anki settings unless overridden."
             )
         )
         ttk.Label(
-            res_body,
+            conn_body,
             textvariable=self.mode_hint_var,
             style="SurfaceMuted.TLabel",
-            wraplength=360,
-        ).grid(row=7, column=0, columnspan=2, sticky="w")
+            wraplength=380,
+        ).pack(anchor="w", pady=(0, 14))
 
-        # --- Left Column Card 3: Network Configuration ---
-        net_card, net_body = make_card(left_col, title="Network Configuration", padding=(12, 10))
-        net_card.pack(fill="both", expand=True)
-        net_body.columnconfigure(0, minsize=126)
-        net_body.columnconfigure(1, weight=1)
-
-        ttk.Label(net_body, text="Primary IP (LAN):", style="SurfaceBold.TLabel").grid(
-            row=0, column=0, sticky="w", pady=5
-        )
-        self.lan_var = tk.StringVar(value=get_local_lan_ip())
-        self.lan_entry = ttk.Entry(net_body, textvariable=self.lan_var)
-        self.lan_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5)
-        self.lan_entry.bind("<KeyRelease>", lambda _e: self._refresh_qr_code())
-
-        ttk.Label(net_body, text="Secondary IP (WAN):", style="SurfaceBold.TLabel").grid(
-            row=1, column=0, sticky="w", pady=5
-        )
-        self.wan_var = tk.StringVar(value="")
-        self.wan_entry = ttk.Entry(net_body, textvariable=self.wan_var)
-        self.wan_entry.grid(row=1, column=1, sticky="ew", padx=(10, 8), pady=5)
-        self.wan_entry.bind("<KeyRelease>", lambda _e: self._refresh_qr_code())
-
+        nav_btns = ttk.Frame(conn_body, style="Surface.TFrame")
+        nav_btns.pack(anchor="w")
+        make_action_button(
+            nav_btns,
+            text="Pair New 3DS →",
+            command=lambda: self.tab_bar.select("devices"),
+            variant="primary",
+            padx=14,
+            pady=6,
+        ).pack(side="left", padx=(0, 8))
         make_secondary_button(
-            net_body, text="Detect", width=7, command=self._detect_wan_async, padx=8, pady=4
-        ).grid(row=1, column=2, pady=5)
+            nav_btns,
+            text="Server Settings →",
+            command=lambda: self.tab_bar.select("settings"),
+            padx=14,
+            pady=6,
+        ).pack(side="left")
 
-        ttk.Label(net_body, text="Server Port:", style="SurfaceBold.TLabel").grid(
-            row=2, column=0, sticky="w", pady=5
+    def _build_devices_tab(self) -> None:
+        parent = self.tab_devices
+        parent.columnconfigure(0, minsize=280, weight=0)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        # --- Left Card: Pair a New 3DS ---
+        pair_card, pair_body = make_card(
+            parent,
+            title="Pair a New 3DS",
+            subtitle="Press [Start] on 3DS and scan QR code",
+            padding=(16, 14),
         )
-        self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
-        self.port_entry = ttk.Entry(net_body, textvariable=self.port_var, width=10)
-        self.port_entry.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=5)
-        self.port_entry.bind("<KeyRelease>", lambda _e: self._refresh_qr_code())
+        pair_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 
-        self.endpoint_preview_var = tk.StringVar(value="")
-        ttk.Label(net_body, textvariable=self.endpoint_preview_var, style="SurfaceMuted.TLabel").grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(8, 0)
-        )
-
-        # --- Right Column Card: 3DS Pairing & Authentication ---
-        pair_card, pair_body = make_card(right_col, title="3DS Camera Pairing & PSK", padding=(14, 12))
-        pair_card.pack(fill="both", expand=True)
-
-        ttk.Label(
-            pair_body,
-            text="In-Game OCR: Press [Start] on your 3DS and scan this QR code to pair your endpoints and key.",
-            style="SurfaceMuted.TLabel",
-            wraplength=290,
-            justify="center",
-        ).pack(pady=(0, 10))
-
-        # QR code frame with toggleable reveal
         qr_outer = tk.Frame(pair_body, bg=BORDER, bd=0, highlightthickness=0)
-        qr_outer.pack(pady=(0, 8))
+        qr_outer.pack(pady=(2, 8))
         self.qr_pad = tk.Frame(qr_outer, bg=BG_SURFACE, padx=10, pady=10)
         self.qr_pad.pack(padx=1, pady=1)
         self.qr_canvas = tk.Label(self.qr_pad, bg=BG_SURFACE, bd=0, cursor="hand2")
@@ -906,16 +944,16 @@ class OcrServerLauncherGui:
             padx=14,
             pady=4,
         )
-        self.toggle_qr_btn.pack(pady=(0, 10))
+        self.toggle_qr_btn.pack(pady=(0, 12))
 
-        tk.Frame(pair_body, bg=BORDER, height=1).pack(fill="x", pady=(0, 10))
+        tk.Frame(pair_body, bg=BORDER_SUBTLE, height=1).pack(fill="x", pady=(0, 12))
 
-        ttk.Label(pair_body, text="Next 3DS Pairing Key (256-bit PSK)", style="SurfaceBold.TLabel").pack(
+        ttk.Label(pair_body, text="Pairing Key (256-bit PSK)", style="SurfaceBold.TLabel").pack(
             anchor="w", pady=(0, 6)
         )
 
         psk_box = ttk.Frame(pair_body, style="Surface.TFrame")
-        psk_box.pack(fill="x", pady=(0, 10))
+        psk_box.pack(fill="x", pady=(0, 12))
 
         self.psk_var = tk.StringVar(value=self.current_psk)
         self.psk_entry = ttk.Entry(
@@ -927,77 +965,74 @@ class OcrServerLauncherGui:
         )
         self.psk_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
 
-        self.toggle_psk_btn = make_secondary_button(
+        self.toggle_psk_btn = make_ghost_button(
             psk_box, text="Show", width=5, command=self._toggle_psk_visibility, padx=6, pady=4
         )
         self.toggle_psk_btn.pack(side="left", padx=(0, 4))
 
-        self.copy_psk_btn = make_secondary_button(
+        self.copy_psk_btn = make_ghost_button(
             psk_box, text="Copy", width=5, command=self._copy_psk, padx=6, pady=4
         )
         self.copy_psk_btn.pack(side="left")
 
-        gen_btn = make_action_button(
+        make_action_button(
             pair_body,
-            text="Generate New Key & QR Code",
+            text="Generate New Key & QR",
             command=self._generate_new_psk,
             variant="primary",
             padx=12,
             pady=7,
-        )
-        gen_btn.pack(fill="x", pady=(2, 8))
+        ).pack(fill="x")
 
-        paired_row = ttk.Frame(pair_body, style="Surface.TFrame")
-        paired_row.pack(fill="x")
-        ttk.Label(paired_row, textvariable=self.paired_count_var, style="SurfaceMuted.TLabel").pack(
+        # --- Right Card: Paired Consoles ---
+        list_card, list_body = make_card(
+            parent,
+            title="Paired Consoles",
+            subtitle="Manage authorized 3DS consoles and active PSKs",
+            padding=(16, 14),
+        )
+        list_card.grid(row=0, column=1, sticky="nsew")
+
+        toolbar = ttk.Frame(list_body, style="Surface.TFrame")
+        toolbar.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(toolbar, textvariable=self.paired_count_var, style="SurfaceMuted.TLabel").pack(
             side="left"
         )
-        make_secondary_button(
-            paired_row,
-            text="Manage...",
-            command=lambda: self.tab_bar.select("devices"),
-            padx=10,
-            pady=3,
-        ).pack(side="right")
 
-    def _build_devices_tab(self) -> None:
-        parent = self.tab_devices
-
-        bar_card, bar = make_card(parent, padding=(12, 8))
-        bar_card.pack(fill="x", pady=(0, 8))
-
-        ttk.Label(bar, text="Paired 3DS Consoles & Active PSKs", style="CardHeader.TLabel").pack(side="left")
-        ttk.Label(bar, textvariable=self.paired_count_var, style="SurfaceMuted.TLabel").pack(
-            side="left", padx=(12, 0)
-        )
-
-        make_action_button(
-            bar,
-            text="Invalidate PSK",
+        self.revoke_btn = make_action_button(
+            toolbar,
+            text="Revoke Key",
             command=self._invalidate_selected_device,
             variant="danger",
             padx=10,
             pady=4,
-        ).pack(side="right")
-        make_secondary_button(
-            bar,
+        )
+        self.revoke_btn.configure(state="disabled")
+        self.revoke_btn.pack(side="right")
+
+        self.rename_btn = make_secondary_button(
+            toolbar,
             text="Rename",
             command=self._rename_selected_device,
             padx=10,
             pady=4,
-        ).pack(side="right", padx=(0, 8))
-        make_secondary_button(
-            bar,
+        )
+        self.rename_btn.configure(state="disabled")
+        self.rename_btn.pack(side="right", padx=(0, 8))
+
+        make_ghost_button(
+            toolbar,
             text="Refresh",
             command=self._refresh_devices_table,
             padx=10,
             pady=4,
         ).pack(side="right", padx=(0, 8))
 
-        table_border = tk.Frame(parent, bg=BORDER, bd=0, highlightthickness=0)
+        table_border = tk.Frame(list_body, bg=BORDER, bd=0, highlightthickness=0)
         table_border.pack(fill="both", expand=True)
 
-        table_inner = tk.Frame(table_border, bg=BG_SURFACE, bd=0, highlightthickness=0)
+        table_inner = tk.Frame(table_border, bg=BG_CANVAS, bd=0, highlightthickness=0)
         table_inner.pack(fill="both", expand=True, padx=1, pady=1)
 
         cols = ("name", "model", "device_id", "psk", "paired_at", "last_seen")
@@ -1009,12 +1044,16 @@ class OcrServerLauncherGui:
         self.devices_tree.heading("paired_at", text="Paired")
         self.devices_tree.heading("last_seen", text="Last Seen")
 
-        self.devices_tree.column("name", width=150, anchor="w")
-        self.devices_tree.column("model", width=110, anchor="w")
-        self.devices_tree.column("device_id", width=140, anchor="w")
-        self.devices_tree.column("psk", width=130, anchor="w")
-        self.devices_tree.column("paired_at", width=135, anchor="w")
-        self.devices_tree.column("last_seen", width=135, anchor="w")
+        self.devices_tree.column("name", width=105, minwidth=70, anchor="w")
+        self.devices_tree.column("model", width=72, minwidth=55, anchor="w")
+        self.devices_tree.column("device_id", width=95, minwidth=70, anchor="w")
+        self.devices_tree.column("psk", width=90, minwidth=70, anchor="w")
+        self.devices_tree.column("paired_at", width=90, minwidth=70, anchor="w")
+        self.devices_tree.column("last_seen", width=90, minwidth=70, anchor="w")
+
+        self.devices_tree.tag_configure("odd", background=BG_CANVAS)
+        self.devices_tree.tag_configure("even", background=BG_SURFACE_ALT)
+        self.devices_tree.bind("<<TreeviewSelect>>", self._on_device_selection_changed)
 
         scroll = ttk.Scrollbar(table_inner, orient="vertical", command=self.devices_tree.yview)
         self.devices_tree.configure(yscrollcommand=scroll.set)
@@ -1022,17 +1061,17 @@ class OcrServerLauncherGui:
         self.devices_tree.pack(side="left", fill="both", expand=True)
 
         ttk.Label(
-            parent,
-            text="Tip: Scan the QR code on the Server & Pairing tab from any 3DS to pair it with its own PSK. Invalidating a PSK immediately disconnects that 3DS.",
-            style="Muted.TLabel",
-        ).pack(anchor="w", pady=(6, 0))
+            list_body,
+            text="Revoking a key disconnects that console immediately; scan a new QR code to re-pair.",
+            style="SurfaceMuted.TLabel",
+        ).pack(anchor="w", pady=(8, 0))
 
     def _build_logs_tab(self) -> None:
         parent = self.tab_logs
 
         # Top Log Toolbar Card
-        bar_card, bar = make_card(parent, padding=(12, 8))
-        bar_card.pack(fill="x", pady=(0, 8))
+        bar_card, bar = make_card(parent, padding=(14, 10))
+        bar_card.pack(fill="x", pady=(0, 10))
 
         ttk.Label(bar, text="Live Server & OCR Activity", style="CardHeader.TLabel").pack(side="left")
 
@@ -1041,7 +1080,7 @@ class OcrServerLauncherGui:
             side="left", padx=(12, 0)
         )
 
-        make_secondary_button(bar, text="Clear", width=7, command=self._clear_logs, padx=8, pady=4).pack(
+        make_ghost_button(bar, text="Clear", width=7, command=self._clear_logs, padx=8, pady=4).pack(
             side="right"
         )
         self.copy_log_btn = make_secondary_button(
@@ -1077,8 +1116,8 @@ class OcrServerLauncherGui:
             selectforeground="#FFFFFF",
             relief="flat",
             bd=0,
-            padx=12,
-            pady=10,
+            padx=14,
+            pady=12,
             yscrollcommand=self.log_scroll.set,
             state="disabled",
         )
@@ -1091,6 +1130,174 @@ class OcrServerLauncherGui:
         self.log_text.tag_configure("info", foreground="#60A5FA")
         self.log_text.tag_configure("success", foreground="#34D399")
         self.log_text.tag_configure("dim", foreground=FG_MUTED)
+
+    def _build_settings_tab(self) -> None:
+        parent = self.tab_settings
+        parent.columnconfigure(0, weight=1, uniform="settings_cols")
+        parent.columnconfigure(1, weight=1, uniform="settings_cols")
+        parent.rowconfigure(0, weight=1)
+
+        left_col = ttk.Frame(parent)
+        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+
+        right_col = ttk.Frame(parent)
+        right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        # --- Left Card 1: Network & Endpoints ---
+        net_card, net_body = make_card(
+            left_col,
+            title="Network & Endpoints",
+            subtitle="Addresses encoded into the 3DS pairing QR",
+            padding=(16, 14),
+        )
+        net_card.pack(fill="x", pady=(0, 12))
+        net_body.columnconfigure(0, minsize=122)
+        net_body.columnconfigure(1, weight=1)
+
+        ttk.Label(net_body, text="Primary IP (LAN):", style="SurfaceBold.TLabel").grid(
+            row=0, column=0, sticky="w", pady=5
+        )
+        self.lan_var = tk.StringVar(value=get_local_lan_ip())
+        self.lan_entry = ttk.Entry(net_body, textvariable=self.lan_var)
+        self.lan_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(10, 0), pady=5)
+        self.lan_entry.bind("<KeyRelease>", lambda _e: self._refresh_qr_code())
+
+        ttk.Label(net_body, text="Secondary IP (WAN):", style="SurfaceBold.TLabel").grid(
+            row=1, column=0, sticky="w", pady=5
+        )
+        self.wan_var = tk.StringVar(value="")
+        self.wan_entry = ttk.Entry(net_body, textvariable=self.wan_var)
+        self.wan_entry.grid(row=1, column=1, sticky="ew", padx=(10, 8), pady=5)
+        self.wan_entry.bind("<KeyRelease>", lambda _e: self._refresh_qr_code())
+
+        make_secondary_button(
+            net_body, text="Detect", width=7, command=self._detect_wan_async, padx=8, pady=4
+        ).grid(row=1, column=2, pady=5)
+
+        ttk.Label(net_body, text="Server Port:", style="SurfaceBold.TLabel").grid(
+            row=2, column=0, sticky="w", pady=5
+        )
+        self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
+        self.port_entry = ttk.Entry(net_body, textvariable=self.port_var, width=10)
+        self.port_entry.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=5)
+        self.port_entry.bind("<KeyRelease>", lambda _e: self._refresh_qr_code())
+
+        self.endpoint_preview_var = tk.StringVar(value="")
+        ttk.Label(net_body, textvariable=self.endpoint_preview_var, style="SurfaceMuted.TLabel").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        )
+
+        # --- Left Card 2: Multi-User Mode ---
+        mode_card, mode_body = make_card(
+            left_col,
+            title="Multi-User Mode",
+            subtitle="How Anki credentials are resolved per console",
+            padding=(16, 14),
+        )
+        mode_card.pack(fill="both", expand=True)
+
+        is_multi = bool(_load_anki_config().get("multi_user_mode", False))
+        self.multi_user_var = tk.BooleanVar(value=is_multi)
+        mode_row = ttk.Frame(mode_body, style="Surface.TFrame")
+        mode_row.pack(anchor="w", pady=(0, 8))
+        ttk.Radiobutton(
+            mode_row,
+            text="Single 3DS",
+            variable=self.multi_user_var,
+            value=False,
+            command=self._on_multi_user_mode_changed,
+        ).pack(side="left", padx=(0, 16))
+        ttk.Radiobutton(
+            mode_row,
+            text="Multiple 3DS",
+            variable=self.multi_user_var,
+            value=True,
+            command=self._on_multi_user_mode_changed,
+        ).pack(side="left")
+
+        ttk.Label(
+            mode_body,
+            textvariable=self.mode_hint_var,
+            style="SurfaceMuted.TLabel",
+            wraplength=380,
+        ).pack(anchor="w")
+
+        # --- Right Card 1: Software Updates ---
+        upd_card, upd_body = make_card(
+            right_col,
+            title="Software Updates",
+            subtitle="Git repository sync and startup check",
+            padding=(16, 14),
+        )
+        upd_card.pack(fill="x", pady=(0, 12))
+
+        is_repo, g_branch, g_sha = git_updater.get_local_git_info(APP_DIR)
+        init_git_txt = (
+            f"{g_branch or 'HEAD'} @ {g_sha}"
+            if is_repo and g_sha
+            else ("Git repo ready" if is_repo else "Not a git repo")
+        )
+        git_row = ttk.Frame(upd_body, style="Surface.TFrame")
+        git_row.pack(fill="x", pady=(0, 10))
+        self.git_status_var = tk.StringVar(value=init_git_txt)
+        ttk.Label(git_row, textvariable=self.git_status_var, style="Surface.TLabel").pack(side="left")
+        self.check_git_btn = make_secondary_button(
+            git_row,
+            text="Check Updates",
+            command=lambda: self._check_git_updates_async(manual=True),
+            padx=12,
+            pady=4,
+        )
+        self.check_git_btn.pack(side="right")
+
+        self.auto_git_update_var = tk.BooleanVar(
+            value=bool(_load_anki_config().get("auto_check_git_updates", True))
+        )
+        ttk.Checkbutton(
+            upd_body,
+            text="Check git for updates on startup",
+            variable=self.auto_git_update_var,
+            command=self._on_auto_git_update_toggled,
+        ).pack(anchor="w")
+
+        # --- Right Card 2: System Environment ---
+        env_card, env_body = make_card(
+            right_col,
+            title="System Environment",
+            subtitle="Backend runtime status",
+            padding=(16, 14),
+        )
+        env_card.pack(fill="both", expand=True)
+        env_body.columnconfigure(0, minsize=110)
+        env_body.columnconfigure(1, weight=1)
+
+        backend_exists = os.path.isfile(OCR_SERVER_SCRIPT)
+        b_text = "ocr_server.py  •  Ready" if backend_exists else "ocr_server.py  •  MISSING"
+        b_color = SUCCESS if backend_exists else DANGER
+
+        ttk.Label(env_body, text="Backend Script:", style="SurfaceBold.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 8)
+        )
+        tk.Label(
+            env_body,
+            text=b_text,
+            font=(UI_FONT, 9, "bold"),
+            bg=BG_SURFACE,
+            fg=b_color,
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0), pady=(0, 8))
+
+        py_disp = self.python_bin
+        if len(py_disp) > 48:
+            py_disp = "…" + py_disp[-45:]
+        ttk.Label(env_body, text="Python Runtime:", style="SurfaceBold.TLabel").grid(
+            row=1, column=0, sticky="w"
+        )
+        ttk.Label(
+            env_body,
+            text=py_disp,
+            style="SurfaceMuted.TLabel",
+            wraplength=260,
+        ).grid(row=1, column=1, sticky="w", padx=(10, 0))
 
     def _open_preview_popout(self) -> None:
         """Open or refocus a separate, floating Screen Preview window."""
@@ -1134,6 +1341,7 @@ class OcrServerLauncherGui:
 
     def _reload_resources(self) -> None:
         self.dict_summary_var.set(self._get_dictionary_summary())
+        self._update_status_summary()
         if self.server_proc and self.server_proc.poll() is None:
             self._log_local("[INFO] Restarting server to apply updated dictionaries & resources...")
             self._restart_server()
@@ -1157,30 +1365,28 @@ class OcrServerLauncherGui:
     def _on_ai_model_changed(self, _event=None) -> None:
         primary, fallback = label_to_ai_models(self.ai_model_var.get())
         save_anki_config({"gemini_model": primary, "gemini_fallback_model": fallback})
-
-    def _on_multi_user_mode_changed(self) -> None:
-        is_multi = bool(self.multi_user_var.get())
-        save_anki_config({"multi_user_mode": is_multi})
-        self.mode_hint_var.set(
-            "Ignores server Anki login; prompts each 3DS to log in."
-            if is_multi
-            else "Uses server Anki login unless a 3DS sets its own."
-        )
-        self._log_local(
-            f"[INFO] Server Mode switched -> {'Multiple 3DS (require per-3DS AnkiWeb login)' if is_multi else 'Single 3DS (server default fallback)'}."
-        )
         fb_note = f", fallback={fallback}" if fallback else ""
         self._log_local(
             f"[INFO] AI model switched -> {self.ai_model_var.get()} (gemini_model={primary}{fb_note})."
         )
 
+    def _on_multi_user_mode_changed(self) -> None:
+        is_multi = bool(self.multi_user_var.get())
+        save_anki_config({"multi_user_mode": is_multi})
+        self.mode_hint_var.set(
+            "Multiple 3DS mode: prompts each console for its own AnkiWeb login."
+            if is_multi
+            else "Single 3DS mode: uses server Anki settings unless overridden."
+        )
+        self._update_status_summary()
+        self._log_local(
+            f"[INFO] Server Mode switched -> {'Multiple 3DS (require per-3DS AnkiWeb login)' if is_multi else 'Single 3DS (server default fallback)'}."
+        )
+
     def _open_anki_dialog(self) -> None:
         def on_saved():
-            cfg = _load_anki_config()
             self.anki_summary_var.set(get_anki_summary())
-            self.gemini_vision_var.set(bool(cfg.get("gemini_use_vision", True)))
-            self.ocr_mode_var.set(ocr_mode_to_label(cfg.get("ocr_mode", "local_cached")))
-            self.ai_model_var.set(ai_model_to_label(cfg.get("gemini_model", "gemini-3.5-flash-lite")))
+            self._update_status_summary()
 
         AnkiSettingsDialog(self.root, on_save_callback=on_saved)
 
@@ -1193,6 +1399,194 @@ class OcrServerLauncherGui:
             self._open_dict_updater_dialog(first_run=True, auto_start_after=True)
         else:
             self._start_server()
+        if self.auto_git_update_var.get():
+            self.root.after(1500, lambda: self._check_git_updates_async(manual=False))
+
+    def _on_auto_git_update_toggled(self) -> None:
+        enabled = bool(self.auto_git_update_var.get())
+        save_anki_config({"auto_check_git_updates": enabled})
+        self._log_local(
+            f"[INFO] Startup git update check {'enabled' if enabled else 'disabled'}."
+        )
+
+    def _check_git_updates_async(self, manual: bool = True) -> None:
+        if self._git_update_busy:
+            if manual:
+                messagebox.showinfo("Git Updates", "A git update check is already in progress.")
+            return
+        self._git_update_busy = True
+        self.check_git_btn.configure(state="disabled")
+        self.git_status_var.set("Checking git...")
+
+        def worker() -> None:
+            status = git_updater.check_for_updates(APP_DIR, fetch=True, timeout=15)
+
+            def _on_done() -> None:
+                self._git_update_busy = False
+                self.check_git_btn.configure(state="normal")
+                if not status.ok:
+                    self.git_status_var.set("Git check failed")
+                    self._log_local(f"[WARN] Git update check failed: {status.error}")
+                    if manual:
+                        messagebox.showwarning("Git Updates", f"Could not check git updates:\n\n{status.error}")
+                    return
+
+                if status.behind_count <= 0:
+                    self.git_status_var.set(f"Up to date ({status.branch} @ {status.local_commit})")
+                    self._log_local(
+                        f"[INFO] Git is up to date ({status.branch} @ {status.local_commit})."
+                    )
+                    if manual:
+                        messagebox.showinfo(
+                            "Git Updates",
+                            f"Already up to date on '{status.branch}' ({status.local_commit}).",
+                        )
+                    return
+
+                self.git_status_var.set(f"{status.behind_count} update(s) available")
+                self._log_local(
+                    f"[INFO] Git update available: {status.behind_count} commit(s) behind {status.upstream} ({status.action_reason})."
+                )
+
+                action_desc = {
+                    "reboot_gui": "Reboot GUI & restart server",
+                    "restart_server": "Reload dictionaries & restart OCR server",
+                    "none": "Pull files only (no restart needed)",
+                }.get(status.action, status.action)
+
+                commits_preview = "\n".join(f"  • {c}" for c in status.commits[:8])
+                if len(status.commits) > 8:
+                    commits_preview += f"\n  … and {len(status.commits) - 8} more commit(s)"
+
+                files_preview = "\n".join(f"  • {f}" for f in status.changed_files[:10])
+                if len(status.changed_files) > 10:
+                    files_preview += f"\n  … and {len(status.changed_files) - 10} more file(s)"
+
+                if status.dirty_tracked:
+                    messagebox.showwarning(
+                        "Git Updates Available (Local Edits Detected)",
+                        f"{status.behind_count} update(s) are available on {status.upstream}, "
+                        f"but tracked local files have uncommitted changes.\n\n"
+                        f"Commit or stash your local changes before updating.\n\n"
+                        f"Incoming commits:\n{commits_preview}",
+                    )
+                    return
+
+                plugin_note = (
+                    "\n\nNote: Includes updated 3DS .3gx plugin files in full/homebrew/slim/."
+                    if status.has_plugin_updates
+                    else ""
+                )
+                prompt = (
+                    f"{status.behind_count} commit(s) available on {status.upstream} "
+                    f"({status.local_commit} -> {status.remote_commit}).\n\n"
+                    f"Reason: {status.action_reason}\n"
+                    f"Action after pull: {action_desc}{plugin_note}\n\n"
+                    f"Commits:\n{commits_preview}\n\n"
+                    f"Changed files:\n{files_preview}\n\n"
+                    f"Pull and apply updates now?"
+                )
+                if messagebox.askyesno("Git Updates Available", prompt):
+                    self._apply_git_update_async(status)
+
+            self.root.after(0, _on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_git_update_async(self, status: git_updater.GitUpdateStatus) -> None:
+        if self._git_update_busy:
+            return
+        self._git_update_busy = True
+        self.check_git_btn.configure(state="disabled")
+        self.git_status_var.set("Updating from git...")
+
+        was_running = bool(self.server_proc and self.server_proc.poll() is None)
+        needs_stop = status.action in ("restart_server", "reboot_gui") and was_running
+
+        if needs_stop:
+            self._log_local(f"[INFO] Stopping OCR server before applying git update ({status.action_reason})...")
+            self._set_server_button("⏳  Updating...", "secondary", state="disabled")
+            self.reset_server_btn.configure(state="disabled")
+            self._set_status_badge("⏳  Applying git update...", WARNING, WARNING_BG)
+            self._stop_server(for_restart=True)
+
+        proc_ref = self.server_proc
+
+        def worker() -> None:
+            if needs_stop and proc_ref is not None:
+                deadline = time.time() + 3.5
+                while proc_ref.poll() is None and time.time() < deadline:
+                    time.sleep(0.1)
+
+            res = git_updater.apply_updates(APP_DIR, status=status, timeout=30)
+
+            def _on_applied() -> None:
+                self._git_update_busy = False
+                self.check_git_btn.configure(state="normal")
+                if not res.ok:
+                    self.git_status_var.set("Git pull failed")
+                    self._log_local(f"[ERROR] Git pull failed: {res.error}")
+                    messagebox.showerror("Git Update Failed", res.error)
+                    if needs_stop and not (self.server_proc and self.server_proc.poll() is None):
+                        self.root.after(200, self._start_server)
+                    return
+
+                self._log_local(
+                    f"[UPDATE] Pulled {len(res.changed_files)} file(s) -> {res.new_commit} (action={res.action})."
+                )
+                if res.has_plugin_updates:
+                    self._log_local(
+                        "[UPDATE] Updated 3DS .3gx plugin files are available in full/homebrew/slim/."
+                    )
+
+                self.dict_summary_var.set(self._get_dictionary_summary())
+                self.git_status_var.set(f"Up to date ({status.branch} @ {res.new_commit})")
+
+                if res.action == "reboot_gui":
+                    self._log_local("[UPDATE] GUI/launcher files updated — rebooting GUI...")
+                    self._reboot_gui()
+                elif res.action == "restart_server":
+                    self._log_local("[UPDATE] Reloading dictionaries & restarting OCR server...")
+                    if was_running:
+                        if not (self.server_proc and self.server_proc.poll() is None):
+                            self.root.after(200, self._start_server)
+                    else:
+                        messagebox.showinfo(
+                            "Git Update Applied",
+                            f"Updated to {res.new_commit} ({res.action_reason}).\n"
+                            "Start the server when ready to load the updated dictionaries/server.",
+                        )
+                else:
+                    msg = f"Updated to {res.new_commit} ({res.action_reason}). No restart required."
+                    if res.has_plugin_updates:
+                        msg += "\n\nUpdated 3DS .3gx plugin files are in full/homebrew/slim/."
+                    messagebox.showinfo("Git Update Applied", msg)
+
+            self.root.after(0, _on_applied)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _reboot_gui(self) -> None:
+        if self.server_proc and self.server_proc.poll() is None:
+            try:
+                self.server_proc.terminate()
+                self.server_proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    self.server_proc.kill()
+                except Exception:
+                    pass
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable] + sys.argv[1:]
+        else:
+            cmd = [self.python_bin, os.path.abspath(__file__)] + sys.argv[1:]
+        try:
+            subprocess.Popen(cmd, cwd=APP_DIR)
+        except Exception as exc:
+            self._log_local(f"[ERROR] Failed to reboot GUI: {exc}")
+            messagebox.showerror("Reboot Failed", f"Updated successfully, but failed to relaunch GUI:\n{exc}")
+            return
+        self.root.destroy()
 
     def _open_dict_updater_dialog(self, first_run: bool = False, auto_start_after: bool = False) -> None:
         was_running = bool(self.server_proc and self.server_proc.poll() is None)
@@ -1454,12 +1848,25 @@ class OcrServerLauncherGui:
             if hasattr(self, "toggle_qr_btn"):
                 self.toggle_qr_btn.configure(text="Show QR Code")
 
+    def _on_device_selection_changed(self, _event=None) -> None:
+        has_sel = bool(hasattr(self, "devices_tree") and self.devices_tree.selection())
+        state = "normal" if has_sel else "disabled"
+        if hasattr(self, "rename_btn"):
+            self.rename_btn.configure(state=state)
+        if hasattr(self, "revoke_btn"):
+            self.revoke_btn.configure(state=state)
+
     def _refresh_devices_table(self) -> None:
         if not hasattr(self, "devices_tree"):
             return
         store = psk_store.load_or_init_store(APP_DIR)
         devices = store.get("devices", [])
-        self.paired_count_var.set(f"Paired 3DSes: {len(devices)}")
+        dev_count = len(devices)
+        self.paired_count_var.set(f"Paired 3DSes: {dev_count}")
+        self.stat_devices_var.set(f"{dev_count} console{'s' if dev_count != 1 else ''}")
+        if hasattr(self, "tab_bar"):
+            title = f"Devices & Pairing ({dev_count})" if dev_count > 0 else "Devices & Pairing"
+            self.tab_bar.set_tab_title("devices", title)
 
         selected = self.devices_tree.selection()
         selected_id = selected[0] if selected else None
@@ -1467,14 +1874,16 @@ class OcrServerLauncherGui:
         for item in self.devices_tree.get_children():
             self.devices_tree.delete(item)
 
-        for dev in devices:
+        for idx, dev in enumerate(devices):
             dev_id = str(dev.get("device_id", "") or "")
             psk = str(dev.get("psk", "") or "")
             masked_psk = (psk[:6] + "…" + psk[-4:]) if len(psk) > 12 else "••••••"
+            row_tag = "even" if idx % 2 else "odd"
             self.devices_tree.insert(
                 "",
                 "end",
                 iid=dev_id,
+                tags=(row_tag,),
                 values=(
                     dev.get("name", "3DS"),
                     dev.get("model", "3DS"),
@@ -1487,6 +1896,7 @@ class OcrServerLauncherGui:
 
         if selected_id and self.devices_tree.exists(selected_id):
             self.devices_tree.selection_set(selected_id)
+        self._on_device_selection_changed()
 
     def _rename_selected_device(self) -> None:
         sel = self.devices_tree.selection()
@@ -1569,6 +1979,31 @@ class OcrServerLauncherGui:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _update_status_summary(self) -> None:
+        lan = self.lan_var.get().strip() or get_local_lan_ip()
+        try:
+            port = int(self.port_var.get().strip())
+        except ValueError:
+            port = DEFAULT_PORT
+        is_multi = bool(self.multi_user_var.get()) if hasattr(self, "multi_user_var") else False
+        mode_lbl = "Multiple 3DS" if is_multi else "Single 3DS"
+
+        self.header_subtitle_var.set(f"Local endpoint {lan}:{port}  •  {mode_lbl} mode")
+        self.stat_endpoint_var.set(f"{lan}:{port}")
+
+        anki_sum = get_anki_summary()
+        if len(anki_sum) > 22:
+            anki_short = anki_sum.split("(", 1)[0].strip() or anki_sum[:20] + "…"
+        else:
+            anki_short = anki_sum
+        self.stat_anki_var.set(anki_short)
+
+        if os.path.isdir(DICTIONARIES_DIR):
+            d_files = [f for f in os.listdir(DICTIONARIES_DIR) if f.endswith((".db", ".zip", ".json"))]
+            self.stat_dicts_var.set(f"{len(d_files)} file{'s' if len(d_files) != 1 else ''}")
+        else:
+            self.stat_dicts_var.set("Not found")
+
     def _refresh_qr_code(self) -> None:
         lan = self.lan_var.get().strip() or get_local_lan_ip()
         wan = self.wan_var.get().strip()
@@ -1584,6 +2019,7 @@ class OcrServerLauncherGui:
 
         wan_note = f"  •  WAN: {wan}:{port}" if wan else ""
         self.endpoint_preview_var.set(f"Endpoint: {lan}:{port}{wan_note}")
+        self._update_status_summary()
 
         qr = qrcode.QRCode(box_size=4, border=2)
         qr.add_data(payload)

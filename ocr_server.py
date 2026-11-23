@@ -11010,6 +11010,55 @@ class ServerManager:
 
 def run_server(host: str = HOST, port: int = PORT) -> None:
     """CLI headless runner."""
+    check_update = "--check-update" in sys.argv
+    auto_update = "--auto-update" in sys.argv
+
+    if check_update or auto_update:
+        import git_updater
+
+        status = git_updater.check_for_updates(APP_DIR, fetch=True, timeout=15)
+        if not status.ok:
+            logger.error("Git update check failed: %s", status.error)
+            if check_update:
+                sys.exit(1)
+        elif status.behind_count <= 0:
+            logger.info(
+                "Git is up to date (%s @ %s).",
+                status.branch,
+                status.local_commit,
+            )
+            if check_update:
+                sys.exit(0)
+        else:
+            logger.info(
+                "Git update available: %d commit(s) behind %s (%s -> %s) | action=%s (%s)",
+                status.behind_count,
+                status.upstream,
+                status.local_commit,
+                status.remote_commit,
+                status.action,
+                status.action_reason,
+            )
+            if check_update:
+                for f in status.changed_files:
+                    logger.info("  changed: %s", f)
+                sys.exit(0)
+
+            res = git_updater.apply_updates(APP_DIR, status=status, timeout=30)
+            if not res.ok:
+                logger.error("Git auto-update failed: %s", res.error)
+            elif res.updated:
+                logger.info(
+                    "Git auto-update applied (%d file(s) -> %s, action=%s).",
+                    len(res.changed_files),
+                    res.new_commit,
+                    res.action,
+                )
+                if res.action in ("restart_server", "reboot_gui"):
+                    logger.info("Re-executing server process to load updates...")
+                    next_args = [a for a in sys.argv if a != "--auto-update"]
+                    os.execv(sys.executable, [sys.executable] + next_args)
+
     for idx, arg in enumerate(sys.argv):
         if arg == "--port" and idx + 1 < len(sys.argv):
             try:

@@ -14,17 +14,19 @@ UI_FONT = "Segoe UI" if sys.platform == "win32" else "Helvetica"
 MONO_FONT = "Consolas" if sys.platform == "win32" else "Courier"
 
 # Surface & Text Palette
-BG_ROOT = "#0D0F14"        # App window & header background
-BG_SURFACE = "#161A23"     # Cards & dialog panels
-BG_ELEVATED = "#262E42"    # Secondary buttons & active tab surface
-BG_ELEVATED_HOVER = "#313B54"
-BG_INPUT = "#0F1219"       # Recessed entry & combobox fields
+BG_ROOT = "#0B0E14"        # App window & header background
+BG_SURFACE = "#141923"     # Cards & dialog panels
+BG_SURFACE_ALT = "#19202E" # Alternating rows & nested callouts
+BG_ELEVATED = "#1F2738"    # Secondary buttons & elevated surfaces
+BG_ELEVATED_HOVER = "#2A354C"
+BG_INPUT = "#0E121A"       # Recessed entry & combobox fields
 BG_CANVAS = "#090B10"      # Terminal log & screenshot canvas
 
-BORDER = "#2B3347"         # Card 1px border
-BORDER_INPUT = "#3B4763"   # Input field border
-BORDER_BTN = "#4A5878"     # Clear button border for contrast
-BORDER_BTN_HOVER = "#6B7FA8"
+BORDER = "#232B3E"         # Card 1px border
+BORDER_SUBTLE = "#1C2333"  # Hairline internal divider
+BORDER_INPUT = "#33415C"   # Input field border
+BORDER_BTN = "#3B4A68"     # Clear button border for contrast
+BORDER_BTN_HOVER = "#5B7099"
 BORDER_FOCUS = "#3B82F6"   # Focus highlight
 
 FG_PRIMARY = "#F1F5F9"     # Crisp primary text
@@ -32,8 +34,8 @@ FG_SECONDARY = "#94A3B8"   # Subtitles, helper text, metadata
 FG_MUTED = "#64748B"       # Disabled text, timestamps
 
 # Semantic & Accent Colors
-ACCENT = "#2563EB"
-ACCENT_HOVER = "#1D4ED8"
+ACCENT = "#3B82F6"
+ACCENT_HOVER = "#2563EB"
 ACCENT_BORDER = "#60A5FA"
 
 CYAN = "#38BDF8"           # OCR headword & section titles
@@ -92,6 +94,16 @@ BUTTON_VARIANTS: Dict[str, Dict[str, str]] = {
         "disabled_bg": "#2B181B",
         "disabled_border": "#3F2327",
         "disabled_fg": "#64748B",
+    },
+    "ghost": {
+        "bg": BG_SURFACE,
+        "hover_bg": BG_ELEVATED,
+        "border": BORDER,
+        "hover_border": BORDER_BTN,
+        "fg": "#CBD5E1",
+        "disabled_bg": BG_SURFACE,
+        "disabled_border": BORDER_SUBTLE,
+        "disabled_fg": "#546078",
     },
 }
 
@@ -175,7 +187,10 @@ def apply_dark_theme(root: tk.Misc) -> ttk.Style:
     style.configure("Surface.TLabel", background=BG_SURFACE, foreground=FG_PRIMARY, font=(UI_FONT, 9))
     style.configure("SurfaceBold.TLabel", background=BG_SURFACE, foreground=FG_PRIMARY, font=(UI_FONT, 9, "bold"))
     style.configure("SurfaceMuted.TLabel", background=BG_SURFACE, foreground=FG_SECONDARY, font=(UI_FONT, 8))
-    style.configure("CardHeader.TLabel", background=BG_SURFACE, foreground=CYAN, font=(UI_FONT, 10, "bold"))
+    style.configure("CardHeader.TLabel", background=BG_SURFACE, foreground=FG_PRIMARY, font=(UI_FONT, 10, "bold"))
+    style.configure("CardSubtitle.TLabel", background=BG_SURFACE, foreground=FG_SECONDARY, font=(UI_FONT, 8))
+    style.configure("MetricLabel.TLabel", background=BG_SURFACE, foreground=FG_MUTED, font=(UI_FONT, 8, "bold"))
+    style.configure("MetricValue.TLabel", background=BG_SURFACE, foreground=FG_PRIMARY, font=(UI_FONT, 10, "bold"))
     style.configure("DialogTitle.TLabel", background=BG_ROOT, foreground=FG_PRIMARY, font=(UI_FONT, 13, "bold"))
     style.configure("Accent.TLabel", background=BG_SURFACE, foreground=CYAN, font=(UI_FONT, 10, "bold"))
 
@@ -321,7 +336,7 @@ def apply_dark_theme(root: tk.Misc) -> ttk.Style:
         foreground=FG_PRIMARY,
         bordercolor=BORDER,
         borderwidth=0,
-        rowheight=26,
+        rowheight=30,
         font=(UI_FONT, 9),
     )
     style.map(
@@ -335,7 +350,7 @@ def apply_dark_theme(root: tk.Misc) -> ttk.Style:
         foreground=FG_PRIMARY,
         bordercolor=BORDER,
         relief="flat",
-        padding=[8, 6],
+        padding=[10, 7],
         font=(UI_FONT, 9, "bold"),
     )
     style.map(
@@ -347,20 +362,105 @@ def apply_dark_theme(root: tk.Misc) -> ttk.Style:
     return style
 
 
-def make_card(parent: tk.Widget, title: str = "", padding: Tuple[int, int] = (14, 12)) -> Tuple[tk.Frame, ttk.Frame]:
+def make_card(
+    parent: tk.Widget,
+    title: str = "",
+    subtitle: str = "",
+    padding: Tuple[int, int] = (16, 14),
+) -> Tuple[tk.Frame, ttk.Frame]:
     """
-    Create a sleek 1px-bordered dark card container with an optional header label.
+    Create a sleek 1px-bordered dark card container with an optional header and subtitle.
     Returns (outer_border_frame, inner_content_frame).
     """
     outer = tk.Frame(parent, bg=BORDER, bd=0, highlightthickness=0)
     inner = ttk.Frame(outer, style="Surface.TFrame", padding=padding)
     inner.pack(fill="both", expand=True, padx=1, pady=1)
     if title:
-        hdr = ttk.Label(inner, text=title, style="CardHeader.TLabel")
-        hdr.pack(anchor="w", pady=(0, 6))
+        hdr_block = ttk.Frame(inner, style="Surface.TFrame")
+        hdr_block.pack(fill="x", pady=(0, 10))
+        ttk.Label(hdr_block, text=title, style="CardHeader.TLabel").pack(anchor="w")
+        if subtitle:
+            ttk.Label(hdr_block, text=subtitle, style="CardSubtitle.TLabel").pack(anchor="w", pady=(2, 0))
     content = ttk.Frame(inner, style="Surface.TFrame")
     content.pack(fill="both", expand=True)
     return outer, content
+
+
+def make_stat_tile(
+    parent: tk.Widget,
+    label: str,
+    value_var: tk.StringVar,
+    on_click: Optional[Callable[[], None]] = None,
+) -> tk.Frame:
+    """Create a compact KPI stat tile with optional click-through navigation."""
+    outer = tk.Frame(parent, bg=BORDER, bd=0, highlightthickness=0)
+    inner = tk.Frame(outer, bg=BG_SURFACE, padx=14, pady=10)
+    inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+    lbl_w = tk.Label(
+        inner,
+        text=label.upper(),
+        bg=BG_SURFACE,
+        fg=FG_MUTED,
+        font=(UI_FONT, 8, "bold"),
+        anchor="w",
+    )
+    lbl_w.pack(fill="x")
+
+    val_w = tk.Label(
+        inner,
+        textvariable=value_var,
+        bg=BG_SURFACE,
+        fg=FG_PRIMARY,
+        font=(UI_FONT, 10, "bold"),
+        anchor="w",
+    )
+    val_w.pack(fill="x", pady=(3, 0))
+
+    if on_click is not None:
+        widgets = (outer, inner, lbl_w, val_w)
+        for w in widgets:
+            w.configure(cursor="hand2")
+            w.bind("<Button-1>", lambda _e, cb=on_click: cb())
+            w.bind("<Enter>", lambda _e: (
+                outer.configure(bg=BORDER_BTN),
+                inner.configure(bg=BG_SURFACE_ALT),
+                lbl_w.configure(bg=BG_SURFACE_ALT),
+                val_w.configure(bg=BG_SURFACE_ALT),
+            ))
+            w.bind("<Leave>", lambda _e: (
+                outer.configure(bg=BORDER),
+                inner.configure(bg=BG_SURFACE),
+                lbl_w.configure(bg=BG_SURFACE),
+                val_w.configure(bg=BG_SURFACE),
+            ))
+
+    return outer
+
+
+def center_window(
+    win: tk.Toplevel,
+    width: int,
+    height: int,
+    parent: Optional[tk.Misc] = None,
+) -> None:
+    """Center a Toplevel dialog over its parent window (or screen) without off-screen clipping."""
+    win.update_idletasks()
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    if parent is not None and parent.winfo_ismapped():
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        x = px + (pw - width) // 2
+        y = py + (ph - height) // 2
+    else:
+        x = (sw - width) // 2
+        y = (sh - height) // 2
+    x = max(0, min(x, max(0, sw - width)))
+    y = max(0, min(y, max(0, sh - height)))
+    win.geometry(f"{width}x{height}+{x}+{y}")
 
 
 class ThemedButton(tk.Frame):
@@ -497,6 +597,28 @@ def make_action_button(
     )
 
 
+def make_ghost_button(
+    parent: tk.Widget,
+    text: str,
+    command: Optional[Callable[[], None]] = None,
+    width: Optional[int] = None,
+    padx: int = 10,
+    pady: int = 4,
+    font_size: int = 9,
+) -> ThemedButton:
+    """Create a low-emphasis surface-blended utility button."""
+    return ThemedButton(
+        parent,
+        text=text,
+        command=command,
+        variant="ghost",
+        width=width,
+        padx=padx,
+        pady=pady,
+        font_size=font_size,
+    )
+
+
 class ModernTabBar(tk.Frame):
     """
     Sleek dark-mode underline tab switcher replacing classic Windows 98 ttk.Notebook tabs.
@@ -515,7 +637,7 @@ class ModernTabBar(tk.Frame):
 
     def add_tab(self, key: str, title: str, frame: tk.Widget) -> None:
         holder = tk.Frame(self._row, bg=BG_ROOT, bd=0, highlightthickness=0)
-        holder.pack(side="left", padx=(0, 6))
+        holder.pack(side="left", padx=(0, 4))
 
         lbl = tk.Label(
             holder,
@@ -523,13 +645,13 @@ class ModernTabBar(tk.Frame):
             font=(UI_FONT, 10, "bold"),
             bg=BG_ROOT,
             fg=FG_SECONDARY,
-            padx=18,
+            padx=16,
             pady=9,
             cursor="hand2",
         )
         lbl.pack(fill="x")
 
-        indicator = tk.Frame(holder, bg=BG_ROOT, height=2, bd=0, highlightthickness=0)
+        indicator = tk.Frame(holder, bg=BG_ROOT, height=3, bd=0, highlightthickness=0)
         indicator.pack(fill="x")
 
         lbl.bind("<Button-1>", lambda _e, k=key: self.select(k))
@@ -548,6 +670,25 @@ class ModernTabBar(tk.Frame):
         if self._active_key is None:
             self.select(key)
 
+    def set_tab_title(self, key: str, title: str) -> None:
+        """Update an existing tab's displayed title."""
+        if key not in self._tabs:
+            return
+        tab = self._tabs[key]
+        tab["title"] = title
+        tab["label"].configure(text=title)  # type: ignore[attr-defined]
+
+    def bind_shortcuts(self, root: tk.Misc) -> None:
+        """Bind Ctrl+1..Ctrl+9 keyboard shortcuts to switch tabs by index."""
+        for idx in range(1, 10):
+            def _handler(_e: tk.Event, i: int = idx - 1) -> Optional[str]:
+                if i < len(self._order):
+                    self.select(self._order[i])
+                    return "break"
+                return None
+
+            root.bind(f"<Control-Key-{idx}>", _handler)
+
     def _on_hover(self, key: str, entering: bool) -> None:
         if key == self._active_key:
             return
@@ -555,8 +696,8 @@ class ModernTabBar(tk.Frame):
         lbl: tk.Label = tab["label"]  # type: ignore[assignment]
         holder: tk.Frame = tab["holder"]  # type: ignore[assignment]
         if entering:
-            lbl.configure(bg="#141821", fg=FG_PRIMARY)
-            holder.configure(bg="#141821")
+            lbl.configure(bg=BG_SURFACE, fg=FG_PRIMARY)
+            holder.configure(bg=BG_SURFACE)
         else:
             lbl.configure(bg=BG_ROOT, fg=FG_SECONDARY)
             holder.configure(bg=BG_ROOT)
@@ -572,9 +713,9 @@ class ModernTabBar(tk.Frame):
             prev["indicator"].configure(bg=BG_ROOT)  # type: ignore[attr-defined]
 
         cur = self._tabs[key]
-        cur["label"].configure(bg=BG_SURFACE, fg=FG_PRIMARY)  # type: ignore[attr-defined]
-        cur["holder"].configure(bg=BG_SURFACE)  # type: ignore[attr-defined]
-        cur["indicator"].configure(bg=BORDER_FOCUS)  # type: ignore[attr-defined]
+        cur["label"].configure(bg=BG_ROOT, fg=FG_PRIMARY)  # type: ignore[attr-defined]
+        cur["holder"].configure(bg=BG_ROOT)  # type: ignore[attr-defined]
+        cur["indicator"].configure(bg=ACCENT)  # type: ignore[attr-defined]
         cur["frame"].pack(in_=self.content_parent, fill="both", expand=True)  # type: ignore[attr-defined]
         self._active_key = key
 
