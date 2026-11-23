@@ -1778,6 +1778,7 @@ class JapaneseOCRDictionaryPipeline:
         self._detector = None
         self._manga_ocr = None
         self._paddle_ocr = None
+        self._paddle_ocr_v3: bool = False
         self._yomi_ocr: Optional[_YomiPARSeqSmallEngine] = None
         self._ndl_sess = None
         self._ndl_charlist: List[str] = []
@@ -1795,13 +1796,22 @@ class JapaneseOCRDictionaryPipeline:
 
         # 1. Initialize Scene Text Detector (RapidOCR DBNet ONNX)
         try:
-            from rapidocr_onnxruntime import RapidOCR
-            self._detector = RapidOCR()
+            from rapidocr import RapidOCR
+            self._detector = RapidOCR(params={
+                "Global.use_det": True,
+                "Global.use_cls": False,
+                "Global.use_rec": False,
+            })
             logger.info("RapidOCR (DBNet text detector) initialized.")
         except ImportError:
-            logger.warning(
-                "rapidocr-onnxruntime not installed; falling back to pytesseract layout detection."
-            )
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+                self._detector = RapidOCR()
+                logger.info("RapidOCR (DBNet text detector, legacy) initialized.")
+            except ImportError:
+                logger.warning(
+                    "rapidocr (or rapidocr-onnxruntime) not installed; falling back to pytesseract layout detection."
+                )
 
         # 2. Initialize MangaOCR for high-accuracy Japanese line recognition
         try:
@@ -1830,19 +1840,37 @@ class JapaneseOCRDictionaryPipeline:
         # 2b. Initialize PaddleOCR Japanese v4, YomiToku PARSeq-Small, and NDLOCR-Lite
         models_dir = find_ocr_models_dir()
         try:
-            from rapidocr_onnxruntime.ch_ppocr_rec import TextRecognizer as PaddleRec
             p_onnx = os.path.join(models_dir, "japan_PP-OCRv4_rec.onnx")
             p_dict = os.path.join(models_dir, "japan_dict.txt")
             if os.path.isfile(p_onnx) and os.path.isfile(p_dict):
-                self._paddle_ocr = PaddleRec({
-                    "model_path": p_onnx,
-                    "rec_keys_path": p_dict,
-                    "rec_batch_num": 6,
-                    "rec_img_shape": [3, 48, 320],
-                    "use_cuda": False,
-                    "use_dml": False,
-                })
-                logger.info("PaddleOCR (japan_PP-OCRv4_rec) initialized.")
+                try:
+                    from rapidocr import RapidOCR as RapidOCRRec
+                    self._paddle_ocr = RapidOCRRec(params={
+                        "Global.use_det": False,
+                        "Global.use_cls": False,
+                        "Global.use_rec": True,
+                        "Global.use_preprocess_img": False,
+                        "Rec.model_path": p_onnx,
+                        "Rec.rec_keys_path": p_dict,
+                        "Rec.rec_batch_num": 6,
+                        "Rec.rec_img_shape": [3, 48, 320],
+                        "EngineConfig.onnxruntime.use_cuda": False,
+                        "EngineConfig.onnxruntime.use_dml": False,
+                    })
+                    self._paddle_ocr_v3 = True
+                    logger.info("PaddleOCR (japan_PP-OCRv4_rec) initialized.")
+                except ImportError:
+                    from rapidocr_onnxruntime.ch_ppocr_rec import TextRecognizer as PaddleRec
+                    self._paddle_ocr = PaddleRec({
+                        "model_path": p_onnx,
+                        "rec_keys_path": p_dict,
+                        "rec_batch_num": 6,
+                        "rec_img_shape": [3, 48, 320],
+                        "use_cuda": False,
+                        "use_dml": False,
+                    })
+                    self._paddle_ocr_v3 = False
+                    logger.info("PaddleOCR (japan_PP-OCRv4_rec, legacy) initialized.")
         except Exception as exc:
             logger.warning("PaddleOCR initialization skipped: %s", exc)
 
@@ -2661,8 +2689,13 @@ class JapaneseOCRDictionaryPipeline:
         if self._paddle_ocr is not None:
             try:
                 bgr_pad = np.array(crop_padded_rgb)[:, :, ::-1]
-                p_res, _ = self._paddle_ocr([bgr_pad])
-                p_raw = p_res[0][0] if (p_res and p_res[0]) else ""
+                if getattr(self, "_paddle_ocr_v3", False):
+                    p_out = self._paddle_ocr(bgr_pad)
+                    p_txts = getattr(p_out, "txts", None)
+                    p_raw = p_txts[0] if (p_txts and len(p_txts) > 0) else ""
+                else:
+                    p_res, _ = self._paddle_ocr([bgr_pad])
+                    p_raw = p_res[0][0] if (p_res and p_res[0]) else ""
                 c_txt, r_txt, hl, ht = _clean_pair(p_raw)
                 engine_texts["Paddle"] = c_txt
                 engine_raw_texts["Paddle"] = r_txt
@@ -3949,8 +3982,13 @@ class JapaneseOCRDictionaryPipeline:
             box_thresh=0.2,
             unclip_ratio=2.0,
         )
-        boxes = det_out[0] if isinstance(det_out, tuple) else det_out
-        if not boxes:
+        if hasattr(det_out, "boxes"):
+            boxes = det_out.boxes
+        elif isinstance(det_out, tuple):
+            boxes = det_out[0]
+        else:
+            boxes = det_out
+        if boxes is None or len(boxes) == 0:
             return []
 
         sub_boxes: List[Tuple[int, int, int, int]] = []
