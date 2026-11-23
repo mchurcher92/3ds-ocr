@@ -8,7 +8,9 @@ rapidocr>=3.0.0
 manga-ocr>=0.1.11
 fugashi[unidic-lite]>=1.3.0
 jamdict>=0.1a11.post2
-jamdict-data>=1.5
+# Optional: jamdict.db is downloaded automatically into dictionaries/ on first launch.
+# (jamdict-data's PyPI sdist has a Windows file-locking bug in setup.py under PEP 517 builds.)
+# jamdict-data>=1.5
 pytesseract>=0.3.10
 qrcode>=7.0
 # Optional: for direct AnkiWeb sync without Anki Desktop
