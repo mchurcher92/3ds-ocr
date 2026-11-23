@@ -2848,7 +2848,8 @@ class JapaneseOCRDictionaryPipeline:
                         raw_runs.append([r_start, r_prev + 1])
 
                         punct_chars = r"\.…‥・。、．，！？!?\-―～~「」『』（）()\[\]【】［］｛｝｜|¦＜＞<>,;"
-                        punct_max_w = max(6, int(line_h * 0.55))
+                        # Full-width punctuation ('？', '！', '…', '―', '「', '」', etc.) can be up to ~1.0x line_h wide
+                        punct_max_w = max(10, int(line_h * 1.05))
 
                         # Determine how many trailing/leading punctuation glyphs were stripped from raw_text
                         trail_match = re.search(f"[{punct_chars}]+$", ln.raw_text or "")
@@ -2862,14 +2863,14 @@ class JapaneseOCRDictionaryPipeline:
                             while len(raw_runs) > num_chars and trail_popped < max_trail_to_pop:
                                 last_w = raw_runs[-1][1] - raw_runs[-1][0]
                                 gap = raw_runs[-1][0] - raw_runs[-2][1]
-                                if last_w <= punct_max_w and gap >= 2:
+                                if last_w <= punct_max_w and gap >= 1:
                                     raw_runs.pop()
                                     trail_popped += 1
                                 else:
                                     break
                         elif len(raw_runs) > num_chars and len(raw_runs) > 1:
                             # Fallback: drop ultra-narrow isolated trailing sliver (e.g. '！')
-                            sliver_max_w = max(4, int(line_h * 0.30))
+                            sliver_max_w = max(4, int(line_h * 0.35))
                             sliver_min_gap = max(4, int(line_h * 0.35))
                             last_w = raw_runs[-1][1] - raw_runs[-1][0]
                             gap = raw_runs[-1][0] - raw_runs[-2][1]
@@ -2881,7 +2882,7 @@ class JapaneseOCRDictionaryPipeline:
                             while len(raw_runs) > num_chars and lead_popped < max_lead_to_pop:
                                 first_w = raw_runs[0][1] - raw_runs[0][0]
                                 gap = raw_runs[1][0] - raw_runs[0][1]
-                                if first_w <= punct_max_w and gap >= 2:
+                                if first_w <= punct_max_w and gap >= 1:
                                     raw_runs.pop(0)
                                     lead_popped += 1
                                 else:
@@ -3805,6 +3806,12 @@ class JapaneseOCRDictionaryPipeline:
                 if combined_gemini_map and not (cancel_event is not None and cancel_event.is_set()):
                     abort_local_evt.set()
                     computed_gem: Dict[str, Optional[List[DetectedLine]]] = {}
+                    with self._screen_cache_lock:
+                        local_cache_snapshot = {
+                            d: list(self._screen_lines_cache[(d, "local_cached")])
+                            for d, _ in uncached_gemini_specs
+                            if (d, "local_cached") in self._screen_lines_cache
+                        }
                     with self._ocr_exec_lock:
                         for d, img in uncached_gemini_specs:
                             sub_boxes = per_screen_sub_boxes[d]
@@ -3819,7 +3826,12 @@ class JapaneseOCRDictionaryPipeline:
                                     for g_idx in range(s_idx, e_idx):
                                         if g_idx in combined_gemini_map:
                                             local_g_map[g_idx - s_idx] = combined_gemini_map[g_idx]
-                                computed_gem[d] = self._finalize_screen_lines(img, sub_boxes, local_g_map)
+                                gem_lines = self._finalize_screen_lines(img, sub_boxes, local_g_map)
+                                if gem_lines and d in local_cache_snapshot:
+                                    self._reconcile_gemini_with_local_lines(
+                                        gem_lines, local_cache_snapshot[d]
+                                    )
+                                computed_gem[d] = gem_lines
 
                     with self._screen_cache_lock:
                         for d, lines in computed_gem.items():
@@ -4123,6 +4135,73 @@ class JapaneseOCRDictionaryPipeline:
                 lines.append(ln)
 
         return self._filter_overlapping_lines(lines)
+
+    _KATAKANA_CONFUSABLE_GROUPS = (
+        frozenset("スツシッ"),
+        frozenset("ソンノ"),
+        frozenset("クワフウ"),
+        frozenset("アマ"),
+        frozenset("ヌス"),
+        frozenset("ラヲ"),
+    )
+
+    @classmethod
+    def _is_confusable_katakana_pair(cls, ch_a: str, ch_b: str) -> bool:
+        """Return True if two differing characters belong to the same visually confusable katakana group."""
+        if ch_a == ch_b:
+            return True
+        return any(ch_a in grp and ch_b in grp for grp in cls._KATAKANA_CONFUSABLE_GROUPS)
+
+    @classmethod
+    def _reconcile_gemini_with_local_lines(
+        cls,
+        gemini_lines: List[DetectedLine],
+        local_lines: List[DetectedLine],
+    ) -> None:
+        """
+        Correct single/few-character visually confusable katakana misreads (e.g. 'ス' vs 'ツ')
+        in Gemini transcriptions when >=2 local OCR engines agree on the exact-length alternative.
+        """
+        if not gemini_lines or not local_lines:
+            return
+
+        local_by_bbox = {ln.bbox: ln for ln in local_lines}
+        for g_ln in gemini_lines:
+            loc_ln = local_by_bbox.get(g_ln.bbox)
+            if loc_ln is None or not loc_ln.engine_texts or not g_ln.text:
+                continue
+
+            g_txt = g_ln.text
+            cand_counts: Dict[str, int] = {}
+            for eng_txt in loc_ln.engine_texts.values():
+                if not eng_txt or eng_txt == g_txt or len(eng_txt) != len(g_txt):
+                    continue
+                if all(cls._is_confusable_katakana_pair(gc, lc) for gc, lc in zip(g_txt, eng_txt)):
+                    cand_counts[eng_txt] = cand_counts.get(eng_txt, 0) + 1
+
+            if not cand_counts:
+                continue
+
+            best_cand, best_votes = max(cand_counts.items(), key=lambda kv: kv[1])
+            if best_votes >= 2:
+                logger.info(
+                    "Hybrid OCR katakana reconciliation: '%s' -> '%s' (%d local engines agreed).",
+                    g_txt,
+                    best_cand,
+                    best_votes,
+                )
+                if g_ln.raw_text and g_txt in g_ln.raw_text:
+                    g_ln.raw_text = g_ln.raw_text.replace(g_txt, best_cand, 1)
+                else:
+                    g_ln.raw_text = best_cand
+                g_ln.text = best_cand
+                for eng in OCR_ENGINE_NAMES:
+                    g_ln.engine_texts[eng] = best_cand
+                    if g_ln.engine_raw_texts and eng in g_ln.engine_raw_texts:
+                        r_val = g_ln.engine_raw_texts[eng]
+                        g_ln.engine_raw_texts[eng] = (
+                            r_val.replace(g_txt, best_cand, 1) if g_txt in r_val else best_cand
+                        )
 
     def _detect_screen_lines_pytesseract_fallback(
         self, screen_img: Image.Image
