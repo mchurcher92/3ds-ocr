@@ -60,12 +60,16 @@ Output is written to `dist/OCR_Server.exe`.
 
 ---
 
-## 2. Building the 3DS Plugins (`.3gx`)
+## 2. 3DS Plugins (`.3gx`) — Prebuilt or Build From Source
 
-### Prerequisites
-- [Docker](https://www.docker.com/) running locally (uses the `pablomk7/libctrpf:0.8.0` builder image — no local `devkitARM` install needed).
+### Prebuilt Binaries (No Docker Needed)
+Ready-to-use `.3gx` builds are included directly in the repository:
+- **`full/default.3gx`** — Standard full CTRPF plugin (recommended for most 3DS games).
+- **`slim/default.3gx`** (+ `slim/user_param.bin`) — Headless slim build for Old 3DS / Mode 3 extended-memory games (e.g. Smash Bros, Monster Hunter 4U, Ultra Sun/Moon).
+- **`homebrew/default.3gx`** — Homebrew-compatible build (`allowHomebrewLoad` enabled).
 
-### Build Commands (PowerShell)
+### Building From Source (Optional)
+- Requires [Docker](https://www.docker.com/) running locally (uses the `pablomk7/libctrpf:0.8.0` builder image — no local `devkitARM` install needed).
 - **Full Plugin** (outputs to `full/default.3gx` and `full/user_param.bin`):
   ```powershell
   .\build_plugin.ps1

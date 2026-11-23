@@ -16,19 +16,23 @@ anki_sync/
 dumps/
 tmp_dumps/
 
-# Python execution and cache
+# Python execution, tests, and cache
 __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+tests/
 
 # PyInstaller / Build artifacts
 build/
 dist/
 *.exe
 
-# 3DS compiled binaries and build files
+# 3DS intermediate build files (keep prebuilt full/slim/homebrew default.3gx + user_param.bin tracked)
 *.3gx
+!full/default.3gx
+!slim/default.3gx
+!homebrew/default.3gx
 *.elf
 3gx_plugin/Build/
 3gx_plugin/disasm.txt
@@ -36,9 +40,6 @@ dist/
 3gx_plugin_hb/disasm.txt
 3gx_plugin_slim/Build/
 3gx_plugin_slim/disasm.txt
-full/
-slim/
-homebrew/
 CTRPluginFramework/Library/debug/
 CTRPluginFramework/Library/lib/
 CTRPluginFramework/Library/release/
