@@ -47,6 +47,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import psk_store
+from japanese_word_meta import JapaneseWordMetaAnalyzer
 
 # Server & Protocol Configuration
 HOST = "0.0.0.0"
@@ -1970,6 +1971,7 @@ class JapaneseOCRDictionaryPipeline:
         self._custom_voicing_index: Dict[str, List[str]] = {}
         self._yomitan_mgr: Optional[YomitanDictionaryManager] = None
         self._word_meta_mgr = WordMetaManager(WORD_META_DB_PATH, JLPT_KANJI_PATH)
+        self._word_reading_meta = JapaneseWordMetaAnalyzer(find_jamdict_db_path())
 
         self._load_custom_dictionaries()
 
@@ -5781,6 +5783,10 @@ class JapaneseOCRDictionaryPipeline:
                                         gloss_list.append(f"{idx}. {sense_glosses}")
 
                             base_pos = ", ".join(pos_notes) if pos_notes else "Word"
+                            meta_tag = self._word_reading_meta.format_meta_tag(
+                                headword, reading, pos_notes, jmdict_entry=entry
+                            )
+                            pos_with_meta = f"{meta_tag} {base_pos}" if meta_tag else base_pos
                             active_steps = c_steps or (
                                 first_morph.conjugation_steps
                                 if first_morph
@@ -5791,9 +5797,9 @@ class JapaneseOCRDictionaryPipeline:
                             )
                             if active_steps:
                                 conj_chain = " -> ".join(active_steps)
-                                full_pos = f"[{conj_chain}] {base_pos}"
+                                full_pos = f"[{conj_chain}] {pos_with_meta}"
                             else:
-                                full_pos = base_pos
+                                full_pos = pos_with_meta
 
                             results.append(
                                 DictionaryResult(
@@ -5919,10 +5925,14 @@ class JapaneseOCRDictionaryPipeline:
                             ):
                                 y_active_steps = deinf_steps_by_reading.get(ent_hira, [])
 
+                        y_meta_tag = self._word_reading_meta.format_meta_tag(
+                            hw, y_ent.reading, [y_ent.pos] if y_ent.pos else []
+                        )
+                        y_base_pos = f"{y_meta_tag} {y_ent.pos}".strip() if y_meta_tag else y_ent.pos
                         y_pos = (
-                            f"[{' -> '.join(y_active_steps)}] {y_ent.pos}"
+                            f"[{' -> '.join(y_active_steps)}] {y_base_pos}"
                             if y_active_steps
-                            else y_ent.pos
+                            else y_base_pos
                         )
 
                         formatted_glosses = [
