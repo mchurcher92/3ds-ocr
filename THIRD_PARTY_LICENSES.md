@@ -22,7 +22,13 @@ This project uses and optionally downloads the following openly licensed diction
 - **Source**: https://github.com/kanjialive/kanji-data-media
 - **Usage**: Japanese readings and English meanings for all 214 Kangxi radicals.
 
-## 4. Local OCR Models (Downloaded via Setup / Updater)
+## 4. CJKVI / CHISE IDS Database (`dictionaries/radical_positions.json`, `dictionaries/kanji_components.json`)
+- **Copyright**: CJKVI Database contributors (2014–2017) & CHISE Project
+- **License**: GNU General Public License v2.0 or later (**GPL-2.0+**, derived from CHISE IDS)
+- **Source**: https://github.com/cjkvi/cjkvi-ids / https://www.chise.org/ids/
+- **Usage**: Radical position metadata (`dictionaries/radical_positions.json`) and non-radical kanji structural decomposition / phonetic sound clue data (`dictionaries/kanji_components.json`, combined with KANJIDIC2 on'yomi readings).
+
+## 5. Local OCR Models (Downloaded via Setup / Updater)
 
 ### PaddleOCR Japanese PP-OCRv4 (`ocr_models/japan_PP-OCRv4_rec.onnx`)
 - **Copyright**: PaddleOCR Authors / Baidu
@@ -43,6 +49,6 @@ This project uses and optionally downloads the following openly licensed diction
 - **RapidOCR**: Apache License 2.0 (https://github.com/RapidAI/RapidOCR)
 - **Manga-OCR**: Apache License 2.0 (https://github.com/kha-white/manga-ocr)
 
-## 5. CTRPluginFramework & `quirc`
+## 6. CTRPluginFramework & `quirc`
 - **CTRPluginFramework**: Included under its respective license in `CTRPluginFramework/LICENSE.txt`.
 - **quirc**: Copyright (C) 2010-2012 Daniel Beer (ISC License), used in the 3DS plugin for QR code pairing.

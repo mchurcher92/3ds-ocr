@@ -1531,6 +1531,15 @@ class WordMetaManager:
                     self._radical_positions = json.load(f)
             except Exception as exc:
                 logger.warning("Failed to load radical positions JSON %s: %s", rad_pos_path, exc)
+        self._kanji_components: Dict[str, dict] = {}
+        comp_json_path = os.path.join(os.path.dirname(jlpt_kanji_path), "kanji_components.json")
+        if os.path.isfile(comp_json_path):
+            try:
+                with open(comp_json_path, "r", encoding="utf-8") as f:
+                    self._kanji_components = json.load(f)
+            except Exception as exc:
+                logger.warning("Failed to load kanji components JSON %s: %s", comp_json_path, exc)
+        self._comp_meaning_cache: Dict[str, str] = {}
         self._cache: Dict[Tuple[str, str], str] = {}
         self._init_db()
 
@@ -1606,6 +1615,58 @@ class WordMetaManager:
                 self._cache[cache_key] = res
         return res
 
+    def _get_component_short_meaning(self, comp_char: str, jam: Any = None) -> str:
+        """Return a concise English meaning for a kanji/radical component."""
+        if not comp_char:
+            return ""
+        with self._lock:
+            if comp_char in self._comp_meaning_cache:
+                return self._comp_meaning_cache[comp_char]
+
+        _VARIANT_SHORT_MEANINGS = {
+            "亻": "person", "𠆢": "person", "⺅": "person",
+            "刂": "knife", "⺈": "knife",
+            "忄": "heart", "⺗": "heart",
+            "扌": "hand",
+            "攵": "strike",
+            "氵": "water", "氺": "water",
+            "灬": "fire",
+            "犭": "dog",
+            "礻": "spirit",
+            "艹": "grass", "⺾": "grass",
+            "衤": "clothes",
+            "辶": "walk", "⻌": "walk", "⻍": "walk",
+            "阝": "mound/town", "⻏": "town", "⻖": "mound",
+            "飠": "food", "𩙿": "food",
+            "罒": "net", "耂": "old", "⺌": "small",
+            "彳": "step", "宀": "roof", "广": "house", "疒": "sickness",
+            "凵": "open box", "冂": "upside-down box", "冖": "cover",
+            "勹": "wrap", "彐": "snout", "彑": "snout", "亠": "lid",
+        }
+        meaning = _VARIANT_SHORT_MEANINGS.get(comp_char, "")
+        if not meaning and jam is not None:
+            try:
+                kd_res = jam.lookup(comp_char)
+                if kd_res and kd_res.chars:
+                    c = kd_res.chars[0]
+                    if c.rm_groups:
+                        for m in getattr(c.rm_groups[0], "meanings", []) or []:
+                            if getattr(m, "m_lang", "") in ("", "en"):
+                                raw = getattr(m, "value", str(m)).strip()
+                                if raw:
+                                    short = raw.split(";")[0].split(",")[0].strip()
+                                    if len(short) > 18:
+                                        short = short[:17].rstrip() + "…"
+                                    meaning = short
+                                    break
+            except Exception:
+                pass
+
+        with self._lock:
+            if len(self._comp_meaning_cache) < 4096:
+                self._comp_meaning_cache[comp_char] = meaning
+        return meaning
+
     def lookup_kanji_info(self, kanji_char: str, jam: Any = None) -> dict:
         """Query Kanjidic2 and local JLPT data for a single kanji character."""
         info: dict = {
@@ -1622,7 +1683,18 @@ class WordMetaManager:
             "kun_readings": [],
             "nanori": [],
             "meanings": [],
+            "components": [],
+            "phonetic": None,
         }
+        comp_entry = self._kanji_components.get(kanji_char)
+        if comp_entry:
+            info["components"] = [
+                (ch, self._get_component_short_meaning(ch, jam))
+                for ch in (comp_entry.get("c") or [])
+            ]
+            phon = comp_entry.get("p")
+            if isinstance(phon, list) and len(phon) == 2:
+                info["phonetic"] = (str(phon[0]), str(phon[1]))
         if jam is not None:
             try:
                 _kanjidic_lookup_aliases = {
@@ -1929,10 +2001,19 @@ class WordMetaManager:
         elif jlpt is not None:
             rank_jlpt = f"N{jlpt}"
 
+        glosses_out = list(meanings) if meanings else ["(No definition found in Kanjidic)"]
+        comps = info.get("components") or []
+        if comps:
+            comp_str = ", ".join(f"{ch} ({m})" if m else ch for ch, m in comps)
+            glosses_out.append(f"Components: {comp_str}")
+        phon = info.get("phonetic")
+        if phon:
+            glosses_out.append(f"Sound clue: {phon[0]} ({phon[1]})")
+
         return DictionaryResult(
             headword=kanji_char,
             reading=reading_str,
-            glosses=meanings if meanings else ["(No definition found in Kanjidic)"],
+            glosses=glosses_out,
             pos=" · ".join(pos_parts),
             matched_surface=kanji_char,
             context_text=f"Kanji {kanji_char} ({reading_str})",
@@ -7697,6 +7778,8 @@ def render_kanji_popup(
     jlpt = info.get("jlpt")
     rad_num = info.get("rad_num")
     rad_char = info.get("rad_char", "")
+    components = info.get("components") or []
+    phonetic = info.get("phonetic")
     rad_base = info.get("rad_base", "")
     rad_reading = info.get("rad_reading", "")
     rad_meaning = info.get("rad_meaning", "")
@@ -7869,6 +7952,35 @@ def render_kanji_popup(
         draw.text((12, y_m), ln, fill=(240, 245, 255), font=font_body)
         _record_text_hotspots(ln, 12, y_m, font_body, 14)
         y_m += 14
+
+    # Other Components & Sound Clue (below Meanings, bounded above footer bar)
+    max_body_y = KANJI_TALL_DIM[1] - 26
+    if (components or phonetic) and y_m + 22 <= max_body_y:
+        draw.line([(8, y_m + 3), (312, y_m + 3)], fill=(55, 68, 95), width=1)
+        y_m += 7
+        if components and y_m + 14 <= max_body_y:
+            draw.text((10, y_m), "Other Components:", fill=(120, 195, 255), font=font_small)
+            y_m += 14
+            comp_items = [f"{ch} ({m})" if m else ch for ch, m in components]
+            comp_lines = _wrap_items(comp_items, "  ", font_body, 296)
+            for ln in comp_lines:
+                if y_m + 15 > max_body_y:
+                    break
+                _draw_text_with_rad_fallback((12, y_m), ln, (235, 240, 248), font_body, rad_font_small)
+                _record_text_hotspots(ln, 12, y_m, font_body, 15, rad_font=rad_font_small)
+                y_m += 15
+        if phonetic and y_m + 16 <= max_body_y:
+            p_char, p_on = phonetic
+            lbl_sc = "Sound Clue: "
+            draw.text((10, y_m), lbl_sc, fill=(125, 230, 165), font=font_small)
+            try:
+                lbl_w = int(round(font_small.getlength(lbl_sc)))
+            except Exception:
+                lbl_w = len(lbl_sc) * 7
+            sc_val = f"{p_char} ({p_on})"
+            _draw_text_with_rad_fallback((10 + lbl_w, y_m - 1), sc_val, (255, 230, 115), font_body, rad_font_small)
+            _record_text_hotspots(sc_val, 10 + lbl_w, y_m - 1, font_body, 15, rad_font=rad_font_small)
+            y_m += 16
 
     # Track actual content bottom (clamped to tall canvas height)
     content_height = min(y_m + 4, KANJI_TALL_DIM[1])
