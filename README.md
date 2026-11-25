@@ -1,6 +1,8 @@
 # Nintendo 3DS Japanese OCR & Translation
 
-Real-time dual-screen Japanese OCR, dictionary lookup, AI/neural translation, and Anki flashcard creation for Nintendo 3DS, using a lightweight Luma3DS `.3gx` plugin paired with a Python PC server.
+Real-time dual-screen Japanese OCR, dictionary lookup, AI/neural translation, and Anki flashcard creation for Nintendo 3DS. Supports both **PC Server mode (Old 3DS & New 3DS)** and **Standalone Offline / No-Server mode (New 3DS / New 2DS XL only)**.
+
+> **Hardware Requirement:** Standalone **No-Server / Offline mode** currently works **only on New 3DS / New 3DS XL / New 2DS XL** (it relies on the New 3DS's extra CPU cores and memory). Using the plugin on an **Old 3DS / Old 2DS requires the PC server**.
 
 ## Repository Layout
 
@@ -12,6 +14,8 @@ Real-time dual-screen Japanese OCR, dictionary lookup, AI/neural translation, an
 - `3gx_plugin/` — Full CTRPluginFramework `.3gx` plugin source (`build_plugin.ps1` / `build_plugin.bat`).
 - `3gx_plugin_slim/` — Headless slim `.3gx` plugin for Old 3DS / extended memory games (`build_slim_plugin.ps1`).
 - `3gx_plugin_hb/` & `CTRPluginFramework_Hb/` — Homebrew-compatible `.3gx` plugin build (`build_hb_plugin.ps1`).
+- `3gx_plugin_n3ds_offline/` — Standalone **New 3DS-only** offline OCR `.3gx` plugin (`build_n3ds_offline_plugin.ps1` → `n3ds_offline/default.3gx`).
+- `tools/build_offline_assets.py` — Builds the `/luma/ocr_offline/` SD card asset pack (`ocr_det_int8.bin`, `ocr_ppocrv4_int8.bin`, `jmdict_offline.bin`, `kanjidic_offline.bin`, `font_pack.bin`).
 - `dictionaries/` — Custom proper-noun glossary (`custom_dict.json`), JLPT & Kangxi radical metadata, plus downloaded open-licensed dictionaries (`jamdict.db`, `KanjiStrokeOrders.ttf`) and optional user-supplied Yomitan `.zip` dictionaries.
 - `THIRD_PARTY_LICENSES.md` — Attributions and licenses for open-licensed dictionary datasets and fonts.
 - `ocr_models/` — Model charsets/configs (`NDLmoji.yaml`, `japan_dict.txt`, `yomitoku_charset.txt`).
@@ -64,9 +68,10 @@ Output is written to `dist/OCR_Server.exe`.
 
 ### Prebuilt Binaries (No Docker Needed)
 Ready-to-use `.3gx` builds are included directly in the repository:
-- **`full/default.3gx`** — Standard full CTRPF plugin (recommended for most 3DS games).
-- **`slim/default.3gx`** (+ `slim/user_param.bin`) — Headless slim build for Old 3DS / Mode 3 extended-memory games (e.g. Smash Bros, Monster Hunter 4U, Ultra Sun/Moon).
-- **`homebrew/default.3gx`** — Homebrew-compatible build (`allowHomebrewLoad` enabled).
+- **`full/default.3gx`** — Standard full CTRPF plugin (requires PC server; works on Old 3DS & New 3DS).
+- **`slim/default.3gx`** (+ `slim/user_param.bin`) — Headless slim build for Old 3DS / Mode 3 extended-memory games (requires PC server; e.g. Smash Bros, Monster Hunter 4U, Ultra Sun/Moon).
+- **`homebrew/default.3gx`** — Homebrew-compatible build (`allowHomebrewLoad` enabled; requires PC server).
+- **`n3ds_offline/default.3gx`** — Standalone **No-Server / Offline** build (**New 3DS / New 3DS XL / New 2DS XL only** — Old 3DS requires the PC server with `full`, `slim`, or `homebrew`).
 
 ### Building From Source (Optional)
 - Requires [Docker](https://www.docker.com/) running locally (uses the `pablomk7/libctrpf:0.8.0` builder image — no local `devkitARM` install needed).
@@ -81,6 +86,10 @@ Ready-to-use `.3gx` builds are included directly in the repository:
 - **Homebrew-Compatible Plugin** (rebuilds `CTRPluginFramework_Hb` and outputs to `homebrew/`):
   ```powershell
   .\build_hb_plugin.ps1
+  ```
+- **New 3DS Offline (No-Server) Plugin** (outputs to `n3ds_offline/default.3gx` and `n3ds_offline/user_param.bin`):
+  ```powershell
+  .\build_n3ds_offline_plugin.ps1
   ```
 
 *(Optional)* Set `$env:GDRIVE_DIR` before running any build script to automatically copy compiled `.3gx` files to a sync directory.
@@ -107,7 +116,27 @@ When a word translation popup is open on-screen, you can inspect any kanji in it
 
 ---
 
-## 3. Multi-User Mode & Per-3DS Pairing
+## 3. Standalone Offline / No-Server Mode (New 3DS Only)
+
+> **New 3DS / New 3DS XL / New 2DS XL only:** At this stage, standalone offline OCR runs **only on New 3DS hardware**. Using the plugin on an **Old 3DS / Old 2DS requires the PC server** (`full`, `slim`, or `homebrew` builds).
+
+### On-Device Features
+- **Neural OCR on-console:** INT8 DBNet text detection (`ocr_det_int8.bin`) + PP-OCRv4 recognition (`ocr_ppocrv4_int8.bin`) with background full-screen caching and region selection reuse.
+- **Offline Dictionary & Kanji Lookup:** Packed JMdict + JMnedict + Kanjidic2 + custom glossary (`jmdict_offline.bin`, `kanjidic_offline.bin`, `font_pack.bin`) with morphological deinflection, de-rendaku, reading-type/honorific tags (`音読み`/`訓読み`/`熟字訓`/`お〜`/`ご〜`), POS-aware region glossing, and Kanji Details with stroke-order diagrams.
+- **Direct Anki Upload (No PC OCR Server Required):** Supports **AnkiWeb Only**, **AnkiConnect Only** (LAN directly to Anki Desktop), **AnkiWeb → Connect**, and **Connect → AnkiWeb**, with duplicate checking, full dual-screen JPEG screenshots, per-game deck names, and an SD card offline queue (`/luma/ocr_offline/`).
+
+### SD Card Setup
+1. Enable **Game Patching** and **Plugin Loader** in Luma3DS (`Select` on boot) and copy `n3ds_offline/default.3gx` to `/luma/plugins/default.3gx` on your New 3DS SD card.
+2. Generate the offline SD asset pack on your PC:
+   ```bash
+   python tools/build_offline_assets.py
+   ```
+   Then copy the generated `n3ds_offline/sd_pack/luma/ocr_offline/` folder to `/luma/ocr_offline/` on your 3DS SD card (`ocr_det_int8.bin`, `ocr_ppocrv4_int8.bin`, `jmdict_offline.bin`, `kanjidic_offline.bin`, `font_pack.bin`).
+3. Press **`Select`** in-game to open the Plugin Menu and configure **Offline Mode**, **Anki Upload Mode**, **AnkiWeb Login**, or **AnkiConnect Host**. *(You can still switch back to PC Server mode from the menu if you want Gemini/multi-engine server OCR.)*
+
+---
+
+## 4. Multi-User Mode & Per-3DS Pairing
 
 Multiple 3DS consoles can connect concurrently to the same server, each with its own encryption key and AnkiWeb account.
 
