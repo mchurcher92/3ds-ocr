@@ -4584,13 +4584,22 @@ class JapaneseOCRDictionaryPipeline:
             h_overlap = min(ax2, bx2) - max(ax1, bx1)
             left_aligned = abs(ax1 - bx1) <= avg_h * 2.5
             same_row = v_overlap >= avg_h * 0.35 and h_gap <= avg_h * 1.9
-            return same_row or (v_gap <= avg_h * 1.4 and (h_overlap > 0 or left_aligned))
+            if same_row:
+                left_ln = a if ax1 < bx1 else b
+                return not left_ln.has_trailing_punct
+            if v_gap <= avg_h * 1.4 and (h_overlap > 0 or left_aligned):
+                top_ln = a if ay1 < by1 else b
+                return not top_ln.has_trailing_punct
+            return False
         else:
             avg_w = (a.width + b.width) / 2.0
             h_gap = max(bx1 - ax2, ax1 - bx2, 0)
             v_overlap = min(ay2, by2) - max(ay1, by1)
             top_aligned = abs(ay1 - by1) <= avg_w * 2.5
-            return h_gap <= avg_w * 1.6 and (v_overlap > 0 or top_aligned)
+            if h_gap <= avg_w * 1.6 and (v_overlap > 0 or top_aligned):
+                prev_ln = a if ax2 > bx2 else b
+                return not prev_ln.has_trailing_punct
+            return False
 
     def _analyze_morphemes(self, full_text: str) -> List[MorphemeSpan]:
         """

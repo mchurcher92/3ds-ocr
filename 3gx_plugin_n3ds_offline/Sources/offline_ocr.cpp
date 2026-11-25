@@ -4452,6 +4452,62 @@ static void TrimBoxEdgeBorders(const uint8_t *rgb, int imgW, int imgH,
     }
 }
 
+static int ColContrastEnergy(const uint8_t *rgb, int imgW, int x, int ry0, int ry1) {
+    int e = 0;
+    for (int y = ry0; y < ry1; ++y) {
+        const uint8_t *p = rgb + ((size_t)y * imgW + x) * 3;
+        int l = (int)p[0] * 3 + (int)p[1] * 6 + (int)p[2];
+        int d = 0;
+        if (x > 0) {
+            const uint8_t *pl = p - 3;
+            d = std::max(d, std::abs(l - ((int)pl[0] * 3 + (int)pl[1] * 6 + (int)pl[2])));
+        }
+        if (y > ry0) {
+            const uint8_t *pu = p - (size_t)imgW * 3;
+            d = std::max(d, std::abs(l - ((int)pu[0] * 3 + (int)pu[1] * 6 + (int)pu[2])));
+        }
+        if (d > 180) ++e;
+    }
+    return e;
+}
+
+static void ExpandClippedBoxEdges(const uint8_t *rgb, int imgW, int imgH,
+                                  int &x1, int y1, int &x2, int y2,
+                                  bool allowLeft, bool allowRight)
+{
+    if (y2 - y1 < 8) return;
+    int ry0 = std::min(y2 - 1, y1 + 2);
+    int ry1 = std::max(ry0 + 1, y2 - 2);
+    if (allowLeft && x1 > 0 && ColContrastEnergy(rgb, imgW, x1, ry0, ry1) >= 2) {
+        int lim = std::max(0, x1 - 8);
+        int nx1 = x1;
+        int z = 0;
+        for (int x = x1 - 1; x >= lim; --x) {
+            if (ColContrastEnergy(rgb, imgW, x, ry0, ry1) == 0) {
+                if (++z >= 2) { nx1 = x; break; }
+            } else {
+                z = 0;
+                nx1 = x;
+            }
+        }
+        x1 = std::max(0, nx1 - 2);
+    }
+    if (allowRight && x2 < imgW && ColContrastEnergy(rgb, imgW, x2 - 1, ry0, ry1) >= 2) {
+        int lim = std::min(imgW - 1, x2 + 8);
+        int nx2 = x2;
+        int z = 0;
+        for (int x = x2; x <= lim; ++x) {
+            if (ColContrastEnergy(rgb, imgW, x, ry0, ry1) == 0) {
+                if (++z >= 2) { nx2 = x; break; }
+            } else {
+                z = 0;
+                nx2 = x + 1;
+            }
+        }
+        x2 = std::min(imgW, nx2 + 2);
+    }
+}
+
 bool RunBox(const uint8_t *rgb, int imgW, int imgH, const TextBox &box,
             const LoadedModel &model, OcrLine &outLine, std::string &err,
             bool allowDualCore, const std::atomic<bool> *abortFlag, int helperCore,
@@ -4460,6 +4516,8 @@ bool RunBox(const uint8_t *rgb, int imgW, int imgH, const TextBox &box,
     int bx1 = box.x1;
     int bx2 = box.x2;
     TrimBoxEdgeBorders(rgb, imgW, imgH, bx1, box.y1, bx2, box.y2);
+    ExpandClippedBoxEdges(rgb, imgW, imgH, bx1, box.y1, bx2, box.y2,
+                          bx1 == box.x1, bx2 == box.x2);
 
     std::vector<float> localNchw;
     std::vector<float> &nchw = scratch ? scratch->nchw : localNchw;
