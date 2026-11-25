@@ -98,6 +98,7 @@ std::string BuildAnkiConnectCreateDeckJson(const std::string &deckName);
 std::string BuildAnkiConnectStoreMediaJson(const std::string &filename, const std::string &b64Data);
 std::string BuildAnkiConnectFindNotesJson(const std::string &deckName, const std::string &headword);
 std::string BuildAnkiConnectNotesInfoJson(const std::vector<int64_t> &noteIds);
+bool AnkiConnectNotesInfoHasFrontPrefix(const std::string &notesInfoJson, const std::string &hwPrefix);
 std::string BuildAnkiConnectAddNoteJson(const std::string &deckName,
                                         const std::string &frontHtml,
                                         const std::string &backHtml,

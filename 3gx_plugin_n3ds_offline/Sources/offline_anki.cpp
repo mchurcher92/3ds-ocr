@@ -967,19 +967,126 @@ std::string BuildAnkiConnectStoreMediaJson(const std::string &filename, const st
            JsonEscape(filename) + "\",\"data\":\"" + b64Data + "\"}}";
 }
 
+static std::string EscapeAnkiQueryTerm(const std::string &s) {
+    std::string out;
+    out.reserve(s.size() + 4);
+    for (char c : s) {
+        if (c == '\\' || c == '"') out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
+static int HexDigitVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static bool ParseHex4(const char *p, uint32_t &out) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i) {
+        int d = HexDigitVal(p[i]);
+        if (d < 0) return false;
+        v = (v << 4) | (uint32_t)d;
+    }
+    out = v;
+    return true;
+}
+
+static void AppendUtf8(std::string &out, uint32_t cp) {
+    if (cp <= 0x7Fu) {
+        out.push_back((char)cp);
+    } else if (cp <= 0x7FFu) {
+        out.push_back((char)(0xC0u | (cp >> 6)));
+        out.push_back((char)(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0xFFFFu) {
+        out.push_back((char)(0xE0u | (cp >> 12)));
+        out.push_back((char)(0x80u | ((cp >> 6) & 0x3Fu)));
+        out.push_back((char)(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0x10FFFFu) {
+        out.push_back((char)(0xF0u | (cp >> 18)));
+        out.push_back((char)(0x80u | ((cp >> 12) & 0x3Fu)));
+        out.push_back((char)(0x80u | ((cp >> 6) & 0x3Fu)));
+        out.push_back((char)(0x80u | (cp & 0x3Fu)));
+    }
+}
+
 std::string BuildAnkiConnectFindNotesJson(const std::string &deckName, const std::string &headword) {
-    std::string q = "deck:\\\"" + JsonEscape(deckName) + "\\\" \\\"" + JsonEscape(headword) + "\\\"";
-    return "{\"action\":\"findNotes\",\"version\":6,\"params\":{\"query\":\"" + q + "\"}}";
+    std::string q = "deck:\"" + EscapeAnkiQueryTerm(deckName) + "\" \"" + EscapeAnkiQueryTerm(headword) + "\"";
+    return "{\"action\":\"findNotes\",\"version\":6,\"params\":{\"query\":\"" + JsonEscape(q) + "\"}}";
 }
 
 std::string BuildAnkiConnectNotesInfoJson(const std::vector<int64_t> &noteIds) {
     std::string out = "{\"action\":\"notesInfo\",\"version\":6,\"params\":{\"notes\":[";
-    for (size_t i = 0; i < noteIds.size() && i < 10; ++i) {
+    for (size_t i = 0; i < noteIds.size(); ++i) {
         if (i > 0) out.push_back(',');
         out += std::to_string((long long)noteIds[i]);
     }
     out += "]}}";
     return out;
+}
+
+bool AnkiConnectNotesInfoHasFrontPrefix(const std::string &notesInfoJson, const std::string &hwPrefix) {
+    if (hwPrefix.empty()) return false;
+    std::string decoded;
+    size_t i = 0;
+    const size_t n = notesInfoJson.size();
+    while (i < n) {
+        if (notesInfoJson[i] != '"') {
+            ++i;
+            continue;
+        }
+        ++i; // skip opening quote
+        decoded.clear();
+        while (i < n) {
+            char c = notesInfoJson[i++];
+            if (c == '"') break;
+            if (c == '\\' && i < n) {
+                char esc = notesInfoJson[i++];
+                switch (esc) {
+                    case '"':  decoded.push_back('"'); break;
+                    case '\\': decoded.push_back('\\'); break;
+                    case '/':  decoded.push_back('/'); break;
+                    case 'b':  decoded.push_back('\b'); break;
+                    case 'f':  decoded.push_back('\f'); break;
+                    case 'n':  decoded.push_back('\n'); break;
+                    case 'r':  decoded.push_back('\r'); break;
+                    case 't':  decoded.push_back('\t'); break;
+                    case 'u': {
+                        uint32_t cp = 0;
+                        if (i + 4 <= n && ParseHex4(notesInfoJson.data() + i, cp)) {
+                            i += 4;
+                            if (cp >= 0xD800u && cp <= 0xDBFFu &&
+                                i + 6 <= n && notesInfoJson[i] == '\\' && notesInfoJson[i + 1] == 'u') {
+                                uint32_t low = 0;
+                                if (ParseHex4(notesInfoJson.data() + i + 2, low) &&
+                                    low >= 0xDC00u && low <= 0xDFFFu) {
+                                    cp = 0x10000u + (((cp - 0xD800u) << 10) | (low - 0xDC00u));
+                                    i += 6;
+                                }
+                            }
+                            AppendUtf8(decoded, cp);
+                        } else {
+                            decoded.push_back('\\');
+                            decoded.push_back('u');
+                        }
+                        break;
+                    }
+                    default:
+                        decoded.push_back(esc);
+                        break;
+                }
+            } else {
+                decoded.push_back(c);
+            }
+        }
+        if (decoded.find(hwPrefix) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string BuildAnkiConnectAddNoteJson(const std::string &deckName,
@@ -1340,7 +1447,7 @@ static bool HttpPlainPost(const std::string &host, uint16_t port,
         if (n <= 0) break;
         raw.append(buf, (size_t)n);
         if (IsHttpResponseComplete(raw)) break;
-        if (raw.size() > 256 * 1024) break;
+        if (raw.size() > 1024 * 1024) break;
     }
     closesocket(sock);
 
@@ -1744,9 +1851,13 @@ static bool ParseIntArrayFromResult(const std::string &jsonResp, std::vector<int
     out.clear();
     size_t rp = jsonResp.find("\"result\"");
     if (rp == std::string::npos) return false;
-    size_t lb = jsonResp.find('[', rp);
-    size_t rb = (lb == std::string::npos) ? std::string::npos : jsonResp.find(']', lb);
-    if (lb == std::string::npos || rb == std::string::npos) return false;
+    size_t colon = jsonResp.find(':', rp + 8);
+    if (colon == std::string::npos) return false;
+    size_t lb = colon + 1;
+    while (lb < jsonResp.size() && std::isspace((unsigned char)jsonResp[lb])) ++lb;
+    if (lb >= jsonResp.size() || jsonResp[lb] != '[') return false;
+    size_t rb = jsonResp.find(']', lb);
+    if (rb == std::string::npos) return false;
     size_t p = lb + 1;
     while (p < rb) {
         while (p < rb && !std::isdigit((unsigned char)jsonResp[p])) ++p;
@@ -1915,19 +2026,24 @@ static bool UploadViaAnkiConnect(const AnkiCard &card, const UploadConfig &cfg,
         s_acCachedDeck = deck;
     }
 
-    // Duplicate check via findNotes + notesInfo (ignoring screenshot filename)
+    // Duplicate check via findNotes + batched notesInfo (ignoring screenshot filename and decoding \uXXXX)
     std::string fnResp, fnErr;
     int fnSt = 0;
     if (HttpPlainPost(cfg.connectHost, port, BuildAnkiConnectFindNotesJson(deck, card.headword), fnSt, fnResp, fnErr) && fnSt == 200) {
         std::vector<int64_t> nids;
         if (ParseIntArrayFromResult(fnResp, nids) && !nids.empty()) {
-            std::string niResp, niErr;
-            int niSt = 0;
-            if (HttpPlainPost(cfg.connectHost, port, BuildAnkiConnectNotesInfoJson(nids), niSt, niResp, niErr) && niSt == 200) {
-                if (niResp.find(JsonEscape(hwPrefix)) != std::string::npos) {
-                    LocalCacheRecordCard(deck, card.headword);
-                    statusOut = "Already in Anki";
-                    return true;
+            const size_t kBatchSize = 10;
+            for (size_t off = 0; off < nids.size(); off += kBatchSize) {
+                size_t end = std::min(nids.size(), off + kBatchSize);
+                std::vector<int64_t> batch(nids.begin() + off, nids.begin() + end);
+                std::string niResp, niErr;
+                int niSt = 0;
+                if (HttpPlainPost(cfg.connectHost, port, BuildAnkiConnectNotesInfoJson(batch), niSt, niResp, niErr) && niSt == 200) {
+                    if (AnkiConnectNotesInfoHasFrontPrefix(niResp, hwPrefix)) {
+                        LocalCacheRecordCard(deck, card.headword);
+                        statusOut = "Already in Anki";
+                        return true;
+                    }
                 }
             }
         }
