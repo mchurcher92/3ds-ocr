@@ -4287,6 +4287,7 @@ namespace CTRPluginFramework
             }
 
             bool touchTap = (kDown & Key::Touchpad) != 0;
+            bool validTouch = false;
             // Touch Screen: Instantly jump cursor to bottom screen touch position
             if (Touch::IsDown() && (!selbox.active || selbox.screenId == SCREEN_ID_BOTTOM)) {
                 UIntVector touch = Touch::GetPosition();
@@ -4295,6 +4296,7 @@ namespace CTRPluginFramework
                     newX = (int)touch.x;
                     newY = (int)touch.y;
                     moved = true;
+                    validTouch = true;
                 }
             }
 
@@ -4332,8 +4334,9 @@ namespace CTRPluginFramework
             bool lookupTriggered = (kDown & g_ocrKeys.lookup) != 0;
             bool touchPopupTap = touchTap && hasPopup && popupTargetScreen == SCREEN_ID_BOTTOM && !selbox.active;
             bool touchKanjiTap = touchTap && hasKanjiWindow && kanjiTargetScreen == SCREEN_ID_BOTTOM && !selbox.active;
-            if (lookupTriggered || touchPopupTap || touchKanjiTap) {
-                bool isTouchAction = touchPopupTap || touchKanjiTap;
+            bool touchLookupTap = touchTap && validTouch && !translateMode && !selbox.active;
+            if (lookupTriggered || touchPopupTap || touchKanjiTap || touchLookupTap) {
+                bool isTouchAction = touchPopupTap || touchKanjiTap || touchLookupTap;
                 int actionScreen = isTouchAction ? SCREEN_ID_BOTTOM : curScreen;
                 int actionX = isTouchAction ? newX : curX;
                 int actionY = isTouchAction ? newY : curY;
