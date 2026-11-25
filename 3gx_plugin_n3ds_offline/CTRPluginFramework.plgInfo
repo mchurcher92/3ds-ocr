@@ -1,0 +1,27 @@
+Author: ""
+
+Version: # Plugin version
+    Major: 1
+    Minor: 0
+    Revision: 0
+
+Targets: # Low TitleId of games which are compatibles with this plugin (0 for all)
+
+Title: Japanese OCR & Translation (N3DS Offline)
+
+Summary: New 3DS Offline + Online Japanese OCR & Dictionary 3GX Plugin
+
+Description: |
+  Real-time screen capture, on-board offline OCR + JMdict/Kanjidic lookup,
+  and optional PC server translation client for New Nintendo 3DS homebrew.
+  Features:
+    - Direct hotkey activation (R + Start + Select)
+    - On-board PP-OCRv4 INT8 recognition & JMdict/Kanjidic offline lookup (New 3DS)
+    - Single word lookup & 2-point box glossing / translation
+    - Offline Anki queue + optional online PC OCR server mode
+
+Compatibility: Any
+
+MemorySize: 10MiB
+
+UsePrivateMemory: false
