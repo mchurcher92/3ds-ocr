@@ -1205,6 +1205,14 @@ void CloseIdleConnection(void) {
     AnkiLockGuard guard;
     s_ankiUserSession.Close();
     s_ankiWebSession.Close();
+    if (s_hasSavedUserTlsSess) {
+        mbedtls_ssl_session_free(&s_savedUserTlsSess);
+        s_hasSavedUserTlsSess = false;
+    }
+    if (s_hasSavedMainTlsSess) {
+        mbedtls_ssl_session_free(&s_savedMainTlsSess);
+        s_hasSavedMainTlsSess = false;
+    }
 }
 
 void ResetCachedSession(void) {

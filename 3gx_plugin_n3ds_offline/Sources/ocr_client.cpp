@@ -4248,6 +4248,7 @@ namespace CTRPluginFramework
         };
 
         OfflineOcr::LoadedDetModel detModel;
+        OfflineOcr::DetScratch detScratch;
         std::string detErr;
         bool hasDet = OfflineOcr::LoadDetModel(OCR_OFFLINE_DET_PATH, detModel, detErr);
 
@@ -4266,7 +4267,7 @@ namespace CTRPluginFramework
                 while (!bg->cancel.load(std::memory_order_acquire)) {
                     if (!waitIfPaused()) return false;
                     std::string rErr;
-                    if (OfflineOcr::DetectScreenTextLinesDbNet(rgb, w, h, detModel, boxes, rErr, true, &bg->abortOp, 0, nullptr)) {
+                    if (OfflineOcr::DetectScreenTextLinesDbNet(rgb, w, h, detModel, boxes, rErr, true, &bg->abortOp, 0, nullptr, &detScratch)) {
                         detected = true;
                         break;
                     }
@@ -4330,7 +4331,8 @@ namespace CTRPluginFramework
         std::vector<OfflineOcr::TextBox> screenBoxes[2];
         bool detOk = detectScreen(SCREEN_ID_TOP, screenBoxes[0]) &&
                      detectScreen(SCREEN_ID_BOTTOM, screenBoxes[1]);
-        // Release the 1.23 MB detection weight buffer before recognition allocates RecScratch
+        // Release the 1.23 MB detection weight buffer and DBNet scratch pool before recognition allocates RecScratch
+        detScratch.Reset();
         std::vector<uint8_t>().swap(detModel.modelBuf);
 
         if (detOk && bg->model && !bg->model->loaded && !bg->cancel.load(std::memory_order_acquire)) {
@@ -6449,6 +6451,9 @@ namespace CTRPluginFramework
 
         // Free session snapshot buffers to return ~750 KB to the game process
         OCR_FreeSessionBuffers();
+        if (offlineMode) {
+            OfflineAnki::CloseIdleConnection();
+        }
 
         // Unpause game after waiting for the dismiss button release so it doesn't leak into the game
         if (!abortedForSleep) {

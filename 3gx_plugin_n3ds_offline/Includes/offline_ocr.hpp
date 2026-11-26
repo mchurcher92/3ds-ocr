@@ -64,6 +64,30 @@ struct RecScratch {
     std::vector<float> biasVec;
 };
 
+struct DetScratch {
+    struct ArenaBlock {
+        size_t off;
+        size_t sz;
+        bool used;
+        ArenaBlock(size_t o = 0, size_t s = 0, bool u = false) : off(o), sz(s), used(u) {}
+    };
+    uint8_t *arenaBase{nullptr};
+    size_t arenaSize{0};
+    bool arenaIsSvc{false};
+    std::vector<ArenaBlock> blocks;
+    std::vector<float> scalesVec;
+    std::vector<float> biasVec;
+    std::vector<uint8_t> visited;
+    std::vector<int> qx;
+    std::vector<int> qy;
+
+    ~DetScratch() { Reset(); }
+    void InitArena();
+    void *AllocBytes(size_t bytes, bool &fromArena);
+    void FreeBytes(void *ptr, bool fromArena);
+    void Reset();
+};
+
 struct Conv1x1OpStat {
     uint16_t cin{0}, cout{0};
     uint8_t act{0}, isS16{0};
@@ -144,7 +168,8 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
                                 const LoadedDetModel &detModel,
                                 std::vector<TextBox> &outBoxes, std::string &err,
                                 bool allowDualCore = false, const std::atomic<bool> *abortFlag = nullptr,
-                                int helperCore = 2, DetProfile *detProf = nullptr);
+                                int helperCore = 2, DetProfile *detProf = nullptr,
+                                DetScratch *detScratch = nullptr);
 
 // Run OCR on a preprocessed NCHW float32 tensor [1, 3, 48, W] (W multiple of 8, <= 320).
 bool RunPreprocessed(const float *nchw, int width, const LoadedModel &model,

@@ -4,6 +4,8 @@
 #ifdef __3DS__
 #include <3ds.h>
 #include <CTRPluginFramework.hpp>
+#include <malloc.h>
+#include "csvc.h"
 #endif
 
 #include <algorithm>
@@ -2268,7 +2270,8 @@ static void RunConv2D(
     OcrProfile *prof = nullptr, int opIdx = -1,
     TensorLayout inLayout = LAY_F32_CHW, float inScale = 0.0f,
     TensorLayout outLayout = LAY_F32_CHW, float outScale = 0.0f,
-    const int16_t *inS16 = nullptr, int16_t *outS16 = nullptr)
+    const int16_t *inS16 = nullptr, int16_t *outS16 = nullptr,
+    DetScratch *detScratch = nullptr)
 {
     const bool hasPost = (postScale != 1.0f || postBias != 0.0f);
     const int outHW = hout * wout;
@@ -2284,6 +2287,8 @@ static void RunConv2D(
         float xScale = inScale;
         const int16_t *inHwcPtr = nullptr;
         std::vector<int16_t> localInHwc;
+        int16_t *arenaInHwc = nullptr;
+        bool arenaInHwcFromArena = false;
 
         if (inLayout == LAY_S16_HWC && inS16 != nullptr) {
             inHwcPtr = inS16;
@@ -2295,15 +2300,23 @@ static void RunConv2D(
             uint64_t tMaxEnd = prof ? NowTicks() : 0;
             if (prof) prof->quantMaxAbsTicks += tMaxEnd - tQuant0;
 
-            std::vector<int16_t> &inHwc = scratchInHwc ? *scratchInHwc : localInHwc;
             const size_t needInHwc = (size_t)outHW * (size_t)cinPad;
-            if (inHwc.size() < needInHwc) inHwc.resize(needInHwc);
+            int16_t *inHwcData = nullptr;
+            if (!scratchInHwc && detScratch && detScratch->arenaBase) {
+                arenaInHwc = (int16_t *)detScratch->AllocBytes(needInHwc * sizeof(int16_t), arenaInHwcFromArena);
+                std::memset(arenaInHwc, 0, needInHwc * sizeof(int16_t));
+                inHwcData = arenaInHwc;
+            } else {
+                std::vector<int16_t> &inHwc = scratchInHwc ? *scratchInHwc : localInHwc;
+                if (inHwc.size() < needInHwc) inHwc.resize(needInHwc);
+                inHwcData = inHwc.data();
+            }
 
             std::atomic<int> nextP(0);
-            QuantTransposeArgs qtArgs{in, inHwc.data(), cin, cinPad, inHW, outHW, invXScale, &nextP, 64};
+            QuantTransposeArgs qtArgs{in, inHwcData, cin, cinPad, inHW, outHW, invXScale, &nextP, 64};
+#ifdef __3DS__
             uint64_t tQt0 = prof ? NowTicks() : 0;
             uint64_t tQtWait = 0;
-#ifdef __3DS__
             if (effCore >= 0 && outHW >= 128 && (size_t)cin * (size_t)outHW >= 8192) {
                 int qtCores[3], qtCount = 0;
                 DispatchHelpers(effCore, QuantTransposeWorkerEntry, &qtArgs, qtCores, qtCount);
@@ -2317,6 +2330,8 @@ static void RunConv2D(
                 RunQuantTransposeRange(&qtArgs);
             }
 #else
+            uint64_t tQt0 = prof ? NowTicks() : 0;
+            uint64_t tQtWait = 0;
             RunQuantTransposeRange(&qtArgs);
 #endif
             uint64_t tQuantEnd = prof ? NowTicks() : 0;
@@ -2325,7 +2340,7 @@ static void RunConv2D(
                 prof->quantTransposeTicks += (tQuantEnd - tQt0) - tQtWait;
                 prof->quantWaitTicks += tQtWait;
             }
-            inHwcPtr = inHwc.data();
+            inHwcPtr = inHwcData;
         }
         uint64_t qOpTicks = prof ? (NowTicks() - tQuant0) : 0;
 
@@ -2385,6 +2400,9 @@ static void RunConv2D(
                 st.gemmTicks += gOpTicks;
                 st.waitTicks += gWaitTicks;
             }
+        }
+        if (arenaInHwc && detScratch) {
+            detScratch->FreeBytes(arenaInHwc, arenaInHwcFromArena);
         }
         return;
     }
@@ -3943,11 +3961,131 @@ static void ConvT2x2WorkerEntry(void *arg) {
 }
 #endif
 
+void DetScratch::InitArena() {
+    if (arenaBase) return;
+    static const size_t kTrySizes[] = {0x300000, 0x280000, 0x200000};
+    for (size_t sz : kTrySizes) {
+#ifdef __3DS__
+        u32 out = 0;
+        if (R_SUCCEEDED(svcControlMemoryUnsafe(&out, 0x07600000, sz,
+                (MemOp)(MEMOP_REGION_SYSTEM | MEMOP_ALLOC),
+                (MemPerm)(MEMPERM_READ | MEMPERM_WRITE))) && out != 0) {
+            arenaBase = (uint8_t *)out;
+            arenaSize = sz;
+            arenaIsSvc = true;
+            break;
+        }
+        out = 0;
+        if (R_SUCCEEDED(svcControlMemoryUnsafe(&out, 0x07600000, sz,
+                (MemOp)(MEMOP_REGION_APP | MEMOP_ALLOC),
+                (MemPerm)(MEMPERM_READ | MEMPERM_WRITE))) && out != 0) {
+            arenaBase = (uint8_t *)out;
+            arenaSize = sz;
+            arenaIsSvc = true;
+            break;
+        }
+        void *m = memalign(0x1000, sz);
+        if (m) {
+            arenaBase = (uint8_t *)m;
+            arenaSize = sz;
+            arenaIsSvc = false;
+            break;
+        }
+#else
+        void *m = std::malloc(sz);
+        if (m) {
+            arenaBase = (uint8_t *)m;
+            arenaSize = sz;
+            arenaIsSvc = false;
+            break;
+        }
+#endif
+    }
+    blocks.clear();
+    if (arenaBase && arenaSize > 0) {
+        blocks.push_back(ArenaBlock{0, arenaSize, false});
+    }
+}
+
+void *DetScratch::AllocBytes(size_t bytes, bool &fromArena) {
+    const size_t aligned = (bytes + 15) & ~size_t(15);
+    if (arenaBase && aligned > 0) {
+        int bestIdx = -1;
+        size_t bestSz = SIZE_MAX;
+        for (int i = 0; i < (int)blocks.size(); ++i) {
+            if (!blocks[i].used && blocks[i].sz >= aligned && blocks[i].sz < bestSz) {
+                bestSz = blocks[i].sz;
+                bestIdx = i;
+            }
+        }
+        if (bestIdx >= 0) {
+            size_t off = blocks[bestIdx].off;
+            size_t rem = blocks[bestIdx].sz - aligned;
+            blocks[bestIdx].sz = aligned;
+            blocks[bestIdx].used = true;
+            if (rem > 0) {
+                blocks.insert(blocks.begin() + bestIdx + 1, ArenaBlock{off + aligned, rem, false});
+            }
+            fromArena = true;
+            return arenaBase + off;
+        }
+    }
+    fromArena = false;
+    return ::operator new(aligned ? aligned : 16);
+}
+
+void DetScratch::FreeBytes(void *ptr, bool fromArena) {
+    if (!ptr) return;
+    if (!fromArena) {
+        ::operator delete(ptr);
+        return;
+    }
+    size_t targetOff = (size_t)((uint8_t *)ptr - arenaBase);
+    for (int i = 0; i < (int)blocks.size(); ++i) {
+        if (blocks[i].used && blocks[i].off == targetOff) {
+            blocks[i].used = false;
+            if (i + 1 < (int)blocks.size() && !blocks[i + 1].used) {
+                blocks[i].sz += blocks[i + 1].sz;
+                blocks.erase(blocks.begin() + i + 1);
+            }
+            if (i > 0 && !blocks[i - 1].used) {
+                blocks[i - 1].sz += blocks[i].sz;
+                blocks.erase(blocks.begin() + i);
+            }
+            return;
+        }
+    }
+}
+
+void DetScratch::Reset() {
+    if (arenaBase) {
+#ifdef __3DS__
+        if (arenaIsSvc) {
+            svcControlMemoryUnsafe(nullptr, (u32)arenaBase, arenaSize, MEMOP_FREE, (MemPerm)0);
+        } else {
+            free(arenaBase);
+        }
+#else
+        std::free(arenaBase);
+#endif
+        arenaBase = nullptr;
+        arenaSize = 0;
+        arenaIsSvc = false;
+    }
+    std::vector<ArenaBlock>().swap(blocks);
+    std::vector<float>().swap(scalesVec);
+    std::vector<float>().swap(biasVec);
+    std::vector<uint8_t>().swap(visited);
+    std::vector<int>().swap(qx);
+    std::vector<int>().swap(qy);
+}
+
 bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
                                 const LoadedDetModel &detModel,
                                 std::vector<TextBox> &outBoxes, std::string &err,
                                 bool allowDualCore, const std::atomic<bool> *abortFlag,
-                                int helperCore, DetProfile *detProf)
+                                int helperCore, DetProfile *detProf,
+                                DetScratch *detScratch)
 {
     outBoxes.clear();
     if (!detModel.loaded || detModel.modelBuf.empty() || !rgb || imgW <= 8 || imgH <= 8) {
@@ -3961,11 +4099,49 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
     const int detW = (imgW > 340) ? 256 : 224;
     const int detH = 160;
 
+    DetScratch localScratch;
+    DetScratch &ds = detScratch ? *detScratch : localScratch;
+    ds.InitArena();
+
     struct DetTensor {
         int c{0}, h{0}, w{0};
-        std::vector<float> data;
+        float *ptr{nullptr};
+        size_t count{0};
+        bool fromArena{false};
     };
     std::vector<DetTensor> slots(detModel.numSlots);
+    struct SlotsGuard {
+        std::vector<DetTensor> &s;
+        DetScratch &ds;
+        ~SlotsGuard() {
+            for (auto &t : s) {
+                if (t.ptr) {
+                    ds.FreeBytes(t.ptr, t.fromArena);
+                    t.ptr = nullptr;
+                    t.count = 0;
+                }
+            }
+        }
+    } slotsGuard{slots, ds};
+
+    auto allocSlotData = [&](DetTensor &t, size_t needed) {
+        if (t.ptr) {
+            ds.FreeBytes(t.ptr, t.fromArena);
+            t.ptr = nullptr;
+            t.count = 0;
+        }
+        t.ptr = (float *)ds.AllocBytes(needed * sizeof(float), t.fromArena);
+        t.count = needed;
+    };
+    auto releaseSlotData = [&](DetTensor &t) {
+        if (t.ptr) {
+            ds.FreeBytes(t.ptr, t.fromArena);
+            t.ptr = nullptr;
+            t.count = 0;
+            t.fromArena = false;
+        }
+    };
+
     OcrProfile detConvProf;
     if (detProf) {
         detProf->numOps = (uint32_t)detModel.ops.size();
@@ -3977,7 +4153,7 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
         DetTensor &inT = slots[detModel.inputSlot];
         inT.c = 3; inT.h = detH; inT.w = detW;
         const size_t hw = (size_t)detH * detW;
-        inT.data.resize(3 * hw);
+        allocSlotData(inT, 3 * hw);
         const float sx = (float)imgW / (float)detW;
         const float sy = (float)imgH / (float)detH;
         for (int dy = 0; dy < detH; ++dy) {
@@ -4008,7 +4184,7 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
                 for (int c = 0; c < 3; ++c) {
                     int srcC = 2 - c; // BGR
                     float px = p00[srcC] * w00 + p01[srcC] * w01 + p10[srcC] * w10 + p11[srcC] * w11;
-                    inT.data[(size_t)c * hw + outIdx] = (px / 255.0f - 0.5f) / 0.5f;
+                    inT.ptr[(size_t)c * hw + outIdx] = (px / 255.0f - 0.5f) / 0.5f;
                 }
             }
         }
@@ -4035,7 +4211,7 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
 
     auto freeIfDead = [&](uint16_t slot, int oi) {
         if (slot < detModel.numSlots && lastUse[slot] == oi) {
-            std::vector<float>().swap(slots[slot].data);
+            releaseSlotData(slots[slot]);
         }
     };
 
@@ -4052,23 +4228,25 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
             int wout = (inT.w + 2 * op.pW - op.kW) / op.sW + 1;
             DetTensor &outT = slots[op.out];
             outT.c = op.outC; outT.h = hout; outT.w = wout;
-            outT.data.resize((size_t)op.outC * hout * wout);
+            allocSlotData(outT, (size_t)op.outC * hout * wout);
             uint64_t tIo0 = detProf ? NowTicks() : 0;
             if (op.dataOffset + op.dataSize > mbSize) {
                 err = "Det weight out of bounds";
                 return false;
             }
             const uint8_t *buf = mb + op.dataOffset;
-            std::vector<float> scales(op.outC), bias(op.outC);
-            std::memcpy(scales.data(), buf, (size_t)op.outC * 4);
-            std::memcpy(bias.data(), buf + (size_t)op.outC * 4, (size_t)op.outC * 4);
+            ds.scalesVec.resize(op.outC);
+            ds.biasVec.resize(op.outC);
+            std::memcpy(ds.scalesVec.data(), buf, (size_t)op.outC * 4);
+            std::memcpy(ds.biasVec.data(), buf + (size_t)op.outC * 4, (size_t)op.outC * 4);
             if (detProf) detProf->ioTicks += NowTicks() - tIo0;
             const int8_t *wq = (const int8_t *)(buf + (size_t)op.outC * 8);
-            RunConv2D(inT.data.data(), inT.c, inT.h, inT.w,
-                      outT.data.data(), op.outC, hout, wout,
+            RunConv2D(inT.ptr, inT.c, inT.h, inT.w,
+                      outT.ptr, op.outC, hout, wout,
                       op.kH, op.kW, op.sH, op.sW, op.pH, op.pW, op.groups,
-                      scales.data(), bias.data(), wq, (uint8_t)op.act, op.postScale, op.postBias,
-                      allowDualCore, helperCore, nullptr, nullptr, detProf ? &detConvProf : nullptr);
+                      ds.scalesVec.data(), ds.biasVec.data(), wq, (uint8_t)op.act, op.postScale, op.postBias,
+                      allowDualCore, helperCore, nullptr, nullptr, detProf ? &detConvProf : nullptr, -1,
+                      LAY_F32_CHW, 0.0f, LAY_F32_CHW, 0.0f, nullptr, nullptr, &ds);
             freeIfDead(op.in0, oi);
         } else if (op.type == 2) { // CONV_T2X2
             const DetTensor &inT = slots[op.in0];
@@ -4081,9 +4259,9 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
                 return false;
             }
             const uint8_t *buf = mb + op.dataOffset;
-            std::vector<float> bias(op.outC);
+            ds.biasVec.resize(op.outC);
             std::vector<float> w((size_t)op.inC * op.outC * 4);
-            std::memcpy(bias.data(), buf, (size_t)op.outC * 4);
+            std::memcpy(ds.biasVec.data(), buf, (size_t)op.outC * 4);
             std::memcpy(w.data(), buf + (size_t)op.outC * 4, w.size() * sizeof(float));
             if (detProf) detProf->ioTicks += NowTicks() - tIo0;
             uint64_t tCt0 = detProf ? NowTicks() : 0;
@@ -4093,13 +4271,16 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
             const int cinPad = (op.inC + 1) & ~1;
             const int nPairs = cinPad / 2;
 
-            float maxAbs = ComputeMaxAbs(inT.data.data(), (int)(op.inC * inHW), effCore);
+            float maxAbs = ComputeMaxAbs(inT.ptr, (int)(op.inC * inHW), effCore);
             const float xScale = maxAbs / 2048.0f;
             const float invXScale = 2048.0f / maxAbs;
-            std::vector<int16_t> inHwc(inHW * (size_t)cinPad, 0);
+            bool inHwcFromArena = false;
+            const size_t inHwcBytes = inHW * (size_t)cinPad * sizeof(int16_t);
+            int16_t *inHwcPtr = (int16_t *)ds.AllocBytes(inHwcBytes, inHwcFromArena);
+            std::memset(inHwcPtr, 0, inHwcBytes);
             {
                 std::atomic<int> nextP(0);
-                QuantTransposeArgs qtArgs{inT.data.data(), inHwc.data(), op.inC, cinPad, (int)inHW, (int)inHW, invXScale, &nextP, 64};
+                QuantTransposeArgs qtArgs{inT.ptr, inHwcPtr, op.inC, cinPad, (int)inHW, (int)inHW, invXScale, &nextP, 64};
 #ifdef __3DS__
                 if (effCore >= 0 && inHW >= 256) {
                     int qtCores[3], qtCount = 0;
@@ -4117,7 +4298,7 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
 
             DetTensor &outT = slots[op.out];
             outT.c = op.outC; outT.h = hout; outT.w = wout;
-            outT.data.resize((size_t)op.outC * hout * wout);
+            allocSlotData(outT, (size_t)op.outC * hout * wout);
 
             std::vector<int16_t> wQ((size_t)op.outC * 4 * cinPad, 0);
             std::vector<float> wScales(op.outC);
@@ -4143,7 +4324,7 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
             const bool splitByY = (op.outC < 4);
             std::atomic<int> nextIdx(0);
             ConvT2x2Args ctArgs{
-                inHwc.data(), wQ.data(), wScales.data(), bias.data(), outT.data.data(),
+                inHwcPtr, wQ.data(), wScales.data(), ds.biasVec.data(), outT.ptr,
                 xScale, cinPad, nPairs, inH, inW, op.outC, wout,
                 outHW, (uint8_t)op.act, splitByY,
                 &nextIdx, splitByY ? 8 : 4, splitByY ? inH : (int)op.outC
@@ -4160,6 +4341,7 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
 #else
             RunConvT2x2Range(&ctArgs);
 #endif
+            ds.FreeBytes(inHwcPtr, inHwcFromArena);
             if (detProf) detProf->convT2x2Ticks += NowTicks() - tCt0;
         } else if (op.type == 3) { // ADD
             uint64_t tOp0 = detProf ? NowTicks() : 0;
@@ -4167,9 +4349,9 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
             const DetTensor &b = slots[op.in1];
             DetTensor &outT = slots[op.out];
             outT.c = a.c; outT.h = a.h; outT.w = a.w;
-            const size_t n = a.data.size();
-            outT.data.resize(n);
-            for (size_t i = 0; i < n; ++i) outT.data[i] = a.data[i] + b.data[i];
+            const size_t n = a.count;
+            allocSlotData(outT, n);
+            for (size_t i = 0; i < n; ++i) outT.ptr[i] = a.ptr[i] + b.ptr[i];
             if (detProf) detProf->addTicks += NowTicks() - tOp0;
             freeIfDead(op.in0, oi);
             freeIfDead(op.in1, oi);
@@ -4181,11 +4363,11 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
             DetTensor &outT = slots[op.out];
             outT.c = fm->c; outT.h = fm->h; outT.w = fm->w;
             const size_t hw = (size_t)fm->h * fm->w;
-            outT.data.resize((size_t)fm->c * hw);
+            allocSlotData(outT, (size_t)fm->c * hw);
             for (int c = 0; c < fm->c; ++c) {
-                float s = vec->data[c];
-                const float *src = fm->data.data() + (size_t)c * hw;
-                float *dst = outT.data.data() + (size_t)c * hw;
+                float s = vec->ptr[c];
+                const float *src = fm->ptr + (size_t)c * hw;
+                float *dst = outT.ptr + (size_t)c * hw;
                 for (size_t i = 0; i < hw; ++i) dst[i] = src[i] * s;
             }
             if (detProf) detProf->mulChTicks += NowTicks() - tOp0;
@@ -4196,14 +4378,14 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
             const DetTensor &inT = slots[op.in0];
             DetTensor &outT = slots[op.out];
             outT.c = inT.c; outT.h = 1; outT.w = 1;
-            outT.data.resize(inT.c);
+            allocSlotData(outT, inT.c);
             const size_t hw = (size_t)inT.h * inT.w;
             const float inv = 1.0f / (float)std::max<size_t>(1, hw);
             for (int c = 0; c < inT.c; ++c) {
-                const float *src = inT.data.data() + (size_t)c * hw;
+                const float *src = inT.ptr + (size_t)c * hw;
                 float sum = 0.0f;
                 for (size_t i = 0; i < hw; ++i) sum += src[i];
-                outT.data[c] = sum * inv;
+                outT.ptr[c] = sum * inv;
             }
             if (detProf) detProf->gapTicks += NowTicks() - tOp0;
             freeIfDead(op.in0, oi);
@@ -4215,12 +4397,12 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
             int wout = inT.w * sc;
             DetTensor &outT = slots[op.out];
             outT.c = inT.c; outT.h = hout; outT.w = wout;
-            outT.data.resize((size_t)inT.c * hout * wout);
+            allocSlotData(outT, (size_t)inT.c * hout * wout);
             const size_t inHW = (size_t)inT.h * inT.w;
             const size_t outHW = (size_t)hout * wout;
             for (int c = 0; c < inT.c; ++c) {
-                const float *srcC = inT.data.data() + (size_t)c * inHW;
-                float *dstC = outT.data.data() + (size_t)c * outHW;
+                const float *srcC = inT.ptr + (size_t)c * inHW;
+                float *dstC = outT.ptr + (size_t)c * outHW;
                 for (int dy = 0; dy < hout; ++dy) {
                     const float *srcRow = srcC + (size_t)(dy / sc) * inT.w;
                     float *dstRow = dstC + (size_t)dy * wout;
@@ -4240,12 +4422,12 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
             int w = slots[op.in0].w;
             DetTensor &outT = slots[op.out];
             outT.c = totC; outT.h = h; outT.w = w;
-            outT.data.resize((size_t)totC * h * w);
+            allocSlotData(outT, (size_t)totC * h * w);
             size_t off = 0;
             for (int k = 0; k < 4; ++k) {
-                const auto &src = slots[ins[k]].data;
-                std::memcpy(outT.data.data() + off, src.data(), src.size() * sizeof(float));
-                off += src.size();
+                const auto &src = slots[ins[k]];
+                std::memcpy(outT.ptr + off, src.ptr, src.count * sizeof(float));
+                off += src.count;
             }
             if (detProf) detProf->concatTicks += NowTicks() - tOp0;
             for (int k = 0; k < 4; ++k) freeIfDead(ins[k], oi);
@@ -4255,16 +4437,21 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
 
     // Post-process DBNet probability map [1, detH, detW]
     uint64_t tPost0 = detProf ? NowTicks() : 0;
-    const DetTensor &prob = slots[detModel.outputSlot];
-    if (prob.h != detH || prob.w != detW || prob.data.size() < (size_t)detH * detW) {
+    DetTensor &prob = slots[detModel.outputSlot];
+    if (prob.h != detH || prob.w != detW || prob.count < (size_t)detH * detW) {
         err = "Unexpected det output shape";
         return false;
     }
 
     const float thresh = 0.30f;
     const float boxThresh = 0.45f;
-    std::vector<uint8_t> visited((size_t)detH * detW, 0);
-    std::vector<int> qx, qy;
+    ds.visited.resize((size_t)detH * detW);
+    std::memset(ds.visited.data(), 0, (size_t)detH * detW);
+    std::vector<uint8_t> &visited = ds.visited;
+    std::vector<int> &qx = ds.qx;
+    std::vector<int> &qy = ds.qy;
+    qx.clear();
+    qy.clear();
     qx.reserve(512);
     qy.reserve(512);
 
@@ -4274,7 +4461,7 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
     for (int y = 0; y < detH; ++y) {
         for (int x = 0; x < detW; ++x) {
             size_t idx = (size_t)y * detW + x;
-            if (visited[idx] || prob.data[idx] <= thresh) continue;
+            if (visited[idx] || prob.ptr[idx] <= thresh) continue;
 
             qx.clear(); qy.clear();
             qx.push_back(x); qy.push_back(y);
@@ -4286,7 +4473,7 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
             while (head < qx.size()) {
                 int cx = qx[head], cy = qy[head];
                 ++head;
-                probSum += prob.data[(size_t)cy * detW + cx];
+                probSum += prob.ptr[(size_t)cy * detW + cx];
                 if (cx < minX) minX = cx;
                 if (cx > maxX) maxX = cx;
                 if (cy < minY) minY = cy;
@@ -4298,7 +4485,7 @@ bool DetectScreenTextLinesDbNet(const uint8_t *rgb, int imgW, int imgH,
                     int nx = cx + dx4[d], ny = cy + dy4[d];
                     if (nx >= 0 && nx < detW && ny >= 0 && ny < detH) {
                         size_t nidx = (size_t)ny * detW + nx;
-                        if (!visited[nidx] && prob.data[nidx] > thresh) {
+                        if (!visited[nidx] && prob.ptr[nidx] > thresh) {
                             visited[nidx] = 1;
                             qx.push_back(nx);
                             qy.push_back(ny);
